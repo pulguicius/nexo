@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# nexo — cliente del puente Nexo (la app Android) para Termux y para distros de proot-distro.
+# Habla con la app por TCP en 127.0.0.1. Solo hace falta bash (o python3); jq es opcional
+# y da la salida con formato. No depende de qué Termux uses (F-Droid, GitHub, Monet, forks...).
+# Licencia: GPL-3.0-or-later
+
+NEXO_VERSION="0.1.0"
+export LC_ALL=C
+
+NEXO_HOST=${NEXO_HOST:-127.0.0.1}
+NEXO_PORT=${NEXO_PORT:-}
+NEXO_TOKEN=${NEXO_TOKEN:-}
+NEXO_TIMEOUT=${NEXO_TIMEOUT:-8}
+TRANSPORT=${NEXO_TRANSPORT:-auto}   # auto | bash | python
+FMT=text
+PRETTY=0
+PASS_ARG=""
+PASS_STDIN=0
+CONFIG_FILE=""
+RESP=""
+ERR_CODE=1
+NEXO_RT=""
+
+# ------------------------------------------------------------------ utilidades
+
+die() { local code=$1; shift; printf 'nexo: %s\n' "$*" >&2; exit "$code"; }
+warn() { printf 'nexo: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+have_jq() { [ "${NEXO_NO_JQ:-0}" != 1 ] && have jq; }   # NEXO_NO_JQ=1 fuerza la salida en JSON crudo
+
+usage() {
+cat <<'EOF'
+nexo — controla el WiFi y el Bluetooth de Android desde Termux o desde una distro de proot
+
+Uso: nexo [opciones] <comando> [argumentos]
+
+Estado
+  status                        Resumen de WiFi y Bluetooth
+  wifi status                   Estado del WiFi
+  bt status                     Estado del Bluetooth
+WiFi
+  wifi on | off                 Enciende o apaga el WiFi
+  wifi scan                     Lista las redes cercanas
+  wifi connect NOMBRE [CLAVE]   Se conecta a una red (CLAVE también con --pass o --pass-stdin)
+  wifi disconnect               Se desconecta de la red actual
+Bluetooth
+  bt on | off                   Enciende o apaga el Bluetooth
+  bt paired                     Dispositivos emparejados y cuáles están conectados
+  bt connect|disconnect DIR     Android lo reserva al sistema: Nexo deja una notificación para hacerlo
+Eventos
+  watch [wifi|bt]               Cambios en vivo, un JSON por línea (--pretty para leerlos mejor)
+Enlace e instalación
+  pair TOKEN [PUERTO]           Guarda el token de la app
+  unpair                        Borra el enlace guardado
+  setup-guests [RUTA...]        (Termux) copia el cliente y el enlace a tus distros de proot-distro
+  doctor                        Diagnóstico de todo el enlace
+  ping                          Comprueba que la app responde
+  raw 'JSON'                    Envía una petición cruda y muestra la respuesta
+  version                       Versión del cliente
+
+Opciones
+  --json      Salida JSON (el campo data)
+  --short     Una línea corta, pensada para barras de estado
+  --waybar    JSON para un módulo "custom" de Waybar
+  --env       Variables de shell:  eval "$(nexo wifi status --env)"
+  --host H  --port P  --timeout S    Dónde está la app (por omisión 127.0.0.1:8765)
+
+Códigos de salida: 0 bien · 1 error · 2 uso · 3 hace falta un toque en el móvil
+                   10 sin conexión con la app · 11 token · 12 sin respuesta a tiempo
+EOF
+}
+
+# ------------------------------------------------------------------ configuración
+
+unquote() {
+    local s=$1
+    s=${s%$'\r'}
+    s=${s#\"}; s=${s%\"}
+    s=${s#\'}; s=${s%\'}
+    printf '%s' "$s"
+}
+
+config_dir() { printf '%s' "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/nexo"; }
+
+config_candidates() {
+    [ -n "${NEXO_CONFIG:-}" ] && printf '%s\n' "$NEXO_CONFIG"
+    printf '%s\n' "$(config_dir)/config" "/etc/nexo/config"
+    [ -n "${PREFIX:-}" ] && printf '%s\n' "$PREFIX/etc/nexo/config"
+    return 0
+}
+
+# Lee el primer archivo de configuración que exista. Las variables de entorno mandan.
+load_config() {
+    local f k v
+    while IFS= read -r f; do
+        [ -r "$f" ] || continue
+        while IFS='=' read -r k v; do
+            case $k in
+                NEXO_PORT)  [ -n "$NEXO_PORT" ]  || NEXO_PORT=$(unquote "$v") ;;
+                NEXO_TOKEN) [ -n "$NEXO_TOKEN" ] || NEXO_TOKEN=$(unquote "$v") ;;
+            esac
+        done < "$f"
+        CONFIG_FILE=$f
+        break
+    done < <(config_candidates)
+    [ -n "$NEXO_PORT" ] || NEXO_PORT=8765
+    return 0
+}
+
+# write_config TOKEN PUERTO RUTA MODO
+write_config() {
+    local token=$1 port=$2 path=$3 mode=$4 dir tmp
+    dir=$(dirname "$path")
+    mkdir -p "$dir" 2>/dev/null || return 1
+    tmp="$path.tmp.$$"
+    ( umask 077
+      {
+        printf '# Enlace con la app Nexo. No compartas este archivo: contiene el token.\n'
+        printf 'NEXO_PORT=%s\n' "$port"
+        printf 'NEXO_TOKEN=%s\n' "$token"
+      } > "$tmp" ) || return 1
+    chmod "$mode" "$tmp" 2>/dev/null
+    mv -f "$tmp" "$path"
+}
+
+# ------------------------------------------------------------------ JSON
+
+jesc() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    s=${s//[$'\001'-$'\010'$'\013'$'\014'$'\016'-$'\037']/}
+    printf '%s' "$s"
+}
+
+# build CMD [clave=texto] [clave:=JSON_crudo] ...
+build() {
+    local cmd=$1 out kv k v
+    shift
+    out="{\"id\":\"$$\",\"cmd\":\"$(jesc "$cmd")\""
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        if [[ $k == *: ]]; then
+            out+=",\"$(jesc "${k%:}")\":$v"
+        else
+            out+=",\"$(jesc "$k")\":\"$(jesc "$v")\""
+        fi
+    done
+    printf '%s}' "$out"
+}
+
+resp_ok() { case $RESP in *'"ok":true'*) return 0 ;; esac; return 1; }
+
+# pad TEXTO ANCHO → TEXTO rellenado con espacios hasta ANCHO columnas.
+# Con LC_ALL=C printf cuenta bytes y las tildes/ñ descuadrarían las tablas; aquí se cuentan letras.
+pad() {
+    local s=$1 w=$2 t
+    t=${s//[$'\200'-$'\277']/}   # sin los bytes de continuación de UTF-8 queda 1 byte por letra
+    printf '%s' "$s"
+    [ "${#t}" -ge "$w" ] || printf '%*s' $((w - ${#t})) ''
+}
+
+# ------------------------------------------------------------------ transporte
+
+# ¿Este bash sabe abrir /dev/tcp? (el puerto 1 casi siempre está cerrado: si el error es
+# "Connection refused" el bash sí lo soporta; si es "No such file", no)
+devtcp_ok() {
+    local err
+    err=$( { exec 3<>/dev/tcp/127.0.0.1/1; } 2>&1 )
+    case $err in *"No such file"*|*"not supported"*|*"Invalid"*) return 1 ;; esac
+    return 0
+}
+
+hello_line() { build hello "token=$NEXO_TOKEN" "client=nexo-cli/$NEXO_VERSION"; }
+
+# rpc_bash HELLO PETICION → imprime la respuesta. Salida: 10 sin conexión, 11 envío, 12 sin respuesta, 13 token malo
+rpc_bash() {
+    (
+        { exec 3<>"/dev/tcp/$NEXO_HOST/$NEXO_PORT"; } 2>/dev/null || exit 10
+        printf '%s\n' "$1" >&3 2>/dev/null || exit 11
+        IFS= read -r -t "$NEXO_TIMEOUT" hello <&3 || exit 12
+        case $hello in *'"ok":true'*) ;; *) printf '%s\n' "$hello"; exit 13 ;; esac
+        printf '%s\n' "$2" >&3 2>/dev/null || exit 11
+        IFS= read -r -t "${NEXO_RT:-$NEXO_TIMEOUT}" resp <&3 || exit 12
+        printf '%s\n' "$resp"
+    )
+}
+
+rpc_python() {
+    python3 - "$NEXO_HOST" "$NEXO_PORT" "$NEXO_TIMEOUT" "${NEXO_RT:-$NEXO_TIMEOUT}" "$1" "$2" <<'PY'
+import socket, sys
+host, port, t1, t2, hello, req = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5], sys.argv[6]
+
+def readline(s, timeout):
+    s.settimeout(timeout)
+    buf = b""
+    while not buf.endswith(b"\n"):
+        try:
+            chunk = s.recv(4096)
+        except OSError:
+            sys.exit(12)
+        if not chunk:
+            sys.exit(12)
+        buf += chunk
+    return buf.decode("utf-8", "replace").rstrip("\r\n")
+
+try:
+    s = socket.create_connection((host, port), timeout=t1)
+except OSError:
+    sys.exit(10)
+try:
+    s.sendall((hello + "\n").encode())
+    h = readline(s, t1)
+    if '"ok":true' not in h:
+        print(h)
+        sys.exit(13)
+    s.sendall((req + "\n").encode())
+    print(readline(s, t2))
+except OSError:
+    sys.exit(11)
+PY
+}
+
+# rpc PETICION → RESP. Elige el transporte; si el bash no trae /dev/tcp usa python3.
+rpc() {
+    local hello rc
+    hello=$(hello_line)
+    RESP=""
+    if [ "$TRANSPORT" != python ]; then
+        RESP=$(rpc_bash "$hello" "$1"); rc=$?
+        if [ "$rc" -eq 10 ] && [ "$TRANSPORT" = auto ] && ! devtcp_ok && have python3; then
+            TRANSPORT=python
+        else
+            return "$rc"
+        fi
+    fi
+    have python3 || die 10 "Este bash no sabe abrir /dev/tcp y no hay python3. Instala uno de los dos."
+    RESP=$(rpc_python "$hello" "$1"); rc=$?
+    return "$rc"
+}
+
+need_token() {
+    [ -n "$NEXO_TOKEN" ] || die 11 "No hay token. Pega en Termux el comando de instalación que copia la app Nexo, o usa: nexo pair TOKEN"
+    case $NEXO_PORT in ''|*[!0-9]*) die 2 "Puerto inválido: $NEXO_PORT" ;; esac
+}
+
+show_error() {
+    local code msg
+    if have_jq; then
+        code=$(printf '%s' "$RESP" | jq -r '.error // "error"' 2>/dev/null)
+        msg=$(printf '%s' "$RESP" | jq -r '.message // ""' 2>/dev/null)
+    else
+        code=$(printf '%s' "$RESP" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p')
+        msg=$(printf '%s' "$RESP" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+    fi
+    printf 'nexo: %s\n' "${msg:-$code}" >&2
+    case $code in
+        needs_user_action) ERR_CODE=3 ;;
+        unauthorized)      ERR_CODE=11 ;;
+        *)                 ERR_CODE=1 ;;
+    esac
+}
+
+# call CMD [k=v ...] → RESP. Devuelve 0 si la app contestó ok:true. Los fallos de conexión terminan el programa.
+call() {
+    local r rc
+    need_token
+    r=$(build "$@")
+    rpc "$r"; rc=$?
+    case $rc in
+        0) ;;
+        10) die 10 "No se puede conectar con Nexo en $NEXO_HOST:$NEXO_PORT. ¿Está encendido el puente en la app? (mira: nexo doctor)" ;;
+        13) die 11 "Nexo rechazó el token. Vuelve a copiar el comando de instalación desde la app (o usa: nexo pair TOKEN)." ;;
+        *)  die 12 "La conexión con Nexo se cortó o no respondió a tiempo." ;;
+    esac
+    resp_ok
+}
+
+# need CMD ... → como call, pero si la app dice que no, termina con el código adecuado
+need() { call "$@" || { show_error; exit "$ERR_CODE"; }; }
+
+# ------------------------------------------------------------------ salida con formato
+
+JQ_WIFI_TEXT='.data |
+  if .available == false then "WiFi: no disponible en este móvil"
+  elif (.enabled | not) then "WiFi: apagado"
+  elif .connected then
+    "WiFi: conectado a " + (.ssid // "(red oculta: falta permiso de ubicación)")
+    + (if .rssi != null then " · \(.rssi) dBm" else "" end)
+    + (if .band != null then " · \(.band)" else "" end)
+    + (if .ip != null then " · \(.ip)" else "" end)
+  else "WiFi: encendido, sin conexión" end'
+
+JQ_WIFI_SHORT='.data |
+  if .available == false then "n/d" elif (.enabled | not) then "apagado"
+  elif .connected then (.ssid // "?") else "sin red" end'
+
+JQ_WIFI_WAYBAR='.data |
+  (if (.enabled | not) then "off" elif .connected then "connected" else "disconnected" end) as $st |
+  {text: (if .available == false then "n/d" elif (.enabled | not) then "off" elif .connected then (.ssid // "wifi") else "sin red" end),
+   alt: $st, class: $st,
+   percentage: (if .level != null then (.level * 25) else 0 end),
+   tooltip: ("WiFi: " + (if .connected then "\(.ssid // "?") · \(.rssi // "?") dBm" else "sin conexión" end))}'
+
+JQ_BT_TEXT='.data |
+  if .available == false then "Bluetooth: no disponible en este móvil"
+  elif (.enabled | not) then "Bluetooth: apagado"
+  else "Bluetooth: encendido"
+    + (if .connected then " · con dispositivos conectados" else " · sin conexiones" end)
+    + (if .bonded_count != null then " · \(.bonded_count) emparejados" else "" end) end'
+
+JQ_BT_SHORT='.data |
+  if .available == false then "n/d" elif (.enabled | not) then "apagado"
+  elif .connected then "conectado" else "encendido" end'
+
+JQ_BT_WAYBAR='.data |
+  (if (.enabled | not) then "off" elif .connected then "connected" else "on" end) as $st |
+  {text: $st, alt: $st, class: $st, percentage: 0,
+   tooltip: ("Bluetooth: " + (if .enabled then (if .connected then "con dispositivos conectados" else "encendido" end) else "apagado" end))}'
+
+JQ_ENV='.data | to_entries[] |
+  "NEXO_\($p)_\(.key | ascii_upcase)=" +
+  (.value | if type == "boolean" then (if . then "1" else "0" end)
+            elif . == null then "\"\""
+            elif type == "object" or type == "array" then (tojson | @sh)
+            else @sh end)'
+
+JQ_EVENT='if .event == "wifi" then
+    "wifi  → " + (.data | if (.enabled | not) then "apagado" elif .connected then "conectado a \(.ssid // "?")" else "sin conexión" end)
+  elif .event == "bt" then
+    "bt    → " + (.data | if (.enabled | not) then "apagado" elif .connected then "con dispositivos conectados" else "encendido" end)
+  else tostring end'
+
+# show TEXT_FILTER SHORT_FILTER WAYBAR_FILTER PREFIJO_ENV
+show() {
+    if ! have_jq; then
+        printf '%s\n' "$RESP"
+        [ "${NEXO_NOHINT:-0}" = 1 ] || warn "(instala jq para ver esto con formato: pkg install jq / apt install jq)"
+        NEXO_NOHINT=1
+        return 0
+    fi
+    case $FMT in
+        json)   printf '%s' "$RESP" | jq -c '.data' ;;
+        short)  printf '%s' "$RESP" | jq -r "$2" ;;
+        waybar) printf '%s' "$RESP" | jq -c "$3" ;;
+        env)    printf '%s' "$RESP" | jq -r --arg p "$4" "$JQ_ENV" ;;
+        *)      printf '%s' "$RESP" | jq -r "$1" ;;
+    esac
+}
+
+show_wifi() { show "$JQ_WIFI_TEXT" "$JQ_WIFI_SHORT" "$JQ_WIFI_WAYBAR" WIFI; }
+show_bt()   { show "$JQ_BT_TEXT" "$JQ_BT_SHORT" "$JQ_BT_WAYBAR" BT; }
+
+# ------------------------------------------------------------------ comandos
+
+cmd_status() {
+    local w b
+    need wifi.status; w=$RESP
+    need bt.status;   b=$RESP
+    if [ "$FMT" = json ] && have_jq; then
+        jq -cn --argjson w "$(printf '%s' "$w" | jq -c .data)" --argjson b "$(printf '%s' "$b" | jq -c .data)" '{wifi:$w,bt:$b}'
+        return 0
+    fi
+    if [ "$FMT" = short ]; then
+        local ws bs
+        RESP=$w; ws=$(show_wifi)
+        RESP=$b; bs=$(show_bt)
+        printf '%s · %s\n' "$ws" "$bs"
+        return 0
+    fi
+    RESP=$w; show_wifi
+    RESP=$b; show_bt
+}
+
+cmd_wifi() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status) need wifi.status; show_wifi ;;
+        on|enable)   need wifi.enable;  show_wifi ;;
+        off|disable) need wifi.disable; show_wifi ;;
+        disconnect)  need wifi.disconnect; [ "$FMT" = json ] || echo "WiFi: desconectado" ;;
+        scan)
+            NEXO_RT=25
+            need wifi.scan
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            printf '%s %s  %-6s %s\n' "$(pad RED 34)" "    SEÑAL" "SEGUR." "BANDA"
+            printf '%s' "$RESP" | jq -r '.data.networks[] | [.ssid, (.rssi|tostring), .security, (.band // "")] | @tsv' |
+                while IFS=$'\t' read -r ssid rssi sec band; do
+                    printf '%s %5s dBm  %-6s %s\n' "$(pad "$ssid" 34)" "$rssi" "$sec" "$band"
+                done
+            printf '%s' "$RESP" | jq -r '.data.hint // empty' | sed 's/^/nexo: /' >&2
+            ;;
+        connect)
+            local ssid=${1:-} pass=""
+            [ -n "$ssid" ] || die 2 "Uso: nexo wifi connect NOMBRE [CLAVE]"
+            if [ $# -ge 2 ]; then pass=$2
+            elif [ -n "$PASS_ARG" ]; then pass=$PASS_ARG
+            elif [ "$PASS_STDIN" = 1 ]; then IFS= read -r pass
+            elif [ -n "${NEXO_WIFI_PASSWORD:-}" ]; then pass=$NEXO_WIFI_PASSWORD; fi
+            NEXO_RT=40
+            if [ -n "$pass" ]; then need wifi.connect "ssid=$ssid" "password=$pass"; else need wifi.connect "ssid=$ssid"; fi
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; fi
+            case $RESP in
+                *'"connected":true'*) [ "$FMT" = json ] || echo "WiFi: conectado a $ssid" ;;
+                *) warn "Se pidió la conexión a «$ssid», pero no se confirmó: revisa la clave o la cobertura."; exit 3 ;;
+            esac
+            ;;
+        *) die 2 "wifi: subcomando desconocido «$sub» (status, on, off, scan, connect, disconnect)" ;;
+    esac
+}
+
+cmd_bt() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status) need bt.status; show_bt ;;
+        on|enable)   need bt.enable;  show_bt ;;
+        off|disable) need bt.disable; show_bt ;;
+        paired|list)
+            need bt.paired
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            printf '%s %s %-10s %s\n' "$(pad NOMBRE 26)" "$(pad DIRECCIÓN 18)" "ESTADO" "PERFILES"
+            printf '%s' "$RESP" | jq -r '.data.devices[] | [(.name // "(sin nombre)"), .address, (if .connected then "conectado" else "-" end), (.profiles | join(","))] | @tsv' |
+                while IFS=$'\t' read -r name addr st prof; do
+                    printf '%s %-18s %-10s %s\n' "$(pad "$name" 26)" "$addr" "$st" "$prof"
+                done
+            ;;
+        connect|disconnect)
+            [ -n "${1:-}" ] || die 2 "Uso: nexo bt $sub DIRECCIÓN   (por ejemplo AA:BB:CC:DD:EE:FF)"
+            need "bt.$sub" "address=$1"
+            ;;
+        *) die 2 "bt: subcomando desconocido «$sub» (status, on, off, paired, connect, disconnect)" ;;
+    esac
+}
+
+watch_once() {
+    local hello sub
+    hello=$(hello_line)
+    sub=$(build subscribe "topics:=$1")
+    (
+        { exec 3<>"/dev/tcp/$NEXO_HOST/$NEXO_PORT"; } 2>/dev/null || exit 10
+        printf '%s\n' "$hello" >&3 || exit 11
+        IFS= read -r -t "$NEXO_TIMEOUT" line <&3 || exit 12
+        case $line in *'"ok":true'*) ;; *) printf '%s\n' "$line" >&2; exit 13 ;; esac
+        printf '%s\n' "$sub" >&3 || exit 11
+        IFS= read -r -t "$NEXO_TIMEOUT" line <&3 || exit 12
+        while :; do
+            if IFS= read -r -t 30 line <&3; then
+                case $line in *'"id":"ka"'*) continue ;; esac
+                printf '%s\n' "$line"
+            else
+                rc=$?
+                if [ "$rc" -gt 128 ]; then
+                    printf '%s\n' '{"id":"ka","cmd":"ping"}' >&3 || exit 11
+                else
+                    exit 12
+                fi
+            fi
+        done
+    )
+}
+
+watch_loop() {
+    local topics=$1 rc
+    while :; do
+        watch_once "$topics"; rc=$?
+        [ "$rc" -eq 13 ] && die 11 "Nexo rechazó el token."
+        warn "Sin conexión con Nexo (código $rc); reintento en 3 s…"
+        sleep 3
+    done
+}
+
+cmd_watch() {
+    local topics='["wifi","bt"]'
+    case ${1:-} in wifi) topics='["wifi"]' ;; bt) topics='["bt"]' ;; esac
+    need_token
+    [ "$TRANSPORT" = python ] && die 2 "watch necesita un bash con /dev/tcp"
+    if [ "$PRETTY" = 1 ] && have_jq; then
+        watch_loop "$topics" | jq --unbuffered -r "$JQ_EVENT"
+    else
+        watch_loop "$topics"
+    fi
+}
+
+cmd_ping() {
+    need ping
+    [ "$FMT" = json ] && have_jq && { printf '%s' "$RESP" | jq -c .data; return 0; }
+    echo "Nexo responde en $NEXO_HOST:$NEXO_PORT"
+}
+
+cmd_raw() {
+    [ -n "${1:-}" ] || die 2 "Uso: nexo raw '{\"cmd\":\"wifi.status\"}'"
+    need_token
+    rpc "$1"; local rc=$?
+    [ "$rc" -eq 0 ] || die 12 "Sin respuesta de Nexo (código $rc)."
+    printf '%s\n' "$RESP"
+}
+
+cmd_pair() {
+    local token=${1:-} port=${2:-$NEXO_PORT} rc
+    [ -n "$token" ] || die 2 "Uso: nexo pair TOKEN [PUERTO]"
+    case $token in *[!0-9a-fA-F]*) die 2 "El token solo lleva dígitos y letras a-f: cópialo tal cual desde la app." ;; esac
+    case $port in ''|*[!0-9]*) die 2 "Puerto inválido: $port" ;; esac
+    NEXO_TOKEN=$token; NEXO_PORT=$port
+    rpc "$(build ping)"; rc=$?
+    case $rc in
+        0) ;;
+        13) die 11 "La app rechazó ese token. Cópialo de nuevo desde la app Nexo." ;;
+        10) warn "No hay nadie escuchando en $NEXO_HOST:$port (¿puente apagado?). Guardo el enlace igualmente." ;;
+        *)  warn "La app no respondió bien (código $rc). Guardo el enlace igualmente." ;;
+    esac
+    write_config "$token" "$port" "$(config_dir)/config" 600 || die 1 "No pude escribir $(config_dir)/config"
+    echo "Enlace guardado en $(config_dir)/config"
+    [ "$rc" -eq 0 ] && echo "Nexo responde: todo listo."
+    return 0
+}
+
+cmd_unpair() {
+    rm -f "$(config_dir)/config" && echo "Enlace borrado de $(config_dir)"
+}
+
+install_in_guest() {
+    local r=${1%/} name tmp
+    name=$(basename "$r")
+    mkdir -p "$r/usr/local/bin" "$r/etc/nexo" 2>/dev/null || { warn "$name: no pude escribir en $r"; return 1; }
+    tmp="$r/usr/local/bin/nexo.tmp.$$"
+    # En Termux el instalador pudo reescribir el shebang; dentro de la distro hace falta el normal.
+    { printf '#!/usr/bin/env bash\n'; tail -n +2 "$SELF"; } > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$r/usr/local/bin/nexo" || { warn "$name: falló la copia"; return 1; }
+    write_config "$NEXO_TOKEN" "$NEXO_PORT" "$r/etc/nexo/config" 644 || { warn "$name: no pude escribir la configuración"; return 1; }
+    echo "✔ $name"
+    if [ ! -e "$r/usr/bin/bash" ] && [ ! -L "$r/usr/bin/bash" ] && [ ! -e "$r/bin/bash" ] && [ ! -L "$r/bin/bash" ]; then
+        echo "   ↳ a $name le falta bash (en Alpine: apk add bash)"
+    fi
+    if [ ! -e "$r/usr/bin/jq" ] && [ ! -L "$r/usr/bin/jq" ] && [ ! -e "$r/bin/jq" ]; then
+        echo "   ↳ opcional: instala jq dentro de $name para ver la salida con formato"
+    fi
+}
+
+cmd_setup_guests() {
+    [ -n "${PREFIX:-}" ] || die 2 "setup-guests se ejecuta desde Termux, no dentro de una distro."
+    [ -n "$NEXO_TOKEN" ] || die 11 "Primero enlaza Termux con la app (pega el comando de instalación)."
+    local root=${NEXO_GUESTS_DIR:-$PREFIX/var/lib/proot-distro/installed-rootfs} d
+    local list=()
+    if [ $# -gt 0 ]; then
+        list=("$@")
+    else
+        for d in "$root"/*/; do [ -d "$d" ] && list+=("${d%/}"); done
+    fi
+    [ "${#list[@]}" -gt 0 ] || die 1 "No encontré distros de proot-distro en $root"
+    SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    for d in "${list[@]}"; do install_in_guest "$d"; done
+    echo "Dentro de cada distro, el comando es: nexo status"
+}
+
+detect_env() {
+    case ${PREFIX:-} in
+        */files/usr) printf 'Termux (%s)' "$PREFIX"; return ;;
+    esac
+    local pretty=""
+    [ -r /etc/os-release ] && pretty=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')
+    printf 'Linux%s' "${pretty:+ — $pretty}"
+}
+
+cmd_doctor() {
+    printf 'nexo       %s\n' "$NEXO_VERSION"
+    printf 'entorno    %s\n' "$(detect_env)"
+    printf 'bash       %s\n' "${BASH_VERSION:-?}"
+    printf 'config     %s\n' "${CONFIG_FILE:-(no hay archivo; ver «nexo pair»)}"
+    printf 'destino    %s:%s\n' "$NEXO_HOST" "$NEXO_PORT"
+    if [ -n "$NEXO_TOKEN" ]; then printf 'token      sí (%s caracteres)\n' "${#NEXO_TOKEN}"; else printf 'token      NO\n'; fi
+    printf 'jq         %s\n' "$(command -v jq || echo 'no instalado (opcional)')"
+    printf 'python3    %s\n' "$(command -v python3 || echo 'no instalado (opcional)')"
+    if devtcp_ok; then echo "/dev/tcp   sí"; else echo "/dev/tcp   no (se usará python3)"; fi
+    [ -n "$NEXO_TOKEN" ] || { echo "enlace     sin token: no se puede probar"; return 1; }
+    local r rc
+    r=$(build ping)
+    rpc "$r"; rc=$?
+    case $rc in
+        0) echo "enlace     OK: la app responde" ;;
+        10) echo "enlace     FALLA: no hay nadie en $NEXO_HOST:$NEXO_PORT (¿puente apagado, o puerto distinto?)"; return 10 ;;
+        13) echo "enlace     FALLA: la app rechazó el token (vuelve a copiar el comando de instalación)"; return 11 ;;
+        *)  echo "enlace     FALLA: conexión abierta pero sin respuesta (código $rc)"; return 12 ;;
+    esac
+}
+
+# ------------------------------------------------------------------ programa principal
+
+main() {
+    local ARGS=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --json) FMT=json ;;
+            --short) FMT=short ;;
+            --waybar) FMT=waybar ;;
+            --env) FMT=env ;;
+            --pretty) PRETTY=1 ;;
+            --pass-stdin) PASS_STDIN=1 ;;
+            --host|--port|--timeout|--pass)
+                [ $# -ge 2 ] || die 2 "$1 necesita un valor"
+                case $1 in
+                    --host) NEXO_HOST=$2 ;;
+                    --port) NEXO_PORT=$2 ;;
+                    --timeout) NEXO_TIMEOUT=$2 ;;
+                    --pass) PASS_ARG=$2 ;;
+                esac
+                shift ;;
+            -h|--help) usage; exit 0 ;;
+            -V|--version) echo "nexo $NEXO_VERSION"; exit 0 ;;
+            --) shift; ARGS+=("$@"); break ;;
+            *) ARGS+=("$1") ;;
+        esac
+        shift
+    done
+    load_config
+
+    set -- "${ARGS[@]}"
+    local cmd=${1:-help}
+    [ $# -gt 0 ] && shift
+    case $cmd in
+        status|st) cmd_status ;;
+        wifi) cmd_wifi "$@" ;;
+        bt|bluetooth) cmd_bt "$@" ;;
+        watch) cmd_watch "$@" ;;
+        ping) cmd_ping ;;
+        raw) cmd_raw "$@" ;;
+        pair) cmd_pair "$@" ;;
+        unpair) cmd_unpair ;;
+        setup-guests|guests) cmd_setup_guests "$@" ;;
+        doctor) cmd_doctor ;;
+        version) echo "nexo $NEXO_VERSION" ;;
+        help) usage ;;
+        *) die 2 "comando desconocido «$cmd». Prueba: nexo help" ;;
+    esac
+}
+
+main "$@"
