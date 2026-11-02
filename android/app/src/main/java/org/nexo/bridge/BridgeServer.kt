@@ -217,11 +217,11 @@ class BridgeServer(
                     return false
                 }
                 authed = true
-                sock.soTimeout = 0
-                refreshCount()
-                BridgeState.log("Cliente conectado: " + req.optString("client", "?").take(40))
-                send(Protocol.ok(id, commands.hello()))
-                return true
+sock.soTimeout = 0
+send(Protocol.ok(id, commands.hello())) // <-- ENVIAR PRIMERO
+refreshCount()                          // <-- UI DESPUÉS
+BridgeState.log("Cliente conectado: " + req.optString("client", "?").take(40))
+return true
             }
 
             when (cmd) {
@@ -266,21 +266,28 @@ class BridgeServer(
         }
 
         private fun runCommand(id: Any?, cmd: String, req: JSONObject) {
-            val resp: JSONObject = try {
-                BridgeState.log("> " + describe(cmd, req))
-                Protocol.ok(id, commands.handle(cmd, req))
-            } catch (e: CmdException) {
-                BridgeState.log("x " + cmd + ": " + e.code)
-                Protocol.error(id, e.code, e.message ?: e.code, e.extra)
-            } catch (e: SecurityException) {
-                BridgeState.log("x " + cmd + ": permission_denied")
-                Protocol.error(id, "permission_denied", "Android negó un permiso: " + (e.message ?: ""))
-            } catch (e: Exception) {
-                BridgeState.log("x " + cmd + ": " + e.javaClass.simpleName)
-                Protocol.error(id, "internal", e.javaClass.simpleName + ": " + (e.message ?: ""))
-            }
-            send(resp)
-        }
+    // 1. Ejecutamos el comando y preparamos la respuesta
+    val resp: JSONObject = try {
+        Protocol.ok(id, commands.handle(cmd, req))
+    } catch (e: CmdException) {
+        Protocol.error(id, e.code, e.message ?: e.code, e.extra)
+    } catch (e: SecurityException) {
+        Protocol.error(id, "permission_denied", "Android negó un permiso: " + (e.message ?: ""))
+    } catch (e: Exception) {
+        Protocol.error(id, "internal", e.javaClass.simpleName + ": " + (e.message ?: ""))
+    }
+    
+    // 2. ENVIAMOS AL INSTANTE (milisegundos)
+    send(resp)
+    
+    // 3. Logueamos DESPUÉS para no bloquear al cliente
+    if (resp.has("error")) {
+        val errCode = resp.optJSONObject("error")?.optString("code") ?: "error"
+        BridgeState.log("x " + cmd + ": " + errCode)
+    } else {
+        BridgeState.log("> " + describe(cmd, req))
+    }
+}
 
         private fun serveBootstrap() {
             try {
