@@ -12,6 +12,9 @@ class CmdException(
 /** Formato de los mensajes. Ver docs/PROTOCOLO.md. Una línea = un objeto JSON. */
 object Protocol {
     const val VERSION = 1
+
+    /** Revisión dentro de la versión 1 (ver docs/PROTOCOLO.md): la 2 añade audio, media y comandos de WiFi/Bluetooth. */
+    const val MINOR = 2
     const val MAX_LINE_BYTES = 64 * 1024
 
     fun ok(id: Any?, data: JSONObject? = null): JSONObject {

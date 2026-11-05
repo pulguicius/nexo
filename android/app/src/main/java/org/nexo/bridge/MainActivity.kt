@@ -14,6 +14,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.LocationManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,6 +26,7 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -60,8 +63,13 @@ class MainActivity : Activity() {
     private lateinit var tvToken: TextView
     private lateinit var tvPerms: TextView
     private lateinit var tvLog: TextView
+    private lateinit var tvAudio: TextView
+    private lateinit var tvMedia: TextView
     private lateinit var etPort: EditText
     private var tokenShown = false
+    private var probing = false
+    private val audioProbe by lazy { AudioHandler(this) }
+    private val mediaProbe by lazy { MediaHandler(this) }
 
     private val tick = object : Runnable {
         override fun run() {
@@ -93,12 +101,12 @@ class MainActivity : Activity() {
         tvDetail = text("", 14f, MUTED)
         tvError = text("", 13f, BAD)
         btnToggle = button("Iniciar puente", primary = true) { toggleService() }
-        col.addView(card(null, tvState, tvDetail, tvError, btnToggle), lp(bottom = 12))
+        col.addView(card(null, tvState, tvDetail, tvError, btnToggle, button("Reiniciar puente") { restartService() }), lp(bottom = 12))
 
         // Enlazar con Termux
         tvToken = text("", 13f, TEXT, mono = true)
         val rowToken = row(
-            button("Mostrar token") { tokenShown = !tokenShown; refresh() },
+            button("Mostrar token") { setTokenShown(!tokenShown) },
             button("Token nuevo") { confirmRegenerate() }
         )
         col.addView(
@@ -113,6 +121,29 @@ class MainActivity : Activity() {
                 button("Copiar solo el token") { copyToken() },
                 tvToken,
                 rowToken
+            ),
+            lp(bottom = 12)
+        )
+
+        // Audio y música
+        tvAudio = text("", 13f, TEXT)
+        tvMedia = text("", 13f, TEXT)
+        col.addView(
+            card(
+                "AUDIO Y MÚSICA",
+                tvAudio,
+                tvMedia,
+                text(
+                    "Para ver y controlar la música (título, pausa, siguiente, carátula) Android exige el «acceso a " +
+                        "notificaciones». Nexo solo lo usa para las sesiones de medios: no lee ni guarda tus notificaciones." +
+                        (if (Build.VERSION.SDK_INT >= 33)
+                            "\n\nSi el interruptor sale en gris (Android 13 o más, app instalada desde un APK): Ajustes › Aplicaciones › " +
+                                "Nexo › ⋮ (arriba a la derecha) › «Permitir ajustes restringidos», y vuelve a intentarlo."
+                        else ""),
+                    12f, MUTED
+                ),
+                button("Dar acceso a notificaciones") { openListenerSettings() },
+                button("Probar sonido") { playTestTone() }
             ),
             lp(bottom = 12)
         )
@@ -163,10 +194,10 @@ class MainActivity : Activity() {
 
         // Actividad
         tvLog = text("", 11f, MUTED, mono = true)
-        col.addView(card("ACTIVIDAD", tvLog), lp(bottom = 12))
+        col.addView(card("ACTIVIDAD", tvLog, button("Copiar registro (últimas 100 líneas)") { copyLog() }), lp(bottom = 12))
 
         col.addView(
-            text("Nexo v0.1.0 · Solo escucha en 127.0.0.1 · Sin anuncios ni telemetría", 11f, MUTED)
+            text("Nexo v" + versionName() + " · Solo escucha en 127.0.0.1 · Sin anuncios ni telemetría", 11f, MUTED)
         )
     }
 
@@ -179,6 +210,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         ui.removeCallbacks(tick)
         BridgeState.uiVisible = false
+        if (tokenShown) setTokenShown(false) // que no quede a la vista en «recientes»
         super.onPause()
     }
 
@@ -194,7 +226,7 @@ class MainActivity : Activity() {
         tvState.text = if (running) "Puente encendido" else "Puente apagado"
         tvState.setTextColor(if (running) GOOD else TEXT)
         tvDetail.text = if (running) {
-            "127.0.0.1:" + BridgeState.port + " · " + clientsText(BridgeState.clients)
+            "127.0.0.1:" + BridgeState.port + " · " + clientsText(BridgeState.clients) + " · activo " + uptimeText(BridgeState.uptimeSeconds())
         } else {
             "Puerto " + Prefs.port(this)
         }
@@ -206,6 +238,70 @@ class MainActivity : Activity() {
         tvPerms.text = permsText()
         val lines = BridgeState.recent(14)
         tvLog.text = if (lines.isEmpty()) "Aún no hay actividad." else lines.joinToString("\n")
+        probeAudioAndMedia()
+    }
+
+    /** Pregunta por el audio y la música en otro hilo (son llamadas a Android que no conviene hacer en la pantalla). */
+    private fun probeAudioAndMedia() {
+        if (probing) return
+        probing = true
+        Thread {
+            var audioLine: String
+            var mediaLine: String
+            try {
+                val a = audioProbe.status()
+                audioLine = if (a.optBoolean("available")) {
+                    val out = a.optJSONObject("output")?.optString("name")
+                    "Volumen de música: " + a.optInt("volume") + " %" + (if (a.optBoolean("muted")) " (en silencio)" else "") +
+                        (if (out.isNullOrEmpty()) "" else "\nSalida: $out")
+                } else {
+                    "Audio no disponible en este móvil"
+                }
+            } catch (e: Exception) {
+                audioLine = "Audio: " + e.javaClass.simpleName
+            }
+            try {
+                val m = mediaProbe.status()
+                mediaLine = when {
+                    !m.optBoolean("listener") -> "✘ Música: falta el acceso a notificaciones"
+                    !m.optBoolean("available") -> "✔ Acceso concedido · no suena nada ahora"
+                    else -> {
+                        val t = m.optString("title").ifEmpty { "(sin título)" }
+                        val ar = m.optString("artist")
+                        val app = m.optString("app").ifEmpty { m.optString("package") }
+                        "✔ " + m.optString("state") + ": " + t + (if (ar.isEmpty()) "" else " — $ar") + "\n($app)"
+                    }
+                }
+            } catch (e: Exception) {
+                mediaLine = "Música: " + e.javaClass.simpleName
+            }
+            ui.post {
+                probing = false
+                tvAudio.text = audioLine
+                tvMedia.text = mediaLine
+            }
+        }.start()
+    }
+
+    private fun uptimeText(s: Long): String = when {
+        s < 60 -> "$s s"
+        s < 3600 -> (s / 60).toString() + " min"
+        else -> (s / 3600).toString() + " h " + ((s % 3600) / 60) + " min"
+    }
+
+    @Suppress("DEPRECATION")
+    private fun versionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    } catch (_: Exception) {
+        "?"
+    }
+
+    /** Mientras el token está a la vista, Android no deja hacer capturas ni mostrarlo en «recientes». */
+    private fun setTokenShown(v: Boolean) {
+        tokenShown = v
+        if (v) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        refresh()
     }
 
     private fun clientsText(n: Int): String = when (n) {
@@ -224,6 +320,7 @@ class MainActivity : Activity() {
         lines.add(mark(locOn, "Ubicación del sistema encendida"))
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         lines.add(mark(nm.areNotificationsEnabled(), "Avisos permitidos"))
+        lines.add(mark(NexoNotificationListener.isEnabled(this), "Acceso a notificaciones (música)"))
         if (Build.VERSION.SDK_INT >= 31) {
             lines.add(mark(granted("android.permission.BLUETOOTH_CONNECT"), "Bluetooth (dispositivos cercanos)"))
         }
@@ -246,13 +343,58 @@ class MainActivity : Activity() {
         ui.postDelayed({ refresh() }, 400)
     }
 
+    private fun restartService() {
+        BridgeState.lastError = null
+        BridgeService.stop(this)
+        ui.postDelayed({
+            try {
+                BridgeService.start(this)
+            } catch (e: Exception) {
+                toast("No se pudo iniciar: " + e.javaClass.simpleName)
+            }
+            refresh()
+        }, 700)
+        toast("Reiniciando el puente…")
+    }
+
+    private fun openListenerSettings() {
+        try {
+            startActivity(UserAction.notificationListenerSettings())
+        } catch (_: Exception) {
+            toast("Abre Ajustes › Notificaciones › Acceso a notificaciones y activa Nexo")
+        }
+    }
+
+    /** Un pitido corto por la salida de música: sirve para comprobar por dónde suena (altavoz, auriculares…). */
+    private fun playTestTone() {
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 300)
+            ui.postDelayed({ tg.release() }, 600)
+        } catch (_: Exception) {
+            toast("No se pudo reproducir el sonido de prueba")
+        }
+    }
+
+    private fun copyLog() {
+        val lines = BridgeState.recent(100)
+        if (lines.isEmpty()) {
+            toast("Aún no hay registro")
+            return
+        }
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("Nexo registro", lines.joinToString("\n")))
+        toast("Copiadas " + lines.size + " líneas (no llevan claves ni el token)")
+    }
+
     private fun copyInstall() {
         try {
             val cmd = Bootstrap.oneLiner(this, Prefs.port(this), Prefs.token(this))
             copy(cmd)
             toast(
-                if (BridgeState.running) "Comando copiado. Pégalo en Termux y pulsa Enter."
-                else "Comando copiado. Antes de pegarlo, enciende el puente."
+                (if (BridgeState.running) "Comando copiado. Pégalo en Termux y pulsa Enter."
+                else "Comando copiado. Antes de pegarlo, enciende el puente.") +
+                    " Lleva tu token: no lo compartas ni lo pegues en chats."
             )
         } catch (e: Exception) {
             toast("No se pudo preparar el comando: " + e.javaClass.simpleName)
@@ -261,7 +403,7 @@ class MainActivity : Activity() {
 
     private fun copyToken() {
         copy(Prefs.token(this))
-        toast("Token copiado")
+        toast("Token copiado. Quien lo tenga controla tu WiFi y Bluetooth: no lo compartas.")
     }
 
     private fun copy(text: String) {
@@ -330,11 +472,29 @@ class MainActivity : Activity() {
     }
 
     private fun openBattery() {
-        try {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-        } catch (_: Exception) {
-            openAppSettings()
+        val xiaomi = Build.MANUFACTURER.equals("xiaomi", true) || Build.MANUFACTURER.equals("redmi", true) ||
+            Build.MANUFACTURER.equals("poco", true)
+        val steps = if (xiaomi) {
+            "1. En la pantalla que se abre, busca Nexo y elige «Sin restricciones».\n" +
+                "2. Activa «Inicio automático» (botón de abajo).\n" +
+                "3. En Recientes, mantén pulsada la tarjeta de Nexo y toca el candado.\n\n" +
+                "HyperOS/MIUI congela las apps en segundo plano aunque el puente esté encendido; con esto lo hace mucho menos."
+        } else {
+            "1. En la pantalla que se abre, busca Nexo y elige «Sin restricciones» (o «No optimizar»).\n" +
+                "2. Si tu móvil tiene «Inicio automático» o «Apps protegidas», actívalo para Nexo."
         }
+        AlertDialog.Builder(this)
+            .setTitle("Que Android no cierre el puente")
+            .setMessage(steps)
+            .setPositiveButton("Abrir ajustes") { _, _ ->
+                try {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (_: Exception) {
+                    openAppSettings()
+                }
+            }
+            .setNegativeButton("Ahora no", null)
+            .show()
     }
 
     private fun openAutostart() {

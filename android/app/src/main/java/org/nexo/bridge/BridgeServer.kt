@@ -1,6 +1,7 @@
 package org.nexo.bridge
 
 import android.content.Context
+import android.os.SystemClock
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -13,9 +14,17 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.security.MessageDigest
+import java.util.concurrent.Callable
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+
+/** Nombre con el que el propio puente se hace ping a sí mismo: no cuenta como cliente ni se anota. */
+const val WATCHDOG_CLIENT = "nexo-watchdog"
 
 /**
  * Servidor TCP que SOLO escucha en 127.0.0.1 (nunca es visible desde la red).
@@ -23,7 +32,11 @@ import java.util.concurrent.Executors
  *
  * Seguridad: cualquier app del móvil puede conectarse a un puerto local, así que hasta que
  * el cliente no envíe `hello` con el token correcto solo se acepta `bootstrap`, que devuelve
- * contenido público (el instalador del cliente) y nunca contiene el token.
+ * contenido público (el instalador del cliente) y nunca contiene el token. `bootstrap` tiene
+ * límite de ritmo (1 cada 2 s y 10 por minuto en total) para que nadie lo use para agotar la app.
+ *
+ * Robustez: cada comando corre en su propio hilo con un plazo; si se pasa, el cliente recibe
+ * `timeout` y la conexión sigue viva (un comando colgado no deja a nadie sin respuesta).
  */
 class BridgeServer(
     private val ctx: Context,
@@ -36,10 +49,15 @@ class BridgeServer(
         const val AUTH_TIMEOUT_MS = 8000
         const val AUTH_FAIL_DELAY_MS = 800L
         const val MAX_CLIENTS = 16
+        const val BOOTSTRAP_MIN_GAP_MS = 2000L
+        const val BOOTSTRAP_MAX_PER_MIN = 10
     }
 
     private var server: ServerSocket? = null
     private val pool: ExecutorService = Executors.newCachedThreadPool()
+
+    /** Aquí corren los comandos (aparte de los hilos de las conexiones) para poder ponerles plazo. */
+    private val cmdPool: ExecutorService = Executors.newCachedThreadPool()
     private val clients = CopyOnWriteArrayList<Client>()
 
     @Volatile
@@ -62,6 +80,7 @@ class BridgeServer(
         }
         for (c in clients) c.close()
         pool.shutdownNow()
+        cmdPool.shutdownNow()
     }
 
     /** Envía un evento a todos los clientes autenticados que lo pidieron con `subscribe`. */
@@ -73,7 +92,7 @@ class BridgeServer(
     }
 
     private fun refreshCount() {
-        BridgeState.clients = clients.count { it.authed }
+        BridgeState.clients = clients.count { it.authed && !it.silent }
         onClientsChanged()
     }
 
@@ -82,7 +101,15 @@ class BridgeServer(
             val s = try {
                 ss.accept()
             } catch (_: IOException) {
-                break
+                if (stopping || ss.isClosed) break
+                // Un fallo suelto de accept() (p. ej. demasiados archivos abiertos) no debe matar el puente.
+                BridgeState.log("accept() falló; sigo escuchando")
+                try {
+                    Thread.sleep(200)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
             }
             if (clients.size >= MAX_CLIENTS) {
                 try {
@@ -124,13 +151,43 @@ class BridgeServer(
     /** Qué se anota en el registro de la pantalla. Nunca claves ni token. */
     private fun describe(cmd: String, req: JSONObject): String = when (cmd) {
         "wifi.connect" -> "wifi.connect " + req.optString("ssid", "").take(32)
-        "bt.connect", "bt.disconnect" -> cmd + " " + req.optString("address", "").take(17)
+        "bt.connect", "bt.disconnect", "bt.forget", "bt.rename", "bt.info" -> cmd + " " + req.optString("address", "").take(17)
+        "wifi.forget" -> "wifi.forget " + req.optString("ssid", req.opt("network_id")?.toString() ?: "").take(32)
+        "audio.volume" -> "audio.volume " + listOf("percent", "level", "delta", "mute").firstOrNull { req.has(it) }.orEmpty()
         else -> cmd
+    }
+
+    private val bootstrapLock = Any()
+    private val bootstrapAt = ArrayDeque<Long>()
+
+    /** Límite de ritmo de `bootstrap` (global, no por conexión: abrir muchas conexiones no lo esquiva). */
+    private fun bootstrapAllowed(): Boolean = synchronized(bootstrapLock) {
+        val now = SystemClock.elapsedRealtime()
+        while (bootstrapAt.isNotEmpty() && now - bootstrapAt.first() > 60_000L) bootstrapAt.removeFirst()
+        if (bootstrapAt.isNotEmpty() && now - bootstrapAt.last() < BOOTSTRAP_MIN_GAP_MS) return false
+        if (bootstrapAt.size >= BOOTSTRAP_MAX_PER_MIN) return false
+        bootstrapAt.addLast(now)
+        true
+    }
+
+    /** Plazo (ms) de cada comando: lo que él mismo espera como máximo más un margen. */
+    private fun timeoutFor(cmd: String, req: JSONObject): Long = when (cmd) {
+        "wifi.connect" -> req.optLong("wait_ms", 12000).coerceIn(0L, 30000L) + 8000L
+        "wifi.reconnect" -> req.optLong("wait_ms", 8000).coerceIn(0L, 30000L) + 6000L
+        "wifi.scan" -> req.optLong("timeout_ms", 4000).coerceIn(500L, 15000L) + 6000L
+        "wifi.enable", "wifi.disable" -> 10000L
+        "bt.enable", "bt.disable" -> 12000L
+        "bt.paired", "bt.info", "bt.forget" -> 10000L
+        else -> 8000L
     }
 
     private inner class Client(private val sock: Socket) : Runnable {
         @Volatile
         var authed = false
+
+        /** true para el ping interno del puente: ni se cuenta ni se anota. */
+        @Volatile
+        var silent = false
 
         @Volatile
         private var topics: Set<String> = emptySet()
@@ -163,7 +220,7 @@ class BridgeServer(
                 sock.close()
             } catch (_: IOException) {
             }
-            if (clients.remove(this)) refreshCount()
+            if (clients.remove(this) && !silent) refreshCount()
         }
 
         override fun run() {
@@ -182,6 +239,8 @@ class BridgeServer(
                 BridgeState.log("Se cerró una conexión que no se autenticó a tiempo")
             } catch (_: IOException) {
                 // el cliente se fue
+            } catch (_: InterruptedException) {
+                // el puente se está deteniendo
             } catch (e: Exception) {
                 BridgeState.log("Error interno: " + e.javaClass.simpleName)
             } finally {
@@ -201,7 +260,12 @@ class BridgeServer(
             val cmd = req.optString("cmd", "")
 
             if (cmd == "bootstrap") {
-                serveBootstrap()
+                if (bootstrapAllowed()) {
+                    serveBootstrap()
+                } else {
+                    send(Protocol.error(null, "rate_limited", "Demasiadas peticiones de instalación seguidas; espera unos segundos"))
+                    BridgeState.log("Se frenó una petición de instalador (demasiado seguidas)")
+                }
                 return false
             }
 
@@ -217,11 +281,16 @@ class BridgeServer(
                     return false
                 }
                 authed = true
-sock.soTimeout = 0
-send(Protocol.ok(id, commands.hello())) // <-- ENVIAR PRIMERO
-refreshCount()                          // <-- UI DESPUÉS
-BridgeState.log("Cliente conectado: " + req.optString("client", "?").take(40))
-return true
+                sock.soTimeout = 0
+                val who = req.optString("client", "?").take(40)
+                silent = who == WATCHDOG_CLIENT
+                // Primero la respuesta (que es lo que espera el cliente); el recuento y el registro, después.
+                send(Protocol.ok(id, commands.hello()))
+                if (!silent) {
+                    refreshCount()
+                    BridgeState.log("Cliente conectado: $who")
+                }
+                return true
             }
 
             when (cmd) {
@@ -242,12 +311,11 @@ return true
             val wanted = HashSet<String>()
             val arr = req.optJSONArray("topics")
             if (arr == null) {
-                wanted.add("wifi")
-                wanted.add("bt")
+                wanted.addAll(Commands.TOPICS)
             } else {
                 for (i in 0 until arr.length()) {
                     val t = arr.optString(i)
-                    if (t == "wifi" || t == "bt") wanted.add(t)
+                    if (t in Commands.TOPICS) wanted.add(t)
                 }
             }
             topics = wanted
@@ -266,28 +334,37 @@ return true
         }
 
         private fun runCommand(id: Any?, cmd: String, req: JSONObject) {
-    // 1. Ejecutamos el comando y preparamos la respuesta
-    val resp: JSONObject = try {
-        Protocol.ok(id, commands.handle(cmd, req))
-    } catch (e: CmdException) {
-        Protocol.error(id, e.code, e.message ?: e.code, e.extra)
-    } catch (e: SecurityException) {
-        Protocol.error(id, "permission_denied", "Android negó un permiso: " + (e.message ?: ""))
-    } catch (e: Exception) {
-        Protocol.error(id, "internal", e.javaClass.simpleName + ": " + (e.message ?: ""))
-    }
-    
-    // 2. ENVIAMOS AL INSTANTE (milisegundos)
-    send(resp)
-    
-    // 3. Logueamos DESPUÉS para no bloquear al cliente
-    if (resp.has("error")) {
-        val errCode = resp.optJSONObject("error")?.optString("code") ?: "error"
-        BridgeState.log("x " + cmd + ": " + errCode)
-    } else {
-        BridgeState.log("> " + describe(cmd, req))
-    }
-}
+            val t0 = SystemClock.elapsedRealtime()
+            val job = try {
+                cmdPool.submit(Callable { commands.handle(cmd, req) })
+            } catch (_: RejectedExecutionException) {
+                send(Protocol.error(id, "internal", "El puente se está deteniendo"))
+                return
+            }
+            val resp: JSONObject = try {
+                Protocol.ok(id, job.get(timeoutFor(cmd, req), TimeUnit.MILLISECONDS))
+            } catch (_: TimeoutException) {
+                job.cancel(true) // interrumpe la espera del comando; la conexión sigue viva
+                Protocol.error(id, "timeout", "El comando $cmd tardó demasiado y se canceló")
+            } catch (e: ExecutionException) {
+                errorFor(id, e.cause ?: e)
+            }
+
+            // Se contesta AL INSTANTE; anotar en el registro (que toca la pantalla) va después.
+            send(resp)
+            val ms = SystemClock.elapsedRealtime() - t0
+            if (resp.optBoolean("ok", false)) {
+                BridgeState.log("> " + describe(cmd, req) + if (ms >= 300) " ($ms ms)" else "")
+            } else {
+                BridgeState.log("x " + cmd + ": " + resp.optString("error", "error") + if (ms >= 300) " ($ms ms)" else "")
+            }
+        }
+
+        private fun errorFor(id: Any?, t: Throwable): JSONObject = when (t) {
+            is CmdException -> Protocol.error(id, t.code, t.message ?: t.code, t.extra)
+            is SecurityException -> Protocol.error(id, "permission_denied", "Android negó un permiso: " + (t.message ?: ""))
+            else -> Protocol.error(id, "internal", t.javaClass.simpleName + ": " + (t.message ?: ""))
+        }
 
         private fun serveBootstrap() {
             try {

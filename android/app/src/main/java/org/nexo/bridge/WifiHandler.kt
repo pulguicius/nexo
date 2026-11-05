@@ -7,6 +7,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.wifi.ScanResult
 import android.net.wifi.SupplicantState
 import android.net.wifi.WifiConfiguration
@@ -14,6 +16,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.Inet4Address
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -68,6 +71,9 @@ class WifiHandler(context: Context) {
         var freq: Int? = null
         var speed: Int? = null
         var ip: String? = null
+        var gateway: String? = null
+        var prefix: Int? = null
+        var dns: List<String>? = null
 
         if (enabled) {
             val info = try {
@@ -89,6 +95,13 @@ class WifiHandler(context: Context) {
                 if (info.frequency > 0) freq = info.frequency
                 if (info.linkSpeed > 0) speed = info.linkSpeed
                 ip = ipToString(info.ipAddress)
+                val cfg = ipConfig(m)
+                if (cfg != null) {
+                    ip = cfg.ip ?: ip
+                    gateway = cfg.gateway
+                    prefix = cfg.prefix
+                    dns = cfg.dns
+                }
             }
         }
 
@@ -102,7 +115,66 @@ class WifiHandler(context: Context) {
         o.putOrNull("band", freq?.let { bandOf(it) })
         o.putOrNull("link_speed", speed)
         o.putOrNull("ip", ip)
+        o.putOrNull("gateway", gateway)
+        o.putOrNull("netmask", prefix?.let { netmaskText(it) })
+        o.putOrNull("prefix", prefix)
+        o.putOrNull("dns", dns?.let { JSONArray(it) })
         return o
+    }
+
+    /** Datos de red del WiFi actual: ip, puerta de enlace, prefijo (24) y DNS. */
+    private class IpCfg(val ip: String?, val gateway: String?, val prefix: Int?, val dns: List<String>)
+
+    /**
+     * Primero se pregunta a ConnectivityManager (lo más fiable en Android recientes) y, si no
+     * hay respuesta, a DhcpInfo (la API antigua, que sigue funcionando al apuntar a API 28).
+     */
+    @Suppress("DEPRECATION")
+    private fun ipConfig(m: WifiManager): IpCfg? {
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (cm != null) {
+                for (n in cm.allNetworks) {
+                    val caps = cm.getNetworkCapabilities(n) ?: continue
+                    if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue
+                    val lp = cm.getLinkProperties(n) ?: continue
+                    var ip: String? = null
+                    var prefix: Int? = null
+                    for (la in lp.linkAddresses) {
+                        val a = la.address
+                        if (a is Inet4Address) {
+                            ip = a.hostAddress
+                            prefix = la.prefixLength
+                            break
+                        }
+                    }
+                    if (ip == null) continue
+                    var gw: String? = null
+                    for (r in lp.routes) {
+                        val g = r.gateway
+                        if (r.isDefaultRoute && g is Inet4Address) {
+                            gw = g.hostAddress
+                            break
+                        }
+                    }
+                    val dns = lp.dnsServers.mapNotNull { it.hostAddress?.substringBefore('%') }
+                        .sortedBy { it.contains(':') } // primero las IPv4
+                    return IpCfg(ip, gw, prefix, dns)
+                }
+            }
+        } catch (_: Exception) {
+            // seguimos con DhcpInfo
+        }
+        return try {
+            val d = m.dhcpInfo ?: return null
+            if (d.ipAddress == 0 && d.gateway == 0) return null
+            IpCfg(
+                ipToString(d.ipAddress), ipToString(d.gateway), prefixFromNetmask(d.netmask),
+                listOfNotNull(ipToString(d.dns1), ipToString(d.dns2))
+            )
+        } catch (_: Exception) {
+            null
+        }
     }
 
     // ------------------------------------------------------- encender / apagar
@@ -310,6 +382,103 @@ class WifiHandler(context: Context) {
         return JSONObject().put("requested", true)
     }
 
+    // ------------------------------------------------- redes guardadas
+
+    private fun requireLocationPermission() {
+        if (!hasLocation()) {
+            throw CmdException(
+                "permission_denied",
+                "Falta el permiso de ubicación: Android lo exige para ver las redes guardadas. Concédelo en la app Nexo.",
+                JSONObject().put("permission", "ACCESS_FINE_LOCATION")
+            )
+        }
+    }
+
+    private fun configured(m: WifiManager): List<WifiConfiguration> = try {
+        m.configuredNetworks ?: emptyList()
+    } catch (_: SecurityException) {
+        throw CmdException(
+            "permission_denied", "Android negó leer las redes guardadas",
+            JSONObject().put("permission", "ACCESS_FINE_LOCATION")
+        )
+    }
+
+    private fun ssidOf(c: WifiConfiguration): String = (c.SSID ?: "").removeSurrounding("\"")
+
+    fun saved(): JSONObject {
+        val m = requireWm()
+        requireLocationPermission()
+        val currentId = connectedNetworkId(m)
+        val arr = JSONArray()
+        for (c in configured(m)) {
+            val name = ssidOf(c)
+            if (name.isEmpty() || name == UNKNOWN_SSID) continue
+            val n = JSONObject()
+            n.put("network_id", c.networkId)
+            n.put("ssid", name)
+            n.put("security", securityOf(c))
+            n.put("hidden", c.hiddenSSID)
+            n.put("current", currentId != -1 && c.networkId == currentId)
+            arr.put(n)
+        }
+        return JSONObject().put("networks", arr)
+    }
+
+    fun forget(req: JSONObject): JSONObject {
+        val m = requireWm()
+        val byId = req.has("network_id") && !req.isNull("network_id")
+        val bySsid = req.has("ssid") && !req.isNull("ssid")
+        if (!byId && !bySsid) throw CmdException("bad_request", "Indica ssid o network_id")
+        requireLocationPermission()
+        val all = configured(m)
+        val targets = if (byId) {
+            val id = req.optInt("network_id", Int.MIN_VALUE)
+            all.filter { it.networkId == id }
+        } else {
+            val name = req.optString("ssid", "")
+            all.filter { ssidOf(it) == name }
+        }
+        if (targets.isEmpty()) throw CmdException("not_found", "No hay ninguna red guardada con ese nombre")
+        var removed = 0
+        for (c in targets) {
+            val ok = try {
+                m.removeNetwork(c.networkId)
+            } catch (_: SecurityException) {
+                false
+            }
+            if (ok) removed++
+        }
+        if (removed == 0) {
+            needsUser(
+                "Android no dejó que Nexo borre esa red (solo puede borrarla quien la creó).",
+                "Olvidar una red WiFi"
+            )
+        }
+        try {
+            m.saveConfiguration() // en Android 9 o menos hace falta para que el cambio quede guardado
+        } catch (_: Exception) {
+        }
+        return JSONObject().put("removed", removed)
+    }
+
+    fun reconnect(req: JSONObject): JSONObject {
+        val m = requireWm()
+        if (!m.isWifiEnabled) throw CmdException("wifi_disabled", "El WiFi está apagado")
+        val waitMs = req.optLong("wait_ms", 8000).coerceIn(0L, 30000L)
+        val asked = try {
+            if (connectedNetworkId(m) == -1) m.reconnect() else m.reassociate()
+        } catch (_: SecurityException) {
+            false
+        }
+        if (!asked) throw CmdException("failed", "Android no aceptó reconectar el WiFi")
+        val connected = if (waitMs > 0) waitUntil(waitMs) { connectedNetworkId(m) != -1 } else connectedNetworkId(m) != -1
+        val o = JSONObject()
+        o.put("requested", true)
+        o.put("connected", connected)
+        if (!connected) o.put("hint", "No se confirmó la conexión: puede que la red no esté a la vista.")
+        return o
+    }
+
     // ---------------------------------------------------------------- ayudas
 
     private fun connectedNetworkId(m: WifiManager): Int {
@@ -322,10 +491,10 @@ class WifiHandler(context: Context) {
     }
 
     /** Devuelve (lanzando) needs_user_action y deja la notificación del panel WiFi. */
-    private fun needsUser(why: String): Nothing {
+    private fun needsUser(why: String, title: String = "Conectar a una red WiFi"): Nothing {
         UserAction.open(
-            ctx, UserAction.ID_WIFI, "Conectar a una red WiFi",
-            "Toca para elegir la red: $why", UserAction.wifiPanel()
+            ctx, UserAction.ID_WIFI, title,
+            "Toca para abrir el panel de WiFi: $why", UserAction.wifiPanel()
         )
         throw CmdException(
             "needs_user_action",
@@ -356,6 +525,20 @@ class WifiHandler(context: Context) {
             mhz < 3000 -> "2.4GHz"
             mhz < 5925 -> "5GHz"
             else -> "6GHz"
+        }
+
+        /** Seguridad de una red GUARDADA (la de una red a la vista sale de securityOf(String)). */
+        fun securityOf(c: WifiConfiguration): String {
+            val km = c.allowedKeyManagement
+            return when {
+                km.get(WifiConfiguration.KeyMgmt.SAE) -> "WPA3"
+                km.get(WifiConfiguration.KeyMgmt.OWE) -> "OWE"
+                km.get(WifiConfiguration.KeyMgmt.WPA_EAP) || km.get(WifiConfiguration.KeyMgmt.IEEE8021X) -> "WPA2"
+                km.get(WifiConfiguration.KeyMgmt.WPA_PSK) || km.get(4) -> // 4 = WPA2_PSK (constante oculta)
+                    if (c.allowedProtocols.get(WifiConfiguration.Protocol.RSN) || !c.allowedProtocols.get(WifiConfiguration.Protocol.WPA)) "WPA2" else "WPA"
+                c.wepKeys?.any { it != null } == true -> "WEP"
+                else -> "OPEN"
+            }
         }
 
         fun securityOf(cap: String): String = when {

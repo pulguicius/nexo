@@ -6,8 +6,10 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
+import java.lang.reflect.InvocationTargetException
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -180,7 +182,8 @@ class BluetoothHandler(context: Context) {
 
     // ------------------------------------------------- conectar / desconectar
 
-    fun connect(req: JSONObject, connect: Boolean): JSONObject {
+    /** Valida `address` y devuelve el adaptador y el dispositivo emparejado (o lanza el error que toque). */
+    private fun bondedDevice(req: JSONObject): Pair<BluetoothAdapter, BluetoothDevice> {
         val a = requireAdapter()
         val addr = req.optString("address", "").uppercase()
         if (!ADDR.matches(addr)) {
@@ -189,17 +192,26 @@ class BluetoothHandler(context: Context) {
         if (a.state != BluetoothAdapter.STATE_ON) {
             throw CmdException("bluetooth_disabled", "El Bluetooth está apagado")
         }
-        val dev = (try {
+        val dev = try {
             a.bondedDevices?.firstOrNull { it.address.equals(addr, ignoreCase = true) }
         } catch (_: SecurityException) {
-            null
-        }) ?: throw CmdException("not_paired", "Ese dispositivo no está emparejado en Android")
-        val name: String = (try {
-            dev.name
-        } catch (_: SecurityException) {
-            null
-        }) ?: addr
+            throw CmdException(
+                "permission_denied", "Android negó leer los dispositivos emparejados",
+                JSONObject().put("permission", "BLUETOOTH_CONNECT")
+            )
+        } ?: throw CmdException("not_paired", "Ese dispositivo no está emparejado en Android")
+        return Pair(a, dev)
+    }
 
+    private fun nameOf(d: BluetoothDevice): String? = try {
+        d.name
+    } catch (_: SecurityException) {
+        null
+    }
+
+    fun connect(req: JSONObject, connect: Boolean): JSONObject {
+        val (_, dev) = bondedDevice(req)
+        val name: String = nameOf(dev) ?: dev.address
         UserAction.open(
             ctx, UserAction.ID_BT,
             if (connect) "Conectar $name" else "Desconectar $name",
@@ -212,6 +224,120 @@ class BluetoothHandler(context: Context) {
                 "Te dejé una notificación que abre los ajustes de Bluetooth.",
             JSONObject().put("action", "notification").put("opens", "bluetooth_settings")
         )
+    }
+
+    // ------------------------------------------- olvidar / renombrar / info
+
+    /**
+     * Desempareja. `BluetoothDevice.removeBond()` NO es API pública: se llama por reflexión y solo
+     * funciona porque la app apunta a API 28. Si Android la bloquea, se pide un toque (no se falla en silencio).
+     */
+    fun forget(req: JSONObject): JSONObject {
+        val (a, dev) = bondedDevice(req)
+        val addr = dev.address
+        val accepted = try {
+            BluetoothDevice::class.java.getMethod("removeBond").invoke(dev) as? Boolean ?: false
+        } catch (_: Exception) {
+            false
+        }
+        if (!accepted) {
+            UserAction.open(
+                ctx, UserAction.ID_BT, "Olvidar " + (nameOf(dev) ?: addr),
+                "Toca para abrir los ajustes de Bluetooth y olvidar el dispositivo.",
+                UserAction.bluetoothSettings()
+            )
+            throw CmdException(
+                "needs_user_action",
+                "Android no dejó que Nexo desempareje el dispositivo. Te dejé una notificación que abre los ajustes de Bluetooth.",
+                JSONObject().put("action", "notification").put("opens", "bluetooth_settings")
+            )
+        }
+        val gone = waitUntil(3000) {
+            try {
+                a.bondedDevices?.none { it.address.equals(addr, ignoreCase = true) } ?: true
+            } catch (_: SecurityException) {
+                true
+            }
+        }
+        val o = JSONObject().put("removed", gone)
+        if (!gone) o.put("hint", "Android aceptó la orden pero el dispositivo sigue emparejado.")
+        return o
+    }
+
+    /** Cambia el nombre que Android muestra para ese dispositivo (alias). Con `name` vacío, quita el alias. */
+    fun rename(req: JSONObject): JSONObject {
+        val (_, dev) = bondedDevice(req)
+        if (Build.VERSION.SDK_INT < 31) {
+            throw CmdException("unsupported", "Renombrar dispositivos Bluetooth necesita Android 12 o más")
+        }
+        val name = req.optString("name", "").trim()
+        // Se llama por reflexión: setAlias devolvía boolean en Android 12 y devuelve int en Android 13+;
+        // una llamada directa fallaría (NoSuchMethodError) en una de las dos.
+        val ok = try {
+            val m = BluetoothDevice::class.java.getMethod("setAlias", String::class.java)
+            val r = m.invoke(dev, if (name.isEmpty()) nameOf(dev) else name)
+            when (r) {
+                is Boolean -> r
+                is Int -> r == 0 // BluetoothStatusCodes.SUCCESS
+                else -> true
+            }
+        } catch (e: InvocationTargetException) {
+            val c = e.cause
+            if (c is SecurityException) {
+                throw CmdException(
+                    "permission_denied", "Android negó cambiar el nombre",
+                    JSONObject().put("permission", "BLUETOOTH_CONNECT")
+                )
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
+        if (!ok) throw CmdException("failed", "Android no aceptó cambiar el nombre del dispositivo")
+        return JSONObject().put("address", dev.address).putOrNull("alias", aliasOf(dev))
+    }
+
+    fun info(req: JSONObject): JSONObject {
+        val (a, dev) = bondedDevice(req)
+        val addr = dev.address
+        val live = connectedByProfile(a)[addr]
+        val o = JSONObject()
+        o.put("address", addr)
+        o.putOrNull("name", nameOf(dev))
+        o.putOrNull("alias", aliasOf(dev))
+        o.put("type", typeName(dev.type))
+        o.put("class", classOf(dev.bluetoothClass))
+        o.put(
+            "bond_state", when (dev.bondState) {
+                BluetoothDevice.BOND_BONDED -> "bonded"
+                BluetoothDevice.BOND_BONDING -> "bonding"
+                else -> "none"
+            }
+        )
+        o.put("connected", live != null && live.isNotEmpty())
+        o.put("profiles", JSONArray(live?.sorted() ?: emptyList<String>()))
+        val uu = JSONArray()
+        try {
+            dev.uuids?.forEach { uu.put(it.toString().lowercase()) }
+        } catch (_: SecurityException) {
+        }
+        o.put("uuids", uu)
+        o.putOrNull("battery", batteryOf(dev))
+        return o
+    }
+
+    private fun aliasOf(d: BluetoothDevice): String? = try {
+        if (Build.VERSION.SDK_INT >= 30) d.alias ?: d.name else d.name
+    } catch (_: SecurityException) {
+        null
+    }
+
+    /** Porcentaje de batería del dispositivo si lo informa (API oculta, por reflexión); null si no. */
+    private fun batteryOf(d: BluetoothDevice): Int? = try {
+        val v = BluetoothDevice::class.java.getMethod("getBatteryLevel").invoke(d) as? Int
+        if (v != null && v in 0..100) v else null
+    } catch (_: Exception) {
+        null
     }
 
     // ---------------------------------------------------------------- ayudas

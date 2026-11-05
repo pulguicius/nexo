@@ -1,5 +1,6 @@
 package org.nexo.bridge
 
+import android.os.SystemClock
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -15,7 +16,10 @@ object BridgeState {
     @Volatile var lastError: String? = null
     @Volatile var uiVisible = false
 
-    private const val MAX_LINES = 80
+    /** SystemClock.elapsedRealtime() del momento en que el puente empezó a escuchar (0 si no escucha). */
+    @Volatile var startedAt = 0L
+
+    private const val MAX_LINES = 200
     private val lines = ArrayList<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
@@ -27,4 +31,10 @@ object BridgeState {
 
     @Synchronized
     fun recent(n: Int): List<String> = lines.takeLast(n)
+
+    /** Segundos que lleva escuchando el puente (0 si está apagado). */
+    fun uptimeSeconds(): Long {
+        val t = startedAt
+        return if (t == 0L) 0L else (SystemClock.elapsedRealtime() - t) / 1000
+    }
 }

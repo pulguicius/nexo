@@ -7,4 +7,9 @@
         <item name="android:colorAccent">@color/nexo_accent</item>
         <item name="android:textColorPrimary">@color/nexo_text</item>
     </style>
+
+    <!-- Para StartActivity: no se ve nada, solo enciende el puente y se cierra -->
+    <style name="Theme.Nexo.Transparent" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
 </resources>

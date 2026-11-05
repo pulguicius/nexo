@@ -38,7 +38,8 @@ object Bootstrap {
         val client = readAsset(ctx, "bin/nexo")
         val installer = readAsset(ctx, "install.sh")
         val b64 = Base64.encodeToString(client.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        val head = "#!/usr/bin/env bash\nNEXO_CLIENT_B64='$b64'\nexport NEXO_CLIENT_B64\n"
+        // Sin `export`: una variable de entorno no puede pasar de 128 KiB y el cliente crecerá.
+        val head = "#!/usr/bin/env bash\nNEXO_CLIENT_B64='$b64'\n"
         return (head + installer).toByteArray(Charsets.UTF_8)
     }
 

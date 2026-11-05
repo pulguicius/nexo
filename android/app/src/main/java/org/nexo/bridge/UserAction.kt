@@ -22,6 +22,9 @@ object UserAction {
 
     const val ID_WIFI = 1001
     const val ID_BT = 1002
+    const val ID_AUDIO = 1003
+    const val ID_LISTENER = 1004
+    const val ID_RECOVERY = 1005
 
     /**
      * Crea los canales de notificación. Se llama al abrir la pantalla: en Android 13+ eso es
@@ -73,4 +76,12 @@ object UserAction {
     fun bluetoothEnable(): Intent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
 
     fun bluetoothSettings(): Intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
+
+    /** Panel de volumen (Android 10+) o, en versiones anteriores, los ajustes de sonido. */
+    fun volumePanel(): Intent =
+        if (Build.VERSION.SDK_INT >= 29) Intent(Settings.Panel.ACTION_VOLUME)
+        else Intent(Settings.ACTION_SOUND_SETTINGS)
+
+    /** Donde el usuario concede a Nexo el «acceso a notificaciones» (necesario para controlar la música). */
+    fun notificationListenerSettings(): Intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
 }
