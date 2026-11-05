@@ -1,0 +1,85 @@
+name: Compilar y probar Nexo
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # solo se usa para publicar el APK en una Release cuando creas una etiqueta v*
+
+jobs:
+  cliente:
+    name: Probar el cliente de Termux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar herramientas de prueba
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      # Aviso, no bloquea: sirve para ver los hallazgos de shellcheck sin que una observación tumbe la compilación.
+      - name: shellcheck (solo errores)
+        continue-on-error: true
+        run: shellcheck -S error termux/bin/nexo termux/install.sh tests/run_tests.sh
+      - name: Pruebas contra la app simulada
+        run: bash tests/run_tests.sh
+
+  apk:
+    name: Compilar el APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Firma estable (opcional). Si creas estos secretos en el repositorio, todas las compilaciones
+      # llevan la misma firma y se instalan encima de la anterior sin desinstalar. Si no existen,
+      # el APK se firma con una clave de depuración y se instala igual (pero cada compilación es distinta).
+      - name: Preparar la firma (si hay secretos)
+        env:
+          KS_B64: ${{ secrets.NEXO_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.NEXO_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.NEXO_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.NEXO_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/nexo.jks"
+            {
+              echo "NEXO_KEYSTORE=$RUNNER_TEMP/nexo.jks"
+              echo "NEXO_KEYSTORE_PASSWORD=$KS_PASS"
+              echo "NEXO_KEY_ALIAS=$KEY_ALIAS"
+              echo "NEXO_KEY_PASSWORD=$KEY_PASS"
+            } >> "$GITHUB_ENV"
+            echo "Se firmará con tu clave."
+          else
+            echo "Sin secretos de firma: se usará la clave de depuración."
+          fi
+
+      - name: Compilar
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Poner nombre al APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/nexo-${GITHUB_REF_NAME//\//-}.apk"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexo-apk
+          path: dist/*.apk
+
+      - name: Publicar en la Release (solo con etiquetas v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
