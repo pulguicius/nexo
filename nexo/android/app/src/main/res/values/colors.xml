@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="nexo_bg">#FF0F1115</color>
+    <color name="nexo_accent">#FFF4B860</color>
+    <color name="nexo_text">#FFECEAE4</color>
+    <color name="ic_launcher_background">#FF14161C</color>
+</resources>

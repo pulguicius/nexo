@@ -1,0 +1,2058 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""nexo-dbus: la música del móvil (y, más adelante, el Bluetooth y la red) como servicios D-Bus estándar.
+
+Es el segundo binario de Nexo (el primero es el cliente `nexo`). Dentro de una distro de proot —donde no hay
+reproductor, ni BlueZ, ni NetworkManager— `nexo-dbus` finge ser un reproductor MPRIS 2 (org.mpris.MediaPlayer2.nexo)
+y lo que suene en Android aparece en `playerctl`, Waybar, Quickshell, los controles multimedia de GNOME y de KDE…
+sin escribir una línea de configuración para cada barra o escritorio.
+
+  · Solo necesita python3 (3.7 o más). Habla D-Bus él solo: no usa pydbus, dbus-python ni GLib.
+  · Habla con la app por el mismo protocolo que el cliente (docs/PROTOCOLO.md): 127.0.0.1, JSON por línea y token.
+  · Va por distro y por sesión: se une al bus de SESIÓN del escritorio (el que ya tengas) y aparece solo mientras
+    Android tenga algo reproduciéndose.
+
+Uso:  nexo-dbus run | start | stop | restart | status | env | version | help      (nexo-dbus help para ver todo)
+"""
+
+import binascii
+import collections
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from urllib.parse import quote, unquote_to_bytes
+
+VERSION = "0.3.0"
+CLIENT_NAME = "nexo-dbus/" + VERSION
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.nexo"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+BUS_NAME = "org.freedesktop.DBus"
+BUS_PATH = "/org/freedesktop/DBus"
+IF_PROPS = "org.freedesktop.DBus.Properties"
+IF_INTRO = "org.freedesktop.DBus.Introspectable"
+IF_PEER = "org.freedesktop.DBus.Peer"
+
+ERR_FAILED = "org.freedesktop.DBus.Error.Failed"
+ERR_NOREPLY = "org.freedesktop.DBus.Error.NoReply"
+ERR_ARGS = "org.freedesktop.DBus.Error.InvalidArgs"
+ERR_NOOBJ = "org.freedesktop.DBus.Error.UnknownObject"
+ERR_NOMETHOD = "org.freedesktop.DBus.Error.UnknownMethod"
+ERR_NOIFACE = "org.freedesktop.DBus.Error.UnknownInterface"
+ERR_NOPROP = "org.freedesktop.DBus.Error.UnknownProperty"
+ERR_RO = "org.freedesktop.DBus.Error.PropertyReadOnly"
+ERR_UNSUPPORTED = "org.freedesktop.DBus.Error.NotSupported"
+
+EXIT_USAGE = 2
+EXIT_NOBUS = 3
+EXIT_NOTOKEN = 11
+
+# ----------------------------------------------------------------------------------------------------- utilidades
+
+
+class Log(object):
+    level = 1  # 0 = solo errores, 1 = normal, 2 = depuración
+    stream = sys.stderr
+    lock = threading.Lock()
+
+
+def log(msg, lvl=1):
+    if lvl > Log.level:
+        return
+    line = "%s %s\n" % (time.strftime("%H:%M:%S"), msg)
+    with Log.lock:
+        try:
+            Log.stream.write(line)
+            Log.stream.flush()
+        except Exception:
+            pass
+
+
+def dbg(msg):
+    log(msg, 2)
+
+
+def home_dir():
+    h = os.path.expanduser("~")
+    return h if h and h != "~" else "/tmp"
+
+
+def cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(home_dir(), ".cache")
+    return os.path.join(base, "nexo")
+
+
+def runtime_dir():
+    d = os.environ.get("XDG_RUNTIME_DIR")
+    if d and os.path.isdir(d) and os.access(d, os.W_OK):
+        return d
+    return cache_dir()
+
+
+def ensure_dir(path):
+    try:
+        os.makedirs(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def clean_text(s):
+    """Texto apto para D-Bus: UTF-8 válido y sin NUL."""
+    if s is None:
+        return ""
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", "replace")
+    return str(s).replace("\x00", "")
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: tipos
+
+_ALIGN = {"y": 1, "b": 4, "n": 2, "q": 2, "i": 4, "u": 4, "x": 8, "t": 8, "d": 8, "s": 4, "o": 4, "g": 1,
+          "a": 4, "(": 8, "{": 8, "v": 1, "h": 4}
+_FMT = {"y": "B", "b": "I", "n": "h", "q": "H", "i": "i", "u": "I", "x": "q", "t": "Q", "d": "d", "h": "I"}
+_SIZE = {"y": 1, "b": 4, "n": 2, "q": 2, "i": 4, "u": 4, "x": 8, "t": 8, "d": 8, "h": 4}
+
+MAX_MESSAGE = 16 * 1024 * 1024
+
+
+class ProtocolError(Exception):
+    pass
+
+
+class DBusError(Exception):
+    """Un error D-Bus con nombre (se devuelve al que llamó)."""
+
+    def __init__(self, name, message=""):
+        Exception.__init__(self, "%s: %s" % (name, message))
+        self.name = name
+        self.message = message
+
+
+class Variant(object):
+    __slots__ = ("sig", "value")
+
+    def __init__(self, sig, value):
+        self.sig = sig
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, Variant) and self.sig == other.sig and self.value == other.value
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self.sig)
+
+    def __repr__(self):
+        return "Variant(%r, %r)" % (self.sig, self.value)
+
+
+def _type_end(sig, i):
+    c = sig[i]
+    if c == "a":
+        if i + 1 >= len(sig):
+            raise ValueError("firma incompleta: " + sig)
+        return _type_end(sig, i + 1)
+    if c in "({":
+        depth = 0
+        for j in range(i, len(sig)):
+            if sig[j] in "({":
+                depth += 1
+            elif sig[j] in ")}":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+        raise ValueError("firma sin cerrar: " + sig)
+    return i + 1
+
+
+def split_sig(sig):
+    out = []
+    i = 0
+    while i < len(sig):
+        j = _type_end(sig, i)
+        out.append(sig[i:j])
+        i = j
+    return out
+
+
+class Writer(object):
+    def __init__(self):
+        self.b = bytearray()
+
+    def align(self, n):
+        pad = (-len(self.b)) & (n - 1)
+        if pad:
+            self.b += b"\0" * pad
+
+    def put(self, t, v):
+        c = t[0]
+        if c in "ynqiuxtdbh":
+            self.align(_SIZE[c])
+            if c == "b":
+                v = 1 if v else 0
+            elif c == "d":
+                v = float(v)
+            else:
+                v = int(v)
+            self.b += struct.pack("<" + _FMT[c], v)
+        elif c in "so":
+            data = clean_text(v).encode("utf-8", "replace")
+            self.align(4)
+            self.b += struct.pack("<I", len(data)) + data + b"\0"
+        elif c == "g":
+            data = str(v).encode("ascii")
+            self.b.append(len(data))
+            self.b += data + b"\0"
+        elif c == "v":
+            if not isinstance(v, Variant):
+                raise ValueError("se esperaba un Variant")
+            self.put("g", v.sig)
+            self.put(v.sig, v.value)
+        elif c == "a":
+            et = t[1:]
+            self.align(4)
+            lenpos = len(self.b)
+            self.b += b"\0\0\0\0"
+            self.align(_ALIGN[et[0]])
+            start = len(self.b)
+            if et[0] == "{":
+                items = v.items() if isinstance(v, dict) else v
+                for kv in items:
+                    self.put(et, kv)
+            else:
+                for e in v:
+                    self.put(et, e)
+            struct.pack_into("<I", self.b, lenpos, len(self.b) - start)
+        elif c == "(":
+            self.align(8)
+            parts = split_sig(t[1:-1])
+            if len(parts) != len(v):
+                raise ValueError("estructura con %d campos y firma de %d" % (len(v), len(parts)))
+            for st, sv in zip(parts, v):
+                self.put(st, sv)
+        elif c == "{":
+            self.align(8)
+            kt, vt = split_sig(t[1:-1])
+            self.put(kt, v[0])
+            self.put(vt, v[1])
+        else:
+            raise ValueError("tipo no soportado: " + c)
+
+
+class Reader(object):
+    def __init__(self, data, pos, fmt):
+        self.d = data
+        self.p = pos
+        self.f = fmt
+
+    def align(self, n):
+        self.p = (self.p + n - 1) & ~(n - 1)
+
+    def take(self, n):
+        if n < 0 or self.p + n > len(self.d):
+            raise ProtocolError("mensaje truncado")
+        b = self.d[self.p:self.p + n]
+        self.p += n
+        return b
+
+    def num(self, c):
+        size = _SIZE[c]
+        self.align(size)
+        return struct.unpack(self.f + _FMT[c], self.take(size))[0]
+
+    def get(self, t):
+        c = t[0]
+        if c in "ynqiuxtdh":
+            return self.num(c)
+        if c == "b":
+            return self.num("b") != 0
+        if c in "so":
+            n = self.num("u")
+            b = self.take(n)
+            self.take(1)
+            return b.decode("utf-8", "replace")
+        if c == "g":
+            n = self.take(1)[0]
+            b = self.take(n)
+            self.take(1)
+            return b.decode("ascii", "replace")
+        if c == "v":
+            sig = self.get("g")
+            if not sig or _type_end(sig, 0) != len(sig):
+                raise ProtocolError("variante con firma no válida")
+            return Variant(sig, self.get(sig))
+        if c == "a":
+            et = t[1:]
+            n = self.num("u")
+            if n > MAX_MESSAGE:
+                raise ProtocolError("array demasiado grande")
+            self.align(_ALIGN[et[0]])
+            end = self.p + n
+            if end > len(self.d):
+                raise ProtocolError("mensaje truncado")
+            if et[0] == "{":
+                kt, vt = split_sig(et[1:-1])
+                out = {}
+                while self.p < end:
+                    self.align(8)
+                    k = self.get(kt)
+                    out[k] = self.get(vt)
+            else:
+                out = []
+                while self.p < end:
+                    out.append(self.get(et))
+            if self.p != end:
+                raise ProtocolError("array mal formado")
+            return out
+        if c == "(":
+            self.align(8)
+            return tuple(self.get(x) for x in split_sig(t[1:-1]))
+        if c == "{":
+            self.align(8)
+            kt, vt = split_sig(t[1:-1])
+            return (self.get(kt), self.get(vt))
+        raise ProtocolError("tipo no soportado: " + c)
+
+
+MSG_CALL, MSG_RETURN, MSG_ERROR, MSG_SIGNAL = 1, 2, 3, 4
+FLAG_NO_REPLY = 0x1
+F_PATH, F_IFACE, F_MEMBER, F_ERROR, F_REPLY, F_DEST, F_SENDER, F_SIG = 1, 2, 3, 4, 5, 6, 7, 8
+
+
+class Message(object):
+    __slots__ = ("type", "flags", "serial", "path", "interface", "member", "error_name", "reply_serial",
+                 "destination", "sender", "signature", "body")
+
+    def __init__(self):
+        self.type = 0
+        self.flags = 0
+        self.serial = 0
+        self.path = None
+        self.interface = None
+        self.member = None
+        self.error_name = None
+        self.reply_serial = None
+        self.destination = None
+        self.sender = None
+        self.signature = ""
+        self.body = ()
+
+
+def build_message(mtype, serial, path=None, interface=None, member=None, dest=None, error_name=None,
+                  reply_serial=None, sig="", body=(), flags=0):
+    bw = Writer()
+    for t, v in zip(split_sig(sig), body):
+        bw.put(t, v)
+    payload = bytes(bw.b)
+    fields = []
+    if path:
+        fields.append((F_PATH, "o", path))
+    if interface:
+        fields.append((F_IFACE, "s", interface))
+    if member:
+        fields.append((F_MEMBER, "s", member))
+    if error_name:
+        fields.append((F_ERROR, "s", error_name))
+    if reply_serial is not None:
+        fields.append((F_REPLY, "u", reply_serial))
+    if dest:
+        fields.append((F_DEST, "s", dest))
+    if sig:
+        fields.append((F_SIG, "g", sig))
+    w = Writer()
+    w.b += struct.pack("<BBBBII", ord("l"), mtype, flags, 1, len(payload), serial)
+    w.align(4)
+    lenpos = len(w.b)
+    w.b += b"\0\0\0\0"
+    w.align(8)
+    start = len(w.b)
+    for code, t, v in fields:
+        w.align(8)
+        w.b.append(code)
+        w.put("v", Variant(t, v))
+    struct.pack_into("<I", w.b, lenpos, len(w.b) - start)
+    w.align(8)
+    return bytes(w.b) + payload
+
+
+def parse_message(buf):
+    """Devuelve (Message, bytes_usados) o None si todavía no ha llegado entero."""
+    if len(buf) < 16:
+        return None
+    e = buf[0:1]
+    if e == b"l":
+        fmt = "<"
+    elif e == b"B":
+        fmt = ">"
+    else:
+        raise ProtocolError("mensaje con endianness desconocido")
+    mtype, flags, ver = buf[1], buf[2], buf[3]
+    if ver != 1:
+        raise ProtocolError("versión de protocolo D-Bus no soportada")
+    blen, serial, flen = struct.unpack(fmt + "III", buf[4:16])
+    hdr = 16 + flen
+    total = hdr + ((-hdr) & 7) + blen
+    if total > MAX_MESSAGE or flen > MAX_MESSAGE:
+        raise ProtocolError("mensaje demasiado grande")
+    if len(buf) < total:
+        return None
+    data = bytes(buf[:total])
+    m = Message()
+    m.type, m.flags, m.serial = mtype, flags, serial
+    r = Reader(data, 16, fmt)
+    while r.p < hdr:
+        r.align(8)
+        code = r.take(1)[0]
+        v = r.get("v").value
+        if code == F_PATH:
+            m.path = v
+        elif code == F_IFACE:
+            m.interface = v
+        elif code == F_MEMBER:
+            m.member = v
+        elif code == F_ERROR:
+            m.error_name = v
+        elif code == F_REPLY:
+            m.reply_serial = v
+        elif code == F_DEST:
+            m.destination = v
+        elif code == F_SENDER:
+            m.sender = v
+        elif code == F_SIG:
+            m.signature = v
+    r.p = hdr + ((-hdr) & 7)
+    if m.signature:
+        m.body = tuple(r.get(t) for t in split_sig(m.signature))
+    return m, total
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: objetos
+
+
+class Method(object):
+    def __init__(self, name, in_sig, out_sig, fn, slow, args, outs):
+        self.name, self.in_sig, self.out_sig, self.fn, self.slow = name, in_sig, out_sig, fn, slow
+        self.args, self.outs = tuple(args), tuple(outs)
+
+
+class Prop(object):
+    def __init__(self, name, sig, get, set_, emits):
+        self.name, self.sig, self.get, self.set, self.emits = name, sig, get, set_, emits
+
+
+class Interface(object):
+    """Una interfaz D-Bus que se exporta: métodos, propiedades y señales."""
+
+    def __init__(self, name):
+        self.name = name
+        self.methods = collections.OrderedDict()
+        self.props = collections.OrderedDict()
+        self.signals = collections.OrderedDict()
+
+    def method(self, name, in_sig="", out_sig="", fn=None, slow=False, args=(), outs=()):
+        """slow=True: puede tardar (habla con la app); se ejecuta en una cola ordenada y no frena a las demás llamadas."""
+        self.methods[name] = Method(name, in_sig, out_sig, fn, slow, args, outs)
+        return self
+
+    def prop(self, name, sig, get, set_=None, emits="true"):
+        self.props[name] = Prop(name, sig, get, set_, emits)
+        return self
+
+    def signal(self, name, sig="", args=()):
+        self.signals[name] = (sig, tuple(args))
+        return self
+
+    @staticmethod
+    def _nm(names, i):
+        return ' name="%s"' % names[i] if i < len(names) else ""
+
+    def xml(self):
+        s = ['  <interface name="%s">\n' % self.name]
+        for m in self.methods.values():
+            s.append('    <method name="%s">\n' % m.name)
+            for i, t in enumerate(split_sig(m.in_sig)):
+                s.append('      <arg type="%s"%s direction="in"/>\n' % (t, self._nm(m.args, i)))
+            for i, t in enumerate(split_sig(m.out_sig)):
+                s.append('      <arg type="%s"%s direction="out"/>\n' % (t, self._nm(m.outs, i)))
+            s.append("    </method>\n")
+        for name, (sig, args) in self.signals.items():
+            s.append('    <signal name="%s">\n' % name)
+            for i, t in enumerate(split_sig(sig)):
+                s.append('      <arg type="%s"%s/>\n' % (t, self._nm(args, i)))
+            s.append("    </signal>\n")
+        for p in self.props.values():
+            s.append('    <property name="%s" type="%s" access="%s">\n' % (p.name, p.sig, "readwrite" if p.set else "read"))
+            s.append('      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="%s"/>\n' % p.emits)
+            s.append("    </property>\n")
+        s.append("  </interface>\n")
+        return "".join(s)
+
+
+_STD_XML = (
+    '  <interface name="org.freedesktop.DBus.Peer">\n'
+    '    <method name="Ping"/>\n'
+    '    <method name="GetMachineId"><arg type="s" name="machine_uuid" direction="out"/></method>\n'
+    "  </interface>\n"
+    '  <interface name="org.freedesktop.DBus.Introspectable">\n'
+    '    <method name="Introspect"><arg type="s" name="xml_data" direction="out"/></method>\n'
+    "  </interface>\n"
+    '  <interface name="org.freedesktop.DBus.Properties">\n'
+    '    <method name="Get"><arg type="s" name="interface_name" direction="in"/><arg type="s" name="property_name" direction="in"/>'
+    '<arg type="v" name="value" direction="out"/></method>\n'
+    '    <method name="GetAll"><arg type="s" name="interface_name" direction="in"/><arg type="a{sv}" name="properties" direction="out"/></method>\n'
+    '    <method name="Set"><arg type="s" name="interface_name" direction="in"/><arg type="s" name="property_name" direction="in"/>'
+    '<arg type="v" name="value" direction="in"/></method>\n'
+    '    <signal name="PropertiesChanged"><arg type="s" name="interface_name"/><arg type="a{sv}" name="changed_properties"/>'
+    '<arg type="as" name="invalidated_properties"/></signal>\n'
+    "  </interface>\n"
+)
+
+_INTRO_HEAD = ('<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"\n'
+               ' "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">\n<node>\n')
+
+
+def machine_id():
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(p) as f:
+                v = f.read().strip()
+            if re.match(r"^[0-9a-f]{32}$", v):
+                return v
+        except OSError:
+            pass
+    return hashlib.md5(("nexo:" + socket.gethostname()).encode()).hexdigest()
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: conexión
+
+
+def parse_address(addr):
+    """«unix:path=/x,guid=…;unix:abstract=/y» → [("unix", {"path": b"/x"}), …]"""
+    out = []
+    for part in addr.split(";"):
+        if not part.strip():
+            continue
+        transport, _, rest = part.partition(":")
+        params = {}
+        for kv in rest.split(","):
+            k, _, v = kv.partition("=")
+            if k:
+                params[k] = unquote_to_bytes(v)
+        out.append((transport, params))
+    return out
+
+
+def _open_socket(transport, params):
+    if transport != "unix":
+        raise OSError("transporte D-Bus no soportado: %s (solo unix)" % transport)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(5)
+        if "path" in params:
+            s.connect(os.fsdecode(params["path"]))
+        elif "abstract" in params:
+            s.connect(b"\0" + params["abstract"])
+        elif params.get("runtime") == b"yes":
+            s.connect(os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), "bus"))
+        else:
+            raise OSError("dirección D-Bus sin path ni abstract")
+    except Exception:
+        s.close()
+        raise
+    return s
+
+
+class _Pending(object):
+    def __init__(self):
+        self.event = threading.Event()
+        self.msg = None
+
+
+class Bus(object):
+    """Una conexión a un bus D-Bus: exporta objetos, atiende llamadas, emite señales y llama a otros."""
+
+    def __init__(self, address, label="bus"):
+        self.address = address
+        self.label = label
+        self.sock = None
+        self.unique_name = None
+        self.objects = {}
+        self.owned = set()
+        self.closed = threading.Event()
+        self.on_name_lost = None
+        self._serial = 0
+        self._slock = threading.Lock()
+        self._wlock = threading.Lock()
+        self._pending = {}
+        self._actions = collections.deque()
+        self._acond = threading.Condition()
+
+    # ---- conexión
+
+    def connect(self):
+        last = None
+        sock = None
+        for transport, params in parse_address(self.address):
+            try:
+                sock = _open_socket(transport, params)
+                break
+            except OSError as e:
+                last = e
+        if sock is None:
+            raise OSError("no pude conectar con el bus (%s): %s" % (self.address, last))
+        try:
+            self._auth(sock)
+        except Exception:
+            sock.close()
+            raise
+        sock.settimeout(None)
+        self.sock = sock
+        threading.Thread(target=self._read_loop, name=self.label + "-lectura", daemon=True).start()
+        threading.Thread(target=self._action_loop, name=self.label + "-acciones", daemon=True).start()
+        self.unique_name = self.call(BUS_NAME, BUS_PATH, BUS_NAME, "Hello")[0]
+        dbg("conectado a %s como %s" % (self.label, self.unique_name))
+
+    @staticmethod
+    def _auth_line(s):
+        buf = b""
+        while not buf.endswith(b"\r\n"):
+            c = s.recv(1)
+            if not c:
+                raise ConnectionError("el bus cerró la conexión durante la autenticación")
+            buf += c
+            if len(buf) > 1024:
+                raise ConnectionError("respuesta de autenticación demasiado larga")
+        return buf[:-2]
+
+    def _auth(self, s):
+        s.sendall(b"\0")
+        uid = str(os.getuid()).encode()
+        for first in (b"AUTH EXTERNAL " + binascii.hexlify(uid), b"AUTH EXTERNAL"):
+            s.sendall(first + b"\r\n")
+            line = self._auth_line(s)
+            if line.startswith(b"DATA"):
+                s.sendall(b"DATA\r\n")
+                line = self._auth_line(s)
+            if line.startswith(b"OK"):
+                s.sendall(b"BEGIN\r\n")
+                return
+        raise ConnectionError("el bus rechazó la autenticación (EXTERNAL)")
+
+    def close(self):
+        self.closed.set()
+        s = self.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+        with self._acond:
+            self._acond.notify_all()
+        self._fail_pending()
+
+    def _fail_pending(self):
+        for p in list(self._pending.values()):
+            p.event.set()
+
+    def _next_serial(self):
+        with self._slock:
+            self._serial += 1
+            return self._serial
+
+    def _send(self, data):
+        with self._wlock:
+            try:
+                self.sock.sendall(data)
+            except (OSError, AttributeError) as e:
+                self.closed.set()
+                raise DBusError(ERR_FAILED, "conexión con el bus perdida: %s" % e)
+
+    # ---- hilo lector
+
+    def _read_loop(self):
+        buf = b""
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    r = parse_message(buf)
+                    if r is None:
+                        break
+                    msg, used = r
+                    buf = buf[used:]
+                    try:
+                        self._dispatch(msg)
+                    except Exception as e:  # un fallo en un mensaje no debe tirar la conexión
+                        log("error atendiendo un mensaje D-Bus: %r" % (e,))
+                        dbg(repr(sys.exc_info()))
+        except (OSError, ProtocolError) as e:
+            dbg("lectura del bus terminada: %r" % (e,))
+        finally:
+            self.closed.set()
+            self._fail_pending()
+            with self._acond:
+                self._acond.notify_all()
+
+    def _dispatch(self, msg):
+        if msg.type in (MSG_RETURN, MSG_ERROR):
+            p = self._pending.get(msg.reply_serial)
+            if p is not None:
+                p.msg = msg
+                p.event.set()
+        elif msg.type == MSG_SIGNAL:
+            if msg.sender == BUS_NAME and msg.member in ("NameLost", "NameAcquired") and msg.body:
+                name = msg.body[0]
+                if msg.member == "NameLost":
+                    self.owned.discard(name)
+                    cb = self.on_name_lost
+                    if cb:
+                        threading.Thread(target=cb, args=(name,), daemon=True).start()
+                else:
+                    self.owned.add(name)
+        elif msg.type == MSG_CALL:
+            self._on_call(msg)
+
+    # ---- llamadas salientes
+
+    def call(self, dest, path, iface, member, sig="", body=(), timeout=8.0):
+        serial = self._next_serial()
+        p = _Pending()
+        self._pending[serial] = p
+        try:
+            self._send(build_message(MSG_CALL, serial, path=path, interface=iface, member=member, dest=dest,
+                                     sig=sig, body=body))
+            if not p.event.wait(timeout):
+                raise DBusError(ERR_NOREPLY, "%s no contestó a %s" % (dest, member))
+        finally:
+            self._pending.pop(serial, None)
+        m = p.msg
+        if m is None:
+            raise DBusError(ERR_FAILED, "se perdió la conexión con el bus")
+        if m.type == MSG_ERROR:
+            raise DBusError(m.error_name or ERR_FAILED, m.body[0] if m.body and isinstance(m.body[0], str) else "")
+        return m.body
+
+    def request_name(self, name, allow_replacement=True, replace=False):
+        """1 = dueño; 4 = ya lo era; 3 = lo tiene otro; 2 = en cola."""
+        flags = 0x4 | (0x1 if allow_replacement else 0) | (0x2 if replace else 0)
+        r = self.call(BUS_NAME, BUS_PATH, BUS_NAME, "RequestName", "su", (name, flags))[0]
+        if r in (1, 4):
+            self.owned.add(name)
+        return r
+
+    def release_name(self, name):
+        try:
+            r = self.call(BUS_NAME, BUS_PATH, BUS_NAME, "ReleaseName", "s", (name,))[0]
+        finally:
+            self.owned.discard(name)
+        return r
+
+    def name_has_owner(self, name):
+        return bool(self.call(BUS_NAME, BUS_PATH, BUS_NAME, "NameHasOwner", "s", (name,))[0])
+
+    # ---- objetos exportados
+
+    def export(self, path, iface):
+        self.objects.setdefault(path, collections.OrderedDict())[iface.name] = iface
+
+    def unexport(self, path, iface_name=None):
+        if iface_name is None:
+            self.objects.pop(path, None)
+        elif path in self.objects:
+            self.objects[path].pop(iface_name, None)
+            if not self.objects[path]:
+                del self.objects[path]
+
+    def emit(self, path, iface, member, sig="", body=()):
+        if self.closed.is_set() or self.sock is None:
+            return
+        try:
+            self._send(build_message(MSG_SIGNAL, self._next_serial(), path=path, interface=iface, member=member,
+                                     sig=sig, body=body))
+        except DBusError as e:
+            dbg("no pude emitir %s: %s" % (member, e))
+        except (ValueError, TypeError, struct.error) as e:
+            log("no pude emitir %s (dato no válido: %s)" % (member, e))
+
+    def properties_changed(self, path, iface_name, values):
+        """values: {nombre: valor de Python}; se mandan con el tipo que declara la interfaz."""
+        it = self.objects.get(path, {}).get(iface_name)
+        if it is None or not values:
+            return
+        changed, invalid = {}, []
+        for name, val in values.items():
+            p = it.props.get(name)
+            if p is None or p.emits in ("false", "const"):
+                continue
+            if p.emits == "invalidates":
+                invalid.append(name)
+            else:
+                changed[name] = Variant(p.sig, val)
+        if changed or invalid:
+            self.emit(path, IF_PROPS, "PropertiesChanged", "sa{sv}as", (iface_name, changed, invalid))
+
+    # ---- llamadas entrantes
+
+    def _children(self, path):
+        prefix = path.rstrip("/") + "/"
+        kids = set()
+        for p in self.objects:
+            if p.startswith(prefix) and p != path:
+                kids.add(p[len(prefix):].split("/", 1)[0])
+        return sorted(kids)
+
+    def _introspect(self, path):
+        parts = [_INTRO_HEAD, _STD_XML]
+        for it in self.objects.get(path, {}).values():
+            parts.append(it.xml())
+        for kid in self._children(path):
+            parts.append('  <node name="%s"/>\n' % kid)
+        parts.append("</node>\n")
+        return "".join(parts)
+
+    def _find_method(self, msg):
+        ifaces = self.objects.get(msg.path)
+        if not ifaces:
+            return None
+        if msg.interface:
+            it = ifaces.get(msg.interface)
+            return it.methods.get(msg.member) if it else None
+        for it in ifaces.values():
+            if msg.member in it.methods:
+                return it.methods[msg.member]
+        return None
+
+    def _on_call(self, msg):
+        slow = False
+        if msg.interface in (IF_PROPS, None) and msg.member == "Set":
+            slow = True
+        else:
+            m = self._find_method(msg)
+            slow = bool(m and m.slow)
+        if slow:
+            with self._acond:
+                self._actions.append(msg)
+                self._acond.notify()
+        else:
+            self._execute(msg)
+
+    def _action_loop(self):
+        while not self.closed.is_set():
+            with self._acond:
+                while not self._actions and not self.closed.is_set():
+                    self._acond.wait(1.0)
+                if self.closed.is_set():
+                    return
+                msg = self._actions.popleft()
+            self._execute(msg)
+
+    def _execute(self, msg):
+        try:
+            sig, body = self._invoke(msg)
+        except DBusError as e:
+            self._reply_error(msg, e.name, e.message)
+            return
+        except Exception as e:
+            log("error en %s.%s: %r" % (msg.interface, msg.member, e))
+            dbg(traceback.format_exc())
+            self._reply_error(msg, ERR_FAILED, "error interno de nexo-dbus")
+            return
+        if not (msg.flags & FLAG_NO_REPLY):
+            try:
+                self._send(build_message(MSG_RETURN, self._next_serial(), reply_serial=msg.serial, dest=msg.sender,
+                                         sig=sig, body=body))
+            except DBusError as e:
+                dbg("no pude responder: %s" % e)
+
+    def _reply_error(self, msg, name, text):
+        if msg.flags & FLAG_NO_REPLY:
+            return
+        try:
+            self._send(build_message(MSG_ERROR, self._next_serial(), error_name=name, reply_serial=msg.serial,
+                                     dest=msg.sender, sig="s", body=(text,)))
+        except DBusError:
+            pass
+
+    @staticmethod
+    def _args(msg, sig):
+        if msg.signature != sig:
+            raise DBusError(ERR_ARGS, "se esperaba la firma «%s» y llegó «%s»" % (sig, msg.signature))
+        return msg.body
+
+    def _invoke(self, msg):
+        if msg.interface == IF_PEER:
+            if msg.member == "Ping":
+                return "", ()
+            if msg.member == "GetMachineId":
+                return "s", (machine_id(),)
+            raise DBusError(ERR_NOMETHOD, "Peer no tiene " + str(msg.member))
+        ifaces = self.objects.get(msg.path)
+        if not ifaces:
+            if msg.member == "Introspect" and msg.interface in (None, IF_INTRO) and self._children(msg.path or "/"):
+                return "s", (self._introspect(msg.path),)
+            raise DBusError(ERR_NOOBJ, "No hay ningún objeto en %s" % msg.path)
+        if msg.member == "Introspect" and msg.interface in (None, IF_INTRO):
+            return "s", (self._introspect(msg.path),)
+        if msg.member in ("Get", "GetAll", "Set") and msg.interface in (None, IF_PROPS):
+            return self._props_call(msg, ifaces)
+        m = self._find_method(msg)
+        if m is None:
+            raise DBusError(ERR_NOMETHOD, "%s no tiene el método %s" % (msg.interface or msg.path, msg.member))
+        if msg.signature != m.in_sig:
+            raise DBusError(ERR_ARGS, "%s espera «%s» y llegó «%s»" % (m.name, m.in_sig, msg.signature))
+        res = m.fn(*msg.body)
+        outs = split_sig(m.out_sig)
+        if not outs:
+            return "", ()
+        if len(outs) == 1:
+            return m.out_sig, (res,)
+        return m.out_sig, tuple(res)
+
+    def _props_call(self, msg, ifaces):
+        if msg.member == "GetAll":
+            (name,) = self._args(msg, "s")
+            if name and name not in ifaces:
+                raise DBusError(ERR_NOIFACE, "Interfaz desconocida: " + name)
+            out = {}
+            for it in ([ifaces[name]] if name else list(ifaces.values())):
+                for p in it.props.values():
+                    out[p.name] = Variant(p.sig, p.get())
+            return "a{sv}", (out,)
+        if msg.member == "Get":
+            name, prop = self._args(msg, "ss")
+        else:
+            name, prop, var = self._args(msg, "ssv")
+        cands = [ifaces[name]] if name in ifaces else ([] if name else list(ifaces.values()))
+        if name and not cands:
+            raise DBusError(ERR_NOIFACE, "Interfaz desconocida: " + name)
+        for it in cands:
+            p = it.props.get(prop)
+            if p is None:
+                continue
+            if msg.member == "Get":
+                return "v", (Variant(p.sig, p.get()),)
+            if p.set is None:
+                raise DBusError(ERR_RO, "La propiedad %s es de solo lectura" % prop)
+            if var.sig != p.sig:
+                raise DBusError(ERR_ARGS, "%s es de tipo «%s», no «%s»" % (prop, p.sig, var.sig))
+            p.set(var.value)
+            return "", ()
+        raise DBusError(ERR_NOPROP, "Propiedad desconocida: " + prop)
+
+
+# ----------------------------------------------------------------------------------------------------- la app Nexo
+
+
+class BridgeError(Exception):
+    def __init__(self, code, message="", extra=None):
+        Exception.__init__(self, message or code)
+        self.code = code
+        self.message = message or code
+        self.extra = extra or {}
+
+
+class _Waiter(object):
+    def __init__(self):
+        self.event = threading.Event()
+        self.resp = None
+
+
+def load_config():
+    """Mismo orden que el cliente `nexo`: variables de entorno, y luego el primer archivo de enlace que exista."""
+    cfg = {"NEXO_PORT": os.environ.get("NEXO_PORT", ""), "NEXO_TOKEN": os.environ.get("NEXO_TOKEN", ""),
+           "NEXO_HOST": os.environ.get("NEXO_HOST", "")}
+    paths = []
+    if os.environ.get("NEXO_CONFIG"):
+        paths.append(os.environ["NEXO_CONFIG"])
+    paths.append(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home_dir(), ".config"), "nexo", "config"))
+    paths.append("/etc/nexo/config")
+    if os.environ.get("PREFIX"):
+        paths.append(os.path.join(os.environ["PREFIX"], "etc", "nexo", "config"))
+    used = None
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            k, sep, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip("\r").strip("\"'")
+            if sep and k in ("NEXO_PORT", "NEXO_TOKEN") and not cfg[k]:
+                cfg[k] = v
+        used = p
+        break
+    cfg["file"] = used
+    if not cfg["NEXO_PORT"]:
+        cfg["NEXO_PORT"] = "8765"
+    if not cfg["NEXO_HOST"]:
+        cfg["NEXO_HOST"] = "127.0.0.1"
+    return cfg
+
+
+class Bridge(object):
+    """Conexión persistente con la app: eventos en vivo y comandos por la misma línea."""
+
+    PING_AFTER = 20.0      # sin tráfico durante tanto → ping
+    PING_TIMEOUT = 8.0     # y si el ping no se contesta, se reconecta
+
+    def __init__(self, host, port, token, topics, on_event, reload=None):
+        self.host, self.port = host, port
+        self._token = token
+        self.topics = list(topics)
+        self.on_event = on_event
+        self.reload = reload   # () -> (host, puerto, token): se vuelve a leer el enlace al reconectar (nexo rekey)
+        self.ready = threading.Event()
+        self.info = {}
+        self.last_ready = 0.0
+        self.last_error = ""
+        self._sock = None
+        self._wlock = threading.Lock()
+        self._ilock = threading.Lock()
+        self._ids = 0
+        self._waiters = {}
+        self._stop = threading.Event()
+        self._hello_done = threading.Event()
+        self.rejected = False
+
+    def start(self):
+        threading.Thread(target=self._loop, name="app-nexo", daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+        s = self._sock
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def _loop(self):
+        delay = 1.0
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                self._session()
+            except Exception as e:
+                msg = "%s" % (e,)
+                if msg != self.last_error:
+                    log("sin conexión con la app Nexo en %s:%s (%s); reintento" % (self.host, self.port, msg))
+                self.last_error = msg
+                dbg(repr(e))
+            finally:
+                if self.ready.is_set():
+                    log("se perdió la conexión con la app Nexo")
+                self.ready.clear()
+                self.last_ready = time.monotonic()
+                self._fail_waiters()
+            if self._stop.is_set():
+                break
+            delay = 1.0 if time.monotonic() - t0 > 30 else min(delay * 2, 15.0)
+            if self.rejected:
+                self._wait_rejected()
+            else:
+                self._stop.wait(delay)
+
+    def _refresh_config(self):
+        """Vuelve a leer el enlace: «nexo rekey» cambia el token mientras nexo-dbus sigue en marcha."""
+        if self.reload is None:
+            return False
+        try:
+            link = self.reload()
+        except Exception as e:
+            dbg("no pude releer la configuración: %r" % (e,))
+            return False
+        if not link or not link[2] or tuple(link) == (self.host, self.port, self._token):
+            return False
+        self.host, self.port, self._token = link
+        log("el enlace con la app cambió en el archivo de configuración: uso el nuevo")
+        return True
+
+    def _wait_rejected(self):
+        """Con el token rechazado no tiene sentido insistir: espera, pero mirando el archivo por si lo arreglan."""
+        end = time.monotonic() + 30.0
+        while not self._stop.wait(2.0):
+            if time.monotonic() >= end or self._refresh_config():
+                return
+
+    def _fail_waiters(self):
+        for w in list(self._waiters.values()):
+            w.event.set()
+
+    def _send(self, obj):
+        data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        with self._wlock:
+            s = self._sock
+            if s is None:
+                raise BridgeError("no_connection", "No hay conexión con la app Nexo")
+            try:
+                s.sendall(data)
+            except OSError as e:
+                raise BridgeError("no_connection", "No pude escribir a la app Nexo: %s" % e)
+
+    def _session(self):
+        self._refresh_config()
+        s = socket.create_connection((self.host, self.port), timeout=4)
+        s.settimeout(1.0)
+        self._sock = s
+        self._hello_done.clear()
+        self.rejected = False
+        buf = b""
+        t_hello = time.monotonic()
+        self._send({"id": "hello", "cmd": "hello", "token": self._token, "client": CLIENT_NAME})
+        last_rx = time.monotonic()
+        last_ping = None
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    chunk = None
+                if chunk == b"":
+                    raise ConnectionError("la app cerró la conexión")
+                now = time.monotonic()
+                if chunk:
+                    last_rx, last_ping = now, None
+                    buf += chunk
+                    if len(buf) > (1 << 20) and b"\n" not in buf:
+                        raise ConnectionError("línea demasiado larga")
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        self._on_line(line)
+                else:
+                    if not self._hello_done.is_set() and now - t_hello > 8:
+                        raise ConnectionError("la app no contestó al hello (¿está congelada?)")
+                    if self._hello_done.is_set():
+                        if last_ping is None and now - last_rx > self.PING_AFTER:
+                            self._send({"id": "ping", "cmd": "ping"})
+                            last_ping = now
+                        elif last_ping is not None and now - last_ping > self.PING_TIMEOUT:
+                            raise ConnectionError("la app no responde al ping")
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _on_line(self, raw):
+        try:
+            o = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if not isinstance(o, dict):
+            return
+        if "event" in o:
+            try:
+                self.on_event(o["event"], o.get("data") or {})
+            except Exception as e:
+                log("error procesando un evento: %r" % (e,))
+            return
+        rid = o.get("id")
+        if rid == "hello":
+            if not o.get("ok"):
+                self.rejected = o.get("error") == "unauthorized"
+                raise ConnectionError("la app rechazó el enlace (%s): ejecuta «nexo pair» o «nexo rekey»" % o.get("error", "?")
+                                      if self.rejected else "hello falló: %s" % o.get("error", "?"))
+            self.info = o.get("data") or {}
+            self._hello_done.set()
+            self.last_error = ""
+            self.ready.set()
+            self.last_ready = time.monotonic()
+            log("conectado con la app Nexo %s (%s)" % (self.info.get("version", "?"), self.info.get("device", "?")))
+            cmds = self.info.get("commands")
+            if self.info.get("minor", 1) < 2 or (isinstance(cmds, list) and "media.status" not in cmds):
+                log("esta versión de la app Nexo (%s) no sabe de música: instala el APK nuevo para usar MPRIS" % self.info.get("version", "?"))
+            self._send({"id": "sub", "cmd": "subscribe", "topics": self.topics})
+            return
+        w = self._waiters.get(rid)
+        if w is not None:
+            w.resp = o
+            w.event.set()
+
+    def call(self, cmd, timeout=8.0, **params):
+        if not self.ready.is_set():
+            raise BridgeError("no_connection", "No hay conexión con la app Nexo")
+        with self._ilock:
+            self._ids += 1
+            rid = "c%d" % self._ids
+        w = _Waiter()
+        self._waiters[rid] = w
+        req = dict(params)
+        req["id"] = rid
+        req["cmd"] = cmd
+        try:
+            self._send(req)
+            if not w.event.wait(timeout):
+                raise BridgeError("timeout", "La app no contestó a tiempo (¿la congeló Android?)")
+        finally:
+            self._waiters.pop(rid, None)
+        r = w.resp
+        if r is None:
+            raise BridgeError("no_connection", "Se perdió la conexión con la app Nexo")
+        if r.get("ok"):
+            return r.get("data") or {}
+        extra = dict((k, r[k]) for k in ("action", "opens", "permission") if k in r)
+        raise BridgeError(r.get("error", "failed"), r.get("message", ""), extra)
+
+
+# ----------------------------------------------------------------------------------------------------- MPRIS
+
+ART_EXT = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+
+
+class Mpris(object):
+    """org.mpris.MediaPlayer2.nexo: la sesión de medios activa de Android como un reproductor más."""
+
+    def __init__(self, bridge, always=False, grace=3.0, grace_down=30.0, force=False):
+        self.bridge = bridge
+        self.always = always
+        self.grace = grace
+        self.grace_down = grace_down
+        self.force = force
+        self.lock = threading.RLock()
+        self.status = {}
+        self.t_status = time.monotonic()
+        self.volume = None
+        self.muted = False
+        self.art = None
+        self._art_fetching = None
+        self._art_missing = set()
+        self.bus = None
+        self.owned = False
+        self.yielded = False
+        self.unwant_since = None
+        self.t_resync = time.monotonic()
+        self._resyncing = False
+        self._last_view = {}
+        self._seeked = None
+        self._warned_listener = False
+        self.root, self.player = self._interfaces()
+
+    # ---- interfaces
+
+    def _interfaces(self):
+        root = Interface(MPRIS_ROOT)
+        root.method("Raise", fn=lambda: None).method("Quit", fn=lambda: None)
+        root.prop("CanQuit", "b", lambda: False, emits="const")
+        root.prop("CanRaise", "b", lambda: False, emits="const")
+        root.prop("HasTrackList", "b", lambda: False, emits="const")
+        root.prop("Identity", "s", lambda: self._view()["Identity"])
+        root.prop("SupportedUriSchemes", "as", lambda: [], emits="const")
+        root.prop("SupportedMimeTypes", "as", lambda: [], emits="const")
+
+        pl = Interface(MPRIS_PLAYER)
+        for name, cmd in (("Next", "media.next"), ("Previous", "media.prev"), ("Pause", "media.pause"),
+                          ("PlayPause", "media.playpause"), ("Stop", "media.stop"), ("Play", "media.play")):
+            pl.method(name, fn=(lambda c: lambda: self._act(c))(cmd), slow=True)
+        pl.method("Seek", "x", fn=self._seek, slow=True, args=("Offset",))
+        pl.method("SetPosition", "ox", fn=self._set_position, slow=True, args=("TrackId", "Position"))
+        pl.method("OpenUri", "s", fn=self._open_uri, slow=True, args=("Uri",))
+        pl.signal("Seeked", "x", ("Position",))
+        pl.prop("PlaybackStatus", "s", lambda: self._view()["PlaybackStatus"])
+        pl.prop("Rate", "d", lambda: self._view()["Rate"])
+        pl.prop("Metadata", "a{sv}", lambda: self._view()["Metadata"])
+        pl.prop("Volume", "d", lambda: self._view()["Volume"], self._set_volume)
+        pl.prop("Position", "x", self._position_us, emits="false")
+        pl.prop("MinimumRate", "d", lambda: self._view()["MinimumRate"])
+        pl.prop("MaximumRate", "d", lambda: self._view()["MaximumRate"])
+        for p in ("CanGoNext", "CanGoPrevious", "CanPlay", "CanPause", "CanSeek", "CanControl"):
+            pl.prop(p, "b", (lambda k: lambda: self._view()[k])(p))
+        return root, pl
+
+    # ---- estado → propiedades
+
+    def _available(self):
+        return bool(self.status.get("available"))
+
+    def _state(self):
+        st = self.status.get("state") if self._available() else "none"
+        if st in ("playing", "buffering"):
+            return "Playing"
+        if st == "paused":
+            return "Paused"
+        return "Stopped"
+
+    def _trackid(self):
+        st = self.status
+        key = st.get("track_id") or "|".join(clean_text(st.get(k)) for k in ("package", "title", "artist", "album", "duration_ms"))
+        return "/org/nexo/track/" + hashlib.sha1(clean_text(key).encode("utf-8", "replace")).hexdigest()[:20]
+
+    def _art_url(self):
+        a = self.art
+        if a and a[0] == self.status.get("art_hash") and os.path.exists(a[1]):
+            return "file://" + quote(a[1])
+        return None
+
+    def _metadata(self):
+        st = self.status
+        if not self._available():
+            return {"mpris:trackid": Variant("o", NO_TRACK)}
+        md = {"mpris:trackid": Variant("o", self._trackid())}
+        dur = st.get("duration_ms")
+        if isinstance(dur, (int, float)) and dur > 0:
+            md["mpris:length"] = Variant("x", int(dur * 1000))
+        url = self._art_url()
+        if url:
+            md["mpris:artUrl"] = Variant("s", url)
+        if st.get("title"):
+            md["xesam:title"] = Variant("s", clean_text(st["title"]))
+        if st.get("artist"):
+            md["xesam:artist"] = Variant("as", [clean_text(st["artist"])])
+        if st.get("album"):
+            md["xesam:album"] = Variant("s", clean_text(st["album"]))
+        if st.get("album_artist"):
+            md["xesam:albumArtist"] = Variant("as", [clean_text(st["album_artist"])])
+        return md
+
+    def _view(self):
+        """Todas las propiedades (menos Position) tal como las vería un cliente MPRIS ahora mismo."""
+        with self.lock:
+            st = self.status
+            av = self._available()
+            speed = st.get("speed")
+            rate = float(speed) if isinstance(speed, (int, float)) and speed > 0 else 1.0
+            listener = bool(st.get("listener"))
+            vol = self.volume
+            if vol is None:
+                vol = 0.0
+            elif self.muted:
+                vol = 0.0
+            return {
+                "Identity": clean_text(st.get("app")) if av and st.get("app") else "Nexo",
+                "PlaybackStatus": self._state(),
+                "Rate": rate,
+                "MinimumRate": min(1.0, rate),
+                "MaximumRate": max(1.0, rate),
+                "Metadata": self._metadata(),
+                "Volume": float(vol),
+                "CanGoNext": av and bool(st.get("can_next")),
+                "CanGoPrevious": av and bool(st.get("can_prev")),
+                "CanPlay": av and bool(st.get("can_play")),
+                "CanPause": av and bool(st.get("can_pause")),
+                "CanSeek": av and bool(st.get("can_seek")),
+                "CanControl": av and listener,
+            }
+
+    def _position_us(self):
+        with self.lock:
+            st = self.status
+            if not self._available():
+                return 0
+            pos = float(st.get("position_ms") or 0)
+            if st.get("state") in ("playing", "buffering"):
+                speed = st.get("speed")
+                pos += (time.monotonic() - self.t_status) * 1000.0 * (float(speed) if isinstance(speed, (int, float)) and speed > 0 else 1.0)
+            dur = st.get("duration_ms")
+            if isinstance(dur, (int, float)) and dur > 0 and pos > dur:
+                pos = float(dur)
+            return int(max(0.0, pos) * 1000)
+
+    # ---- eventos de la app
+
+    def on_event(self, topic, data):
+        if topic == "media":
+            self.apply_media(data)
+        elif topic == "audio":
+            self.apply_audio(data)
+
+    def apply_media(self, data):
+        with self.lock:
+            had = self._available()
+            before_pos = self._position_us()
+            before_track = self._trackid() if had else None
+            before_state = self._state()
+            self.status = dict(data) if isinstance(data, dict) else {}
+            self.t_status = time.monotonic()
+            if self.status.get("listener") is False and not self._warned_listener:
+                self._warned_listener = True
+                log("Android no le ha dado a Nexo el «acceso a notificaciones»: sin él no se puede ver la música. "
+                    "En Android 13 o más, antes hay que pulsar «Permitir ajustes restringidos» en la info de la app.")
+            if self.status.get("listener"):
+                self._warned_listener = False
+            self._want_art()
+            after_pos = self._position_us()
+            seeked = (had and self._available() and before_track == self._trackid() and before_state == self._state()
+                      and abs(after_pos - before_pos) > 1500000)
+        self._flush_changes()
+        if seeked:
+            self._emit_seeked(after_pos)
+
+    def apply_audio(self, data):
+        if not isinstance(data, dict):
+            return
+        with self.lock:
+            v = data.get("volume")
+            self.volume = max(0.0, min(1.0, float(v) / 100.0)) if isinstance(v, (int, float)) else self.volume
+            self.muted = bool(data.get("muted"))
+        self._flush_changes()
+
+    def _flush_changes(self):
+        """Emite PropertiesChanged por lo que cambió desde la última vez."""
+        bus = self.bus
+        with self.lock:
+            cur = self._view()
+            last = self._last_view
+            self._last_view = cur
+            if bus is None or not self.owned:
+                return
+            ch_root = {"Identity": cur["Identity"]} if cur["Identity"] != last.get("Identity") else {}
+            ch_player = dict((k, v) for k, v in cur.items() if k != "Identity" and v != last.get(k))
+        if ch_root:
+            bus.properties_changed(MPRIS_PATH, MPRIS_ROOT, ch_root)
+        if ch_player:
+            bus.properties_changed(MPRIS_PATH, MPRIS_PLAYER, ch_player)
+
+    def _emit_seeked(self, pos_us):
+        """Seeked, sin repetirlo: el salto lo notan a la vez la respuesta a Seek y el evento que manda la app."""
+        now = time.monotonic()
+        with self.lock:
+            last = self._seeked
+            if last and now - last[0] < 1.5 and abs(pos_us - last[1]) < 1500000:
+                return
+            self._seeked = (now, pos_us)
+        bus = self.bus
+        if bus is not None and self.owned:
+            bus.emit(MPRIS_PATH, MPRIS_PLAYER, "Seeked", "x", (int(pos_us),))
+
+    # ---- carátula
+
+    def _want_art(self):
+        h = self.status.get("art_hash")
+        if not h or not self._available():
+            return
+        if self.art and self.art[0] == h and os.path.exists(self.art[1]):
+            return
+        if h in self._art_missing or self._art_fetching == h:
+            return
+        cached = self._art_path(h, None)
+        if cached:
+            self.art = (h, cached)
+            return
+        self._art_fetching = h
+        threading.Thread(target=self._fetch_art, args=(h,), name="caratula", daemon=True).start()
+
+    @staticmethod
+    def _art_base(h):
+        return os.path.join(cache_dir(), "art", hashlib.sha1(clean_text(h).encode("utf-8", "replace")).hexdigest()[:24])
+
+    def _art_path(self, h, ext):
+        base = self._art_base(h)
+        for e in ([ext] if ext else sorted(set(ART_EXT.values()))):
+            if os.path.exists(base + "." + e):
+                return base + "." + e
+        return None
+
+    def _fetch_art(self, h):
+        path = None
+        try:
+            d = self.bridge.call("media.art", timeout=8.0)
+            import base64
+            raw = base64.b64decode(d.get("data") or "", validate=False)
+            if not raw:
+                raise BridgeError("not_found", "sin carátula")
+            ext = ART_EXT.get(str(d.get("mime", "")).lower(), "jpg")
+            ensure_dir(os.path.join(cache_dir(), "art"))
+            path = self._art_base(h) + "." + ext
+            tmp = path + ".tmp%d" % os.getpid()
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+            self._prune_art()
+        except (BridgeError, OSError, ValueError) as e:
+            dbg("sin carátula para %s: %s" % (h, e))
+            path = None
+        with self.lock:
+            self._art_fetching = None
+            if path:
+                self.art = (h, path)
+            else:
+                self._art_missing.add(h)
+        self._flush_changes()
+
+    @staticmethod
+    def _prune_art(keep=30):
+        d = os.path.join(cache_dir(), "art")
+        try:
+            files = [os.path.join(d, f) for f in os.listdir(d)]
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for p in files[keep:]:
+                os.remove(p)
+        except OSError:
+            pass
+
+    # ---- métodos MPRIS
+
+    def _err(self, e):
+        if e.code == "needs_user_action":
+            return DBusError(ERR_FAILED, e.message or "Falta el acceso a notificaciones en Android")
+        if e.code == "timeout":
+            return DBusError(ERR_NOREPLY, e.message)
+        return DBusError(ERR_FAILED, e.message)
+
+    def _act(self, cmd, **params):
+        try:
+            r = self.bridge.call(cmd, **params)
+        except BridgeError as e:
+            raise self._err(e)
+        with self.lock:
+            if self._available():
+                here = self._position_us() // 1000
+                if isinstance(r.get("state"), str) and cmd not in ("media.next", "media.prev"):
+                    self.status["state"] = r["state"]
+                    self.status["position_ms"] = 0 if r["state"] == "stopped" else here
+                    self.t_status = time.monotonic()
+                if isinstance(r.get("position_ms"), int):
+                    self.status["position_ms"] = r["position_ms"]
+                    self.t_status = time.monotonic()
+        self._flush_changes()
+        return r
+
+    def _seek(self, offset_us):
+        r = self._act("media.seek", delta_ms=int(offset_us // 1000))
+        self._emit_seeked(self._position_us())
+        return r
+
+    def _set_position(self, track_id, pos_us):
+        with self.lock:
+            if not self._available() or track_id != self._trackid():
+                return
+        self._act("media.seek", position_ms=max(0, int(pos_us // 1000)))
+        self._emit_seeked(self._position_us())
+
+    def _open_uri(self, uri):
+        raise DBusError(ERR_UNSUPPORTED, "Nexo no puede abrir direcciones en el móvil")
+
+    def _set_volume(self, v):
+        try:
+            pct = int(round(max(0.0, min(1.0, float(v))) * 100))
+        except (TypeError, ValueError):
+            raise DBusError(ERR_ARGS, "Volume debe ser un número entre 0 y 1")
+        try:
+            d = self.bridge.call("audio.volume", percent=pct)
+        except BridgeError as e:
+            raise self._err(e)
+        self.apply_audio(d)
+
+    # ---- ciclo de vida
+
+    def attach(self, bus):
+        self.bus = bus
+        self.owned = False
+        bus.on_name_lost = self._name_lost
+
+    def _name_lost(self, name):
+        if name != MPRIS_NAME or not self.owned:
+            return  # si lo soltamos nosotros (_release), el bus también manda NameLost: eso no es que nos lo quiten
+        self.owned = False
+        if not self.force:
+            self.yielded = True
+        log("otro programa reclamó %s: cedo el nombre%s" % (MPRIS_NAME, "" if not self.force else " (y lo reclamo otra vez: NEXO_DBUS_FORCE=1)"))
+
+    def _acquire(self):
+        bus = self.bus
+        if bus is None or self.yielded:
+            return
+        try:
+            with self.lock:
+                self._last_view = self._view()
+            bus.export(MPRIS_PATH, self.root)
+            bus.export(MPRIS_PATH, self.player)
+            r = bus.request_name(MPRIS_NAME, allow_replacement=True, replace=self.force)
+        except DBusError as e:
+            log("no pude registrar %s: %s" % (MPRIS_NAME, e.message or e.name))
+            bus.unexport(MPRIS_PATH)
+            return
+        if r in (1, 4):
+            self.owned = True
+            log("reproductor MPRIS «%s» disponible" % MPRIS_NAME)
+        else:
+            bus.unexport(MPRIS_PATH)
+            self.yielded = not self.force
+            log("%s ya lo tiene otro programa: no lo toco (modo pasivo; NEXO_DBUS_FORCE=1 lo reclama)" % MPRIS_NAME)
+
+    def _release(self):
+        bus = self.bus
+        self.owned = False
+        if bus is None:
+            return
+        try:
+            bus.release_name(MPRIS_NAME)
+        except DBusError:
+            pass
+        bus.unexport(MPRIS_PATH)
+        log("no suena nada en Android: retiro %s" % MPRIS_NAME)
+
+    def tick(self):
+        """Se llama cada medio segundo: decide si el reproductor debe verse y corrige la posición."""
+        now = time.monotonic()
+        with self.lock:
+            bridge_ok = self.bridge.ready.is_set() or (now - self.bridge.last_ready) < self.grace_down
+            want = self.always or (self._available() and bridge_ok)
+            if want:
+                self.unwant_since = None
+            elif self.unwant_since is None:
+                self.unwant_since = now
+            drop = (not want) and self.unwant_since is not None and (now - self.unwant_since) >= self.grace
+            playing = self._state() == "Playing"
+        if want and not self.owned:
+            self._acquire()
+        elif drop and self.owned:
+            self._release()
+        if self.owned and playing and self.bridge.ready.is_set() and not self._resyncing and now - self.t_resync > 10.0:
+            self.t_resync = now
+            self._resyncing = True
+            threading.Thread(target=self._resync, name="resync", daemon=True).start()
+
+    def _resync(self):
+        try:
+            self.apply_media(self.bridge.call("media.status", timeout=6.0))
+        except BridgeError as e:
+            dbg("resincronización fallida: %s" % e.message)
+        finally:
+            self._resyncing = False
+
+    def detach(self):
+        if self.bus is not None and self.owned:
+            self._release()
+        self.bus = None
+
+
+# ----------------------------------------------------------------------------------------------------- el servicio
+
+
+class Opts(object):
+    def __init__(self):
+        self.verbose = False
+        self.log = None
+        self.bus = os.environ.get("NEXO_DBUS_BUS") or None
+        self.own_bus = False
+        self.always = os.environ.get("NEXO_DBUS_ALWAYS") == "1"
+        self.force = os.environ.get("NEXO_DBUS_FORCE") == "1"
+        self.grace = env_float("NEXO_DBUS_GRACE", 3.0)
+        self.grace_down = env_float("NEXO_DBUS_GRACE_DOWN", 30.0)
+        self.passthrough = []
+
+
+def own_bus_file():
+    return os.path.join(cache_dir(), "session-bus")
+
+
+def _socket_alive(address):
+    for transport, params in parse_address(address):
+        try:
+            _open_socket(transport, params).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def find_session_bus():
+    """La dirección del bus de sesión: la del entorno, el de systemd/dbus-broker, o el que creó --own-bus."""
+    a = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if a:
+        return a
+    for d in (os.environ.get("XDG_RUNTIME_DIR"), "/run/user/%d" % os.getuid()):
+        if d and os.path.exists(os.path.join(d, "bus")):
+            return "unix:path=" + os.path.join(d, "bus")
+    try:
+        with open(own_bus_file()) as f:
+            a = f.read().strip()
+        if a and _socket_alive(a):
+            return a
+    except OSError:
+        pass
+    return None
+
+
+def ensure_own_bus():
+    """Arranca (si hace falta) un dbus-daemon de sesión propio para esta distro y devuelve su dirección."""
+    import shutil
+    path = os.path.join(runtime_dir(), "nexo-bus")
+    addr = "unix:path=" + path
+    if _socket_alive(addr):
+        return addr
+    exe = shutil.which("dbus-daemon")
+    if not exe:
+        raise OSError("no encuentro dbus-daemon: instala el paquete dbus de tu distro")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    ensure_dir(os.path.dirname(path))
+    subprocess.Popen([exe, "--session", "--nofork", "--nopidfile", "--address=" + addr], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    for _ in range(40):
+        if _socket_alive(addr):
+            break
+        time.sleep(0.1)
+    else:
+        raise OSError("dbus-daemon no llegó a arrancar")
+    ensure_dir(cache_dir())
+    with open(own_bus_file(), "w") as f:
+        f.write(addr + "\n")
+    log("bus de sesión propio en %s (para otras terminales: eval \"$(nexo-dbus env)\")" % addr)
+    return addr
+
+
+def pid_file():
+    return os.path.join(runtime_dir(), "nexo-dbus.pid")
+
+
+def read_pid():
+    try:
+        with open(pid_file()) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"nexo-dbus" not in f.read():
+                return None
+    except OSError:
+        pass
+    return pid
+
+
+class Daemon(object):
+    def __init__(self, opts, cfg):
+        self.opts = opts
+        self.stop = threading.Event()
+        self.bus = None
+        topics = ["media", "audio"]
+        self.bridge = Bridge(cfg["NEXO_HOST"], int(cfg["NEXO_PORT"]), cfg["NEXO_TOKEN"], topics, self._on_event,
+                             reload=self._link)
+        self.mpris = Mpris(self.bridge, always=opts.always, grace=opts.grace, grace_down=opts.grace_down, force=opts.force)
+
+    def _on_event(self, topic, data):
+        self.mpris.on_event(topic, data)
+
+    @staticmethod
+    def _link():
+        cfg = load_config()
+        return cfg["NEXO_HOST"], int(cfg["NEXO_PORT"]), cfg["NEXO_TOKEN"]
+
+    def _connect_bus(self, first):
+        addr = self.opts.bus or find_session_bus()
+        if self.opts.own_bus and not self.opts.bus:
+            addr = ensure_own_bus()
+        if not addr:
+            if first:
+                sys.stderr.write(no_bus_message())
+                raise SystemExit(EXIT_NOBUS)
+            return False
+        bus = Bus(addr, "sesion")
+        try:
+            bus.connect()
+        except (OSError, DBusError, ConnectionError, ProtocolError) as e:
+            if first:
+                sys.stderr.write("No pude conectar con el bus de sesión: %s\n" % e)
+                raise SystemExit(EXIT_NOBUS)
+            dbg("bus no disponible: %s" % e)
+            return False
+        self.bus = bus
+        self.mpris.attach(bus)
+        log("conectado al bus de sesión (%s)" % bus.unique_name)
+        return True
+
+    def run(self):
+        for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                signal.signal(sg, lambda *_: self.stop.set())
+            except (ValueError, OSError):
+                pass
+        self._connect_bus(first=True)
+        self.bridge.start()
+        lost_logged = False
+        while not self.stop.is_set():
+            if self.bus is None or self.bus.closed.is_set():
+                if self.bus is not None:
+                    log("se perdió la conexión con el bus; reconecto")
+                    self.mpris.detach()
+                    self.bus = None
+                if self._connect_bus(first=False):
+                    lost_logged = False
+                elif not lost_logged:
+                    log("esperando un bus de sesión de D-Bus…")
+                    lost_logged = True
+                self.stop.wait(3.0)
+                continue
+            self.mpris.tick()
+            self.stop.wait(0.5)
+        self.mpris.detach()
+        self.bridge.stop()
+        if self.bus is not None:
+            self.bus.close()
+
+
+# ----------------------------------------------------------------------------------------------------- línea de comandos
+
+HELP = """nexo-dbus %s: la música del móvil como reproductor MPRIS (playerctl, Waybar, Quickshell, GNOME, KDE…)
+
+Uso:
+  nexo-dbus run [opciones]      Se queda en primer plano (para systemd o para probar)
+  nexo-dbus start [opciones]    Lo arranca en segundo plano (no hace nada si ya está)
+  nexo-dbus stop                Lo para
+  nexo-dbus restart             Lo para y lo vuelve a arrancar
+  nexo-dbus status              Dice si está en marcha (código 0) o no (1)
+  nexo-dbus env                 Imprime «export DBUS_SESSION_BUS_ADDRESS=…» del bus que usa (para eval)
+  nexo-dbus version
+
+Opciones de run/start:
+  -v, --verbose       Anota también los detalles
+  --log ARCHIVO       Dónde anotar (start: ~/.cache/nexo/dbus.log)
+  --bus DIRECCIÓN     Un bus de sesión concreto (por omisión: DBUS_SESSION_BUS_ADDRESS)
+  --own-bus           Si no hay bus de sesión, arranca uno propio con dbus-daemon (para terminales sin escritorio)
+  --always            Que el reproductor se vea siempre, aunque no suene nada (por omisión solo mientras suena algo)
+
+Variables: NEXO_DBUS_BUS, NEXO_DBUS_ALWAYS=1, NEXO_DBUS_FORCE=1 (reclama el nombre aunque ya lo tenga otro),
+           NEXO_DBUS_GRACE=segundos (espera antes de retirar el reproductor cuando deja de sonar, 3 por omisión),
+           NEXO_DBUS_GRACE_DOWN=segundos (ídem si la app Nexo no responde, 30), NEXO_PORT, NEXO_TOKEN, NEXO_CONFIG
+
+Arranque automático en tu escritorio o distro:  nexo setup-dbus   (lo hace el cliente «nexo»)
+
+Qué hace: aparece como «org.mpris.MediaPlayer2.nexo» en el bus de SESIÓN mientras Android tenga música sonando
+(hace falta el «acceso a notificaciones» de la app Nexo). Prueba:  playerctl -p nexo metadata
+Códigos de salida: 0 bien · 1 error · 2 uso · 3 sin bus de sesión · 11 sin token
+""" % VERSION
+
+
+def no_bus_message():
+    return ("No encuentro un bus de sesión de D-Bus.\n"
+            "  · Dentro de tu escritorio ya existe uno (variable DBUS_SESSION_BUS_ADDRESS): lanza nexo-dbus desde su arranque.\n"
+            "  · En una terminal sin escritorio:  nexo-dbus start --own-bus   y luego, en cada terminal:  eval \"$(nexo-dbus env)\"\n"
+            "  · O arráncalo dentro de un bus nuevo:  dbus-run-session -- nexo-dbus run\n")
+
+
+def parse_opts(args):
+    o = Opts()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-v", "--verbose"):
+            o.verbose = True
+            o.passthrough.append(a)
+        elif a == "--own-bus":
+            o.own_bus = True
+            o.passthrough.append(a)
+        elif a == "--always":
+            o.always = True
+            o.passthrough.append(a)
+        elif a in ("--log", "--bus"):
+            if i + 1 >= len(args):
+                sys.stderr.write("%s necesita un valor\n" % a)
+                raise SystemExit(EXIT_USAGE)
+            if a == "--log":
+                o.log = args[i + 1]
+            else:
+                o.bus = args[i + 1]
+            o.passthrough += [a, args[i + 1]]
+            i += 1
+        else:
+            sys.stderr.write("Opción desconocida: %s (mira: nexo-dbus help)\n" % a)
+            raise SystemExit(EXIT_USAGE)
+        i += 1
+    return o
+
+
+def cmd_run(args):
+    o = parse_opts(args)
+    if o.verbose:
+        Log.level = 2
+    if o.log:
+        try:
+            Log.stream = open(o.log, "a", buffering=1)
+        except OSError as e:
+            sys.stderr.write("No pude abrir %s: %s\n" % (o.log, e))
+            return 1
+    cfg = load_config()
+    if not cfg["NEXO_TOKEN"]:
+        sys.stderr.write("No hay token: enlaza primero con la app (nexo pair TOKEN, o copia el comando de instalación).\n")
+        return EXIT_NOTOKEN
+    if not re.match(r"^[0-9]+$", cfg["NEXO_PORT"]):
+        sys.stderr.write("Puerto inválido: %s\n" % cfg["NEXO_PORT"])
+        return EXIT_USAGE
+    other = read_pid()
+    if other and other != os.getpid():
+        log("nexo-dbus ya está en marcha (PID %d)" % other)
+        return 0
+    ensure_dir(os.path.dirname(pid_file()))
+    try:
+        with open(pid_file(), "w") as f:
+            f.write("%d\n" % os.getpid())
+    except OSError as e:
+        dbg("no pude escribir %s: %s" % (pid_file(), e))
+    log("nexo-dbus %s: app en %s:%s%s" % (VERSION, cfg["NEXO_HOST"], cfg["NEXO_PORT"],
+                                           " (config: %s)" % cfg["file"] if cfg.get("file") else ""))
+    try:
+        Daemon(o, cfg).run()
+    finally:
+        try:
+            if read_pid() in (None, os.getpid()):
+                os.remove(pid_file())
+        except OSError:
+            pass
+    return 0
+
+
+def cmd_start(args):
+    o = parse_opts(args)
+    pid = read_pid()
+    if pid:
+        print("nexo-dbus ya está en marcha (PID %d)" % pid)
+        return 0
+    cfg = load_config()
+    if not cfg["NEXO_TOKEN"]:
+        sys.stderr.write("No hay token: enlaza primero con la app (nexo pair TOKEN).\n")
+        return EXIT_NOTOKEN
+    if not (o.bus or o.own_bus or find_session_bus()):
+        sys.stderr.write(no_bus_message())
+        return EXIT_NOBUS
+    logfile = o.log or os.path.join(ensure_dir(cache_dir()), "dbus.log")
+    try:
+        if os.path.getsize(logfile) > 512 * 1024:
+            os.remove(logfile)
+    except OSError:
+        pass
+    args2 = [a for a in o.passthrough]
+    if not o.log:
+        args2 += ["--log", logfile]
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "run"] + args2, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    for _ in range(30):
+        time.sleep(0.1)
+        if child.poll() is not None:
+            tail = ""
+            try:
+                with open(logfile, encoding="utf-8", errors="replace") as f:
+                    tail = "".join(f.readlines()[-5:])
+            except OSError:
+                pass
+            sys.stderr.write("nexo-dbus no arrancó (código %s)%s\n" % (child.returncode, ":\n" + tail if tail else ""))
+            return child.returncode if child.returncode in (EXIT_NOBUS, EXIT_NOTOKEN, EXIT_USAGE) else 1
+        if read_pid() == child.pid:
+            break
+    print("nexo-dbus en marcha (PID %d). Registro: %s" % (child.pid, logfile))
+    return 0
+
+
+def cmd_stop():
+    pid = read_pid()
+    if not pid:
+        print("nexo-dbus no estaba en marcha")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        sys.stderr.write("No pude parar el PID %d: %s\n" % (pid, e))
+        return 1
+    for _ in range(40):
+        time.sleep(0.1)
+        if read_pid() != pid:
+            break
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.remove(pid_file())
+    except OSError:
+        pass
+    print("nexo-dbus parado")
+    return 0
+
+
+def cmd_status():
+    pid = read_pid()
+    if pid:
+        print("nexo-dbus en marcha (PID %d)" % pid)
+        return 0
+    print("nexo-dbus parado")
+    return 1
+
+
+def cmd_env():
+    a = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or find_session_bus()
+    if not a:
+        sys.stderr.write(no_bus_message())
+        return EXIT_NOBUS
+    print("export DBUS_SESSION_BUS_ADDRESS='%s'" % a.replace("'", "'\\''"))
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        sys.stdout.write(HELP)
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd in ("-V", "--version", "version"):
+        print("nexo-dbus " + VERSION)
+        return 0
+    if cmd == "run":
+        return cmd_run(rest)
+    if cmd == "start":
+        return cmd_start(rest)
+    if cmd == "stop":
+        return cmd_stop()
+    if cmd == "restart":
+        cmd_stop()
+        return cmd_start(rest)
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "env":
+        return cmd_env()
+    sys.stderr.write("Comando desconocido: %s (mira: nexo-dbus help)\n" % cmd)
+    return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
