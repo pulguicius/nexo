@@ -239,7 +239,7 @@ dd_start() {
     shift 2
     env -i PATH="$PATH" HOME="$DB/home" XDG_RUNTIME_DIR="$DB/run" XDG_CACHE_HOME="$DB/cache" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCK" NEXO_PORT="$port" NEXO_TOKEN="${DD_TOKEN:-$TOKEN}" \
-        NEXO_DBUS_GRACE=1 NEXO_DBUS_GRACE_DOWN=2 "$@" python3 "$DD" run "${DD_OPTS[@]}" >"$DB/$name.log" 2>&1 &
+        NEXO_DBUS_SYSTEM_BUS=none NEXO_DBUS_GRACE=1 NEXO_DBUS_GRACE_DOWN=2 "$@" python3 "$DD" run "${DD_OPTS[@]}" >"$DB/$name.log" 2>&1 &
     DD_PID=$!
     APP_PIDS+=("$DD_PID")
 }
@@ -263,6 +263,9 @@ app() { NEXO_PORT=$1 NEXO_TOKEN=$TOKEN "$NEXO" "${@:2}"; }                     #
 nmon() { grep -c -- "$2" "$1" 2>/dev/null || true; }
 
 bus_start && ok "arranca un dbus-daemon de pruebas" || bad "dbus-daemon de pruebas"
+
+# NEXO_TESTS_DBUS_PART=system (solo BlueZ y compañía) | mpris (solo el reproductor) | all (por omisión): para iterar rápido
+if [ "${NEXO_TESTS_DBUS_PART:-all}" != system ]; then
 
 # ------------------------------------------------------------------------------ la sonda de tipos D-Bus
 echo "== nexo-dbus: los tipos D-Bus los entiende un cliente de verdad (busctl)"
@@ -510,7 +513,7 @@ RKPORT=$(start_app dbusRK)
 mkdir -p "$DB/runRK"
 printf 'NEXO_PORT=%s\nNEXO_TOKEN=%s\n' "$RKPORT" "00ff" > "$DB/cfgRK"
 env -i PATH="$PATH" HOME="$DB/home" XDG_RUNTIME_DIR="$DB/runRK" XDG_CACHE_HOME="$DB/cache" DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCK" \
-    NEXO_CONFIG="$DB/cfgRK" NEXO_DBUS_GRACE=1 python3 "$DD" run -v >"$DB/RK.log" 2>&1 &
+    NEXO_DBUS_SYSTEM_BUS=none NEXO_CONFIG="$DB/cfgRK" NEXO_DBUS_GRACE=1 python3 "$DD" run -v >"$DB/RK.log" 2>&1 &
 DD_PID=$!
 APP_PIDS+=("$DD_PID")
 sleep 2
@@ -548,7 +551,7 @@ dd_stop
 # ------------------------------------------------------------------------------ start / stop / status / --own-bus
 echo "== nexo-dbus: start, stop, status y bus propio"
 SPORT=$(start_app dbusS)
-sd() { env -i PATH="$PATH" HOME="$DB/home" XDG_RUNTIME_DIR="$DB/runS" XDG_CACHE_HOME="$DB/cacheS" NEXO_PORT="$SPORT" NEXO_TOKEN="$TOKEN" "$@"; }
+sd() { env -i PATH="$PATH" HOME="$DB/home" XDG_RUNTIME_DIR="$DB/runS" XDG_CACHE_HOME="$DB/cacheS" NEXO_PORT="$SPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none "$@"; }
 mkdir -p "$DB/runS"
 run sd python3 "$DD" status;                       rc_is "status con nexo-dbus parado → 1" 1
 run sd DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCK" python3 "$DD" start
@@ -585,7 +588,7 @@ echo "== nexo setup-dbus de verdad (con el bus de pruebas)"
 RPORT=$(start_app dbusR)
 mkdir -p "$DB/runR" "$DB/homeR"
 sdr() { env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR" XDG_CACHE_HOME="$DB/cacheR" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCK" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_GRACE=1 SD_LOG="$DB/systemctlR.log" "$@"; }
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCK" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none NEXO_DBUS_GRACE=1 SD_LOG="$DB/systemctlR.log" "$@"; }
 run sdr "$SD/bin/nexo" setup-dbus
 rc_is "setup-dbus deja nexo-dbus funcionando" 0
 wait_name "$MP" 8 && ok "…y el reproductor aparece en el bus" || bad "setup-dbus no registró nada" "$(cat "$DB/cacheR/nexo/dbus.log" 2>/dev/null)"
@@ -604,10 +607,16 @@ rc_is "--uninstall" 0
 wait_gone "$MP" 6 && ok "…para el servicio y el reproductor se va" || bad "--uninstall no paró nexo-dbus"
 [ ! -e "$DB/homeR/.config/autostart/nexo-dbus.desktop" ] && ok "…y quita el arranque automático" || bad "quedó el .desktop"
 if [ "$NOBUS" = 1 ]; then
-run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" "$SD/bin/nexo" setup-dbus
+run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none "$SD/bin/nexo" setup-dbus
 rc_is "sin bus de sesión, setup-dbus deja el arranque listo y no falla" 0
 has "…y explica que se arrancará con el escritorio" "no hay bus de sesión"
-run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" "$SD/bin/nexo" setup-dbus --uninstall
+run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none "$SD/bin/nexo" setup-dbus --uninstall
+fi
+
+fi   # parte MPRIS
+
+if [ "${NEXO_TESTS_DBUS_PART:-all}" != mpris ]; then
+. "$ROOT/tests/dbus_system_tests.sh"
 fi
 
 fi   # hay dbus-daemon, busctl y gdbus

@@ -49,11 +49,13 @@ ID   TIPO             NOMBRE                       ACTIVA
 $ nexo media next          # y también: play, pause, playpause, stop, prev, seek +10s
 ```
 
-> **Estado: versión 0.2.0.** De la 0.1 (WiFi y Bluetooth) hay un APK compilado, firmado y probado en un móvil real
+> **Estado: versión 0.4.0‑beta1** (la última versión cerrada es la 0.3.0). De la 0.1 (WiFi y Bluetooth) hay un APK compilado, firmado y probado en un móvil real
 > (Xiaomi 25078RA3EL, Android 16 / SDK 36, con Termux Monet y Arch Linux en proot-distro).
-> La 0.2 añade audio, música, redes guardadas, olvidar/renombrar Bluetooth, formatos para barras de estado y auto-recuperación:
-> el cliente pasa **399 pruebas** y el código de Android compila y coincide con la app simulada y con el protocolo,
-> pero **esa parte nueva de la app todavía no se ha ejecutado en un móvil**. Lee [Estado y lo que falta](#estado-y-lo-que-falta).
+> La 0.2 añadió audio, música, redes guardadas, olvidar/renombrar Bluetooth, formatos para barras de estado y auto-recuperación;
+> la 0.3 añadió `nexo-dbus` con la música del móvil como reproductor MPRIS (`playerctl`, Waybar, Quickshell, GNOME, KDE);
+> la **0.4.0‑beta1 añade a `nexo-dbus` el Bluetooth (`org.bluez`) y el WiFi (`org.freedesktop.NetworkManager`) del móvil** para `bluetoothctl`, `nmcli` y los applets, y `nexo dbus status` por servicio.
+> El cliente y `nexo-dbus` pasan **979 pruebas** (`nexo-dbus` contra un bus D‑Bus real, visto con `busctl` y `gdbus`) y el código de Android compila y coincide con la app simulada y con el protocolo,
+> pero **el código nuevo de la app (0.2) todavía no se ha ejecutado en un móvil** y `nexo-dbus` **no se ha probado con `bluetoothctl`, `nmcli`, `playerctl`, Waybar, etc.** Lee [Estado y lo que falta](#estado-y-lo-que-falta).
 
 ---
 
@@ -91,6 +93,9 @@ En Termux, `nexo setup-guests` copia el cliente y el enlace a todas tus distros
 (o a la que indiques: `nexo setup-guests debian`, o la ruta de su rootfs). `nexo setup-guests --list` te dice cuáles ya lo tienen.
 Dentro de la distro, el comando es el mismo: `nexo status`.
 
+**¿Quieres la música, el Bluetooth y el WiFi del móvil para tus programas de escritorio** (`playerctl`, `bluetoothctl`, `nmcli`, Waybar, Quickshell, GNOME, KDE…)? Copia también `nexo-dbus` con `nexo setup-guests --with-dbus` y,
+dentro de la distro, `nexo setup-dbus --own-bus`. Guía completa: [`docs/INTEGRACION-ESCRITORIO.md`](docs/INTEGRACION-ESCRITORIO.md).
+
 Dependiendo de la distro, necesitarás instalar `bash` y `jq`:
 
 - Arch Linux: `pacman -S bash jq`
@@ -123,7 +128,9 @@ Dependiendo de la distro, necesitarás instalar `bash` y `jq`:
 | `nexo watch [wifi\|bt\|audio\|media]` | Cambios en vivo, un JSON por línea (`--pretty` para leerlos mejor). Reconecta solo |
 | `nexo pair [TOKEN] [PUERTO]` · `nexo unpair` | Guarda o borra el enlace a mano (`--token-stdin`: el token no queda en el historial) |
 | `nexo rekey [TOKEN]` | Cambia el token tras «Token nuevo» en la app y actualiza tus distros |
-| `nexo setup-guests [DISTRO…]` | (Termux) copia cliente y enlace a tus distros de proot-distro (`--list`, `--uninstall`, `--private`) |
+| `nexo setup-guests [DISTRO…]` | (Termux) copia cliente y enlace a tus distros de proot-distro (`--list`, `--uninstall`, `--private`, `--with-dbus`) |
+| `nexo setup-dbus [--uninstall]` | Activa `nexo-dbus` (música MPRIS, Bluetooth BlueZ y WiFi NetworkManager del móvil), con arranque automático (`--no-start`, `--own-bus`, `--launcher ARCHIVO`, `--system-policy` para un bus del sistema de verdad). Necesita python3 |
+| `nexo dbus start\|stop\|status\|env\|run` | Atajo a `nexo-dbus` (`status` dice qué servicio está activo y por qué no) |
 | `nexo start` | (Termux) abre la app Nexo para despertar el puente |
 | `nexo doctor [--fix]` | Diagnóstico de todo el enlace; `--fix` intenta repararlo |
 | `nexo version [--check]` · `nexo logs [N]` · `nexo config` | Versión (y si cliente y app son compatibles), lo último que anotó la app, ajustes del cliente |
@@ -234,7 +241,7 @@ tmux: `set -g status-right '#(nexo status --tmux)'` · starship: `[custom.nexo]`
 ## Integración universal
 
 Nexo no convierte el móvil en un adaptador WiFi o Bluetooth de Linux: **controla** lo que Android ya tiene y se lo cuenta a tu escritorio.
-Hoy esa cuenta llega por la línea de comandos; la emulación de los servicios que usan los programas de Linux (D‑Bus) viene en las siguientes versiones:
+Esa cuenta llega por la línea de comandos y, desde la 0.3, también por **D‑Bus** (con `nexo-dbus`), que es lo que hablan los programas de Linux. Hoy la música, y desde la 0.4.0‑beta1 el Bluetooth y el WiFi; las notificaciones vienen en la beta 2:
 
 | Programa o protocolo | Cómo se integra | Estado |
 |---|---|---|
@@ -242,10 +249,10 @@ Hoy esa cuenta llega por la línea de comandos; la emulación de los servicios q
 | Quickshell y otros shells en QML (p. ej. Quantum OS) | Opción `--qml` | ✅ v0.2 (formato probado; programa real sin probar) |
 | dunst · mako · swaync | Opción `--dunst` con `notify-send` | ✅ v0.2 (formato probado) |
 | Scripts, hojas de cálculo | `--env`, `--json`, `--csv` | ✅ v0.2 |
-| `playerctl` y widgets de música (MPRIS) | Servicio `nexo-dbus` que publica la música del móvil como un reproductor más | 🕓 planeado v0.3 |
-| `bluetoothctl`, Blueman y applets de Bluetooth (BlueZ) | `nexo-dbus` (solo estado: adaptador y dispositivos) | 🕓 planeado v0.4 |
-| `nmcli`, `nm-applet`, applets de red (NetworkManager) | `nexo-dbus` (solo estado: WiFi y redes a la vista) | 🕓 planeado v0.5 |
-| Notificaciones del móvil en tu escritorio | Acceso a notificaciones + `org.freedesktop.Notifications` | 🕓 planeado v0.6 |
+| `playerctl`, módulo `mpris` de Waybar, Quickshell, GNOME, KDE (MPRIS) | `nexo-dbus` publica la música del móvil como un reproductor más (`nexo setup-dbus`; [guía](docs/INTEGRACION-ESCRITORIO.md)) | ✅ v0.3 (probado con `busctl` y `gdbus` contra un bus real; los programas reales, sin probar) |
+| `bluetoothctl`, Blueman y applets de Bluetooth (BlueZ) | `nexo-dbus` emula `org.bluez`: adaptador, dispositivos emparejados, batería, encender/apagar (conectar un dispositivo pide un toque en el móvil) | 🚧 v0.4.0‑beta1 (probado con `busctl` y `gdbus` contra un bus real; `bluetoothctl`, sin probar) |
+| `nmcli`, `nm-applet`, applets de red (NetworkManager) | `nexo-dbus` emula `org.freedesktop.NetworkManager`: `wlan0`, redes a la vista y guardadas, conectar/desconectar, encender/apagar | 🚧 v0.4.0‑beta1 (probado con `busctl` y `gdbus` contra un bus real; `nmcli`, sin probar) |
+| Notificaciones del móvil en tu escritorio | Acceso a notificaciones + `org.freedesktop.Notifications` | 🕓 planeado 0.4.0‑beta2 |
 
 El plan completo, con lo que **no** se puede hacer, está en [`docs/ROADMAP.md`](docs/ROADMAP.md) y [`docs/LIMITACIONES.md`](docs/LIMITACIONES.md).
 
@@ -274,8 +281,9 @@ Nexo **controla** el WiFi, el Bluetooth, el audio y la música de Android; no se
   En Opciones de desarrollador existe el interruptor «Wi‑Fi scan throttling» si quieres quitar el límite.
 - **El nombre de la red** necesita el permiso de ubicación **y** la ubicación del sistema encendida; si no, sale «(red oculta: falta permiso de ubicación)».
 - **El puente necesita la app en marcha** (servicio en primer plano). Si Android la cierra o congela, `nexo` dice que no puede conectar (código 12).
-- **No hay BlueZ ni NetworkManager dentro de la distro.** Las apps de Linux no ven un adaptador WiFi ni Bluetooth, y no hay audio Bluetooth para ellas.
-  Para programas que leen el estado por D‑Bus (`nmcli`, `bluetoothctl`, `playerctl`, applets de escritorio) todavía no hay emulación; ver [Integración universal](#integración-universal).
+- **No hay BlueZ ni NetworkManager *de verdad* dentro de la distro.** Las apps de Linux no ven un adaptador WiFi ni Bluetooth reales, y no hay audio Bluetooth para ellas.
+  Para los programas que leen el estado por D‑Bus, `nexo-dbus` los finge: la música (`playerctl`, MPRIS) desde la 0.3, y el Bluetooth y el WiFi (`bluetoothctl`, `nmcli`, applets) desde la 0.4.0‑beta1
+  (`nexo setup-dbus`); con los límites de [LIMITACIONES](docs/LIMITACIONES.md) (no se conectan dispositivos Bluetooth, no se leen las claves WiFi). Ver [Integración universal](#integración-universal).
 - **API 28.** Android 14 empezó a bloquear la instalación de apps con un `targetSdk` demasiado antiguo: mínimo 23 en Android 14 y 24 de Android 15 en adelante
   ([fuente](https://bayton.org/android/android-minimum-targetsdk-matrix/)). 28 queda por encima, pero si algún día Android sube ese mínimo, Termux tendría el mismo problema
   y Nexo tendría que subir su `targetSdk` (y perder parte del control directo). No se publica en Google Play.
@@ -355,10 +363,10 @@ export ANDROID_HOME=/ruta/al/sdk
 ```
 
 El workflow `.github/workflows/build.yml` compila automáticamente y firma el APK usando los secretos del repositorio, publicándolo en Releases al crear una etiqueta
-(`git tag v0.2.0 && git push --tags`). Cómo preparar la firma y cómo colaborar: [`docs/CONTRIBUIR.md`](docs/CONTRIBUIR.md).
+(`git tag v0.4.0-beta1 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar). Cómo preparar la firma y cómo colaborar: [`docs/CONTRIBUIR.md`](docs/CONTRIBUIR.md).
 
 ```bash
-bash tests/run_tests.sh      # 399 pruebas del cliente y del instalador contra una app simulada (bash, python3 y jq)
+bash tests/run_tests.sh      # 979 pruebas: cliente, instalador y nexo-dbus contra una app simulada (bash, python3 y jq; las de D-Bus piden además dbus-daemon, busctl y gdbus)
 ```
 
 Las pruebas incluyen una comprobación de **contrato** (`tests/check_contract.py`): compara el código Kotlin de la app con la app simulada y con `docs/PROTOCOLO.md`
@@ -382,35 +390,44 @@ android/                       Proyecto de Android (Gradle, Kotlin 2.0, AGP 8.7,
     Prefs.kt · BridgeState.kt · Protocol.kt · Util.kt · BootReceiver.kt
 termux/
   bin/nexo                     El cliente
+  bin/nexo-dbus                Servicios D-Bus (MPRIS, BlueZ, NetworkManager); un solo archivo de Python 3, sin librerías
   install.sh                   El instalador (también --uninstall)
   oneliner.tpl                 Plantilla del comando de una línea que copia la app
-tests/                         App simulada (fake_app.py), pruebas (run_tests.sh) y comprobación de contrato (check_contract.py)
-docs/                          PROTOCOLO · LIMITACIONES · ANDROID-VERSIONES · FAQ · CONTRIBUIR · ROADMAP
+tests/                         App simulada (fake_app.py), pruebas (run_tests.sh, dbus_tests.sh, dbus_system_tests.sh, dbus_probe.py, dbus_hold.py) y comprobación de contrato (check_contract.py)
+docs/                          PROTOCOLO · LIMITACIONES · ANDROID-VERSIONES · FAQ · CONTRIBUIR · ROADMAP · INTEGRACION-ESCRITORIO
 .github/workflows/build.yml    Pruebas del cliente + compilación del APK
 ```
 
-El cliente y el instalador viajan dentro del APK como *assets* (el `build.gradle.kts` apunta a la carpeta `termux/`), y el servidor los entrega por `bootstrap`.
+El cliente, `nexo-dbus` y el instalador viajan dentro del APK como *assets* (el `build.gradle.kts` apunta a la carpeta `termux/`), y el servidor los entrega por `bootstrap`.
 
 ---
 
 ## Estado y lo que falta
 
-**Versión 0.2.0.**
+**Versión 0.4.0‑beta1.**
 
 - ✅ **Comprobado en móvil real (v0.1):** Xiaomi 25078RA3EL (Android 16 / SDK 36). El APK compila y se firma automáticamente con un Keystore propio a través de GitHub Actions.
   El cliente lee el WiFi/Bluetooth reales y se comunica sin problemas desde Termux Monet y desde proot-distro (probado en Arch Linux). Se corrigió un bloqueo del hilo de red
   (enviando la respuesta TCP antes de actualizar la interfaz) y se documentó la necesidad de desactivar el ahorro de batería de HyperOS.
-- ✅ **Comprobado aquí (v0.2):** el cliente `nexo` y el instalador (399 pruebas: caracteres raros en nombres y claves, eventos en vivo, reintentos, app congelada, un «Termux» simulado con otro nombre de paquete,
+- ✅ **Comprobado aquí (v0.2):** el cliente `nexo` y el instalador (en esa versión eran 399 pruebas: caracteres raros en nombres y claves, eventos en vivo, reintentos, app congelada, un «Termux» simulado con otro nombre de paquete,
   distros de proot, un impostor que intenta colarse en el puerto, todos los formatos de salida) y el **contrato** entre el código de la app, la app simulada y el protocolo.
   Todo el Kotlin compila sin errores contra la API real de Android.
+- ✅ **Comprobado aquí (v0.3):** `nexo-dbus` con un `dbus-daemon` de verdad y dos clientes independientes (`busctl` y `gdbus`): su propio empaquetado de mensajes D‑Bus (30 tipos), el reproductor MPRIS completo
+  (propiedades, metadatos, carátula, controles, `Seek`, volumen, cambios desde Android, 30 clientes a la vez), aparecer y desaparecer según haya música, app caída y vuelta, bus reiniciado, token cambiado y modo pasivo;
+  `nexo setup-dbus`, `setup-guests --with-dbus` y el instalador. Las pruebas encontraron y corrigieron un fallo real (el reproductor no volvía a registrarse tras caerse la app).
+- ✅ **Comprobado aquí (0.4.0‑beta1):** en un bus del sistema de pruebas (un `dbus-daemon` real, visto con `busctl` y `gdbus`): **BlueZ** (árbol de objetos, propiedades y tipos, escrituras y errores, señales, encender y apagar,
+  `StartDiscovery`/`StopDiscovery`, `RemoveDevice`), **NetworkManager** (objetos, redes con intensidad y seguridad, conectar y desconectar incluidos los fallos, WiFi apagado, olvidar una red, estado global),
+  cada servicio con su conexión al bus (un fallo no arrastra al otro), modo pasivo ante un BlueZ/NetworkManager de verdad o systemd, **la política del bus** (un bus que lo niega todo → `nexo setup-dbus --system-policy` → `nexo-dbus` ocupa el nombre solo),
+  el bus propio (`--own-bus`, también el «del sistema» que falte dentro de un proot) y `nexo dbus status` por servicio. La batería entera se pasó como `root` y como usuario sin privilegios (`nobody`, sin `sudo`). Las pruebas encontraron y corrigieron varios fallos propios (p. ej. que la app falsa no coincidía con la real en un panel que abre, que dos pruebas «de apagado» no probaban nada porque el demonio salía antes, o que el cliente pedía `sudo` aunque la carpeta de la política fuera del propio usuario).
+- ⚠️ **Sin comprobar (v0.3 y 0.4.0‑beta1):** `bluetoothctl`, `nmcli`, Blueman, `nm-applet`, `libnm`, `playerctl`, Waybar, Polybar, Quickshell, GNOME y KDE con `nexo-dbus` (en GitHub Actions hay un trabajo que prueba `playerctl`; no bloquea),
+  el comportamiento dentro de proot en un móvil real, instalar la política en el `/etc/dbus-1/system.d` de un sistema de verdad con `sudo` (las pruebas usan un bus de pruebas y una carpeta propia) y Python anteriores a 3.13 en ejecución (el código está escrito para 3.7+).
 - ⚠️ **Sin comprobar en un móvil:** el código nuevo de la app (audio, música y su carátula, redes guardadas, olvidar/renombrar Bluetooth, plazos por comando, auto-ping y reintento de puerto).
   Espera algún ajuste según el fabricante y la versión de Android (sobre todo `bt forget`, que usa una función no pública, y la lista de redes guardadas en Android recientes).
 - ⚠️ **Limitaciones del entorno:** El encendido/apagado directo de WiFi/Bluetooth depende de las restricciones de cada fabricante (HyperOS puede pedir un toque manual).
   Las redes con señal muy débil (ej. -87 dBm) pueden hacer que Android reporte un `connected: false` momentáneo mientras re-negocia la conexión.
   HyperOS puede congelar la app: se mitiga, no se puede evitar desde dentro de la app (ver [Que Android no cierre la app](#que-android-no-cierre-la-app)).
-- ❌ **Sin hacer:** la emulación D‑Bus (v0.3 en adelante, ver [Integración universal](#integración-universal)): un pequeño servicio por distro que publique la música como un reproductor MPRIS
-  y simule `org.bluez` y `org.freedesktop.NetworkManager` para que `playerctl`, `bluetoothctl`, `nmcli` y los applets de escritorio vean el estado real del móvil.
-  El protocolo ya entrega todo lo que haría falta (estado, redes, emparejados, audio, música y eventos).
+- ❌ **Sin hacer:** las notificaciones del móvil en tu escritorio y la red móvil en NetworkManager (0.4.0‑beta2, protocolo 1.3: el código de la app aún no lo trae), el puente USB serie (0.4.1),
+  el almacenamiento USB (0.4.2), los paquetes (AUR, `.deb`, `.rpm`, `APKBUILD`) y F‑Droid (ver [ROADMAP](docs/ROADMAP.md)).
 
 Ideas sin explorar: un azulejo de Ajustes rápidos para encender y apagar el puente; conectar dispositivos Bluetooth de verdad mediante ADB inalámbrico o Shizuku.
 

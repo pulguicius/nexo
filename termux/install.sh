@@ -8,6 +8,9 @@
 #   NEXO_TOKEN=... NEXO_PORT=8765 bash termux/install.sh    # instala y enlaza
 #   bash termux/install.sh --uninstall                      # quita cliente y enlace
 #
+# Instala dos archivos: «nexo» (el cliente) y «nexo-dbus» (el reproductor MPRIS para escritorios; necesita python3
+# y se activa aparte con «nexo setup-dbus»).
+#
 # Variables opcionales: NEXO_BIN_DIR, NEXO_CONFIG_DIR, NEXO_NO_DEPS=1 (no instalar jq)
 
 set -u
@@ -47,9 +50,11 @@ fi
 
 # ---------------------------------------------------------------- desinstalar
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -f "$BIN_DIR/nexo" "$CONF_DIR/config"
+    # Primero el reproductor MPRIS: si está en marcha o tiene arranque automático, que no se quede colgando.
+    if [ -x "$BIN_DIR/nexo" ]; then "$BIN_DIR/nexo" setup-dbus --uninstall >/dev/null 2>&1; fi
+    rm -f "$BIN_DIR/nexo" "$BIN_DIR/nexo-dbus" "$CONF_DIR/config"
     rmdir "$CONF_DIR" 2>/dev/null
-    say "✔ Nexo (cliente) desinstalado de $BIN_DIR"
+    say "✔ Nexo (cliente y nexo-dbus) desinstalado de $BIN_DIR"
     exit 0
 fi
 
@@ -95,6 +100,25 @@ chmod 755 "$TMP" && mv -f "$TMP" "$BIN_DIR/nexo" || { warn "No pude instalar en 
 if [ "$IS_TERMUX" = 1 ] && have termux-fix-shebang; then termux-fix-shebang "$BIN_DIR/nexo" 2>/dev/null; fi
 say "✔ Cliente instalado en $BIN_DIR/nexo"
 
+
+# nexo-dbus es un componente aparte y opcional: si algo falla aquí, el cliente ya quedó instalado.
+if [ -n "${NEXO_DBUS_B64:-}" ] || [ -f "$SRC_DIR/bin/nexo-dbus" ]; then
+    TMPD=$BIN_DIR/nexo-dbus.tmp.$$
+    DBUS_OK=1
+    if [ -n "${NEXO_DBUS_B64:-}" ]; then
+        printf '%s' "$NEXO_DBUS_B64" | base64 -d > "$TMPD" 2>/dev/null || DBUS_OK=0
+    else
+        cp "$SRC_DIR/bin/nexo-dbus" "$TMPD" 2>/dev/null || DBUS_OK=0
+    fi
+    if [ "$DBUS_OK" = 1 ] && chmod 755 "$TMPD" && mv -f "$TMPD" "$BIN_DIR/nexo-dbus"; then
+        if [ "$IS_TERMUX" = 1 ] && have termux-fix-shebang; then termux-fix-shebang "$BIN_DIR/nexo-dbus" 2>/dev/null; fi
+        say "✔ nexo-dbus instalado en $BIN_DIR/nexo-dbus (reproductor MPRIS para escritorios; se activa con: nexo setup-dbus)"
+    else
+        rm -f "$TMPD"
+        warn "No pude instalar nexo-dbus (es opcional; el cliente funciona igual)."
+    fi
+fi
+
 case ":${PATH:-}:" in
     *":$BIN_DIR:"*) ;;
     *) warn "$BIN_DIR no está en tu PATH. Añade:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
@@ -127,5 +151,8 @@ fi
 say ""
 say "Listo. Prueba:   nexo status"
 if [ "$IS_TERMUX" = 1 ] && [ -d "$PREFIX/var/lib/proot-distro/installed-rootfs" ]; then
-    say "¿Usas distros de proot-distro?   nexo setup-guests   (les copia el cliente y el enlace)"
+    say "¿Usas distros de proot-distro?   nexo setup-guests --with-dbus   (les copia el cliente, el enlace y nexo-dbus)"
+fi
+if [ "$IS_TERMUX" != 1 ] && [ -x "$BIN_DIR/nexo-dbus" ]; then
+    say "¿Tienes un escritorio aquí (playerctl, Waybar, Quickshell…)?   nexo setup-dbus   (muestra la música del móvil como reproductor)"
 fi

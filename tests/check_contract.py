@@ -13,6 +13,8 @@ import os
 import re
 import sys
 
+sys.dont_write_bytecode = True   # al cargar fake_app.py no dejar un __pycache__ en el repositorio
+
 ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 KT = os.path.join(ROOT, "android/app/src/main/java/org/nexo/bridge")
 failed = 0
@@ -79,7 +81,7 @@ def keys_in(text):
 spec = importlib.util.spec_from_file_location("fake_app", os.path.join(ROOT, "tests", "fake_app.py"))
 fa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fa)
-fa.ARGS = argparse.Namespace(old=False, listener=True, no_session=False, record=None, reqlog=None)
+fa.ARGS = argparse.Namespace(old=False, listener=True, no_session=False, record=None, reqlog=None, minor3=False)
 
 # ---------------------------------------------------------------- comandos y temas
 commands_kt = kt("Commands.kt")
@@ -124,14 +126,23 @@ check("targetSdk 28 y minSdk 26 (decisión de diseño: ver build.gradle.kts)",
 
 # ---------------------------------------------------------------- instalador (bootstrap)
 bk = kt("Bootstrap.kt")
-m = re.search(r'val head = "(#!/usr/bin/env bash\\nNEXO_CLIENT_B64=\'\$b64\'\\n)"', bk)
-kt_head = m.group(1).replace("$b64", "%s").replace("\\n", "\n") if m else None
+m = re.search(r'val head = "((?:[^"\\]|\\.)*)"', bk)
+kt_head = re.sub(r"\$[A-Za-z0-9_]+", "%s", m.group(1)).replace("\\n", "\n") if m else None
 fa_src = rd("tests/fake_app.py")
-m2 = re.search(r'head = "(#!/usr/bin/env bash\\nNEXO_CLIENT_B64=\'%s\'\\n)" % b64', fa_src)
+m2 = re.search(r'head = "((?:[^"\\]|\\.)*)" % \(', fa_src)
 fa_head = m2.group(1).replace("\\n", "\n") if m2 else None
 check("el instalador que sirve la app (Bootstrap.kt) empieza igual que el de la app falsa", kt_head is not None and kt_head == fa_head,
       "  app: %r\n  falsa: %r" % (kt_head, fa_head))
-check("el instalador NO exporta la variable con el cliente (límite de 128 KiB por variable de entorno)", "export NEXO_CLIENT_B64" not in bk)
+check("el instalador lleva el cliente y nexo-dbus, en ese orden, como variables de shell",
+      kt_head is not None and re.findall(r"^(NEXO_[A-Z0-9_]+)=", kt_head, re.M) == ["NEXO_CLIENT_B64", "NEXO_DBUS_B64"])
+check("el instalador NO exporta las variables con los archivos (límite de 128 KiB por variable de entorno)",
+      "export NEXO_CLIENT_B64" not in bk and "export NEXO_DBUS_B64" not in bk)
+check("la app lee de sus assets bin/nexo y bin/nexo-dbus, y ambos existen en el repositorio",
+      'readAsset(ctx, "bin/nexo")' in bk and 'readAsset(ctx, "bin/nexo-dbus")' in bk
+      and os.path.isfile(os.path.join(ROOT, "termux", "bin", "nexo")) and os.path.isfile(os.path.join(ROOT, "termux", "bin", "nexo-dbus")))
+inst = rd("termux/install.sh")
+check("install.sh instala nexo-dbus desde NEXO_DBUS_B64 (o desde bin/nexo-dbus si se ejecuta desde el repositorio)",
+      "NEXO_DBUS_B64" in inst and "$SRC_DIR/bin/nexo-dbus" in inst)
 
 # ---------------------------------------------------------------- campos de cada respuesta
 wifi_kt, bt_kt, audio_kt, media_kt = kt("WifiHandler.kt"), kt("BluetoothHandler.kt"), kt("AudioHandler.kt"), kt("MediaHandler.kt")
@@ -187,6 +198,8 @@ opens_fake |= set(re.findall(r'\n\s+"([a-z_]+_(?:settings|panel|enable))"\)', fa
 opens_doc = set(re.findall(r"`([a-z_]+)`", doc[doc.index("| `needs_user_action`"):].split("\n", 1)[0]))
 check("los paneles (`opens`) que abre la app están todos documentados", opens_kt and opens_kt <= opens_doc,
       "  app: %s\n  doc: %s" % (sorted(opens_kt), sorted(opens_doc)))
+if minor < 3:
+    opens_fake -= fa.V13_OPENS      # los paneles del protocolo 1.3 los traerá la app cuando llegue a la revisión 3
 check("…y los que usa la app falsa existen también en la app", opens_fake <= opens_kt, "  falsa: %s\n  app: %s" % (sorted(opens_fake), sorted(opens_kt)))
 
 # ---------------------------------------------------------------- manifiesto

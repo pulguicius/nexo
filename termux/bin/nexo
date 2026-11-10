@@ -4,7 +4,7 @@
 # y da la salida con formato. No depende de qué Termux uses (F-Droid, GitHub, Monet, forks...).
 # Licencia: GPL-3.0-or-later
 
-NEXO_VERSION="0.2.0"
+NEXO_VERSION="0.4.0-beta1"
 CLIENT_MINOR=2          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
 export LC_ALL=C
 
@@ -72,12 +72,20 @@ Música (hace falta darle a Nexo «acceso a notificaciones» en Android)
   media art [ARCHIVO]           Guarda la carátula y muestra dónde quedó
 Eventos
   watch [wifi|bt|audio|media]   Cambios en vivo, un JSON por línea (--pretty para leerlos; --event para eventos sueltos)
+Escritorio (el móvil como MPRIS, BlueZ y NetworkManager: playerctl, bluetoothctl, nmcli, Waybar, Quickshell, GNOME, KDE…)
+  setup-dbus [--uninstall]      Deja nexo-dbus funcionando y con arranque automático (hace falta python3)
+                                (--no-start no lo arranca ahora, --own-bus crea los buses de D-Bus que falten,
+                                 --launcher ARCHIVO añade el arranque a un script tuyo,
+                                 --system-policy [--policy-user NOMBRE]… deja que Linux permita a ese usuario
+                                 ocupar org.bluez y NetworkManager en el bus del sistema; pide root)
+  dbus COMANDO                  Atajo a nexo-dbus: start, stop, status (qué hace cada servicio), env, run…
 Enlace e instalación
   pair [TOKEN] [PUERTO]         Guarda el token de la app (--token-stdin lo lee de la entrada: no queda en el historial)
   rekey [TOKEN]                 Cambia el token tras «Token nuevo» en la app (y actualiza tus distros)
   unpair                        Borra el enlace guardado
   setup-guests [RUTA...]        (Termux) copia el cliente y el enlace a tus distros de proot-distro
-                                (--list las muestra, --uninstall las limpia, --private deja el enlace solo para root)
+                                (--list las muestra, --uninstall las limpia, --private deja el enlace solo para root,
+                                 --with-dbus les copia también nexo-dbus)
   start                         (Termux) abre la app Nexo para despertar el puente
   doctor [--fix]                Diagnóstico de todo el enlace (--fix intenta repararlo)
   version [--check]             Versión del cliente (--check la compara con la app)
@@ -1252,6 +1260,18 @@ cmd_rekey() {
 
 guests_root() { printf '%s' "${NEXO_GUESTS_DIR:-$PREFIX/var/lib/proot-distro/installed-rootfs}"; }
 
+# ¿hay un programa en esa distro? (sirve tanto con enlaces relativos como absolutos)
+guest_has() { [ -e "$1/usr/bin/$2" ] || [ -L "$1/usr/bin/$2" ] || [ -e "$1/bin/$2" ] || [ -L "$1/bin/$2" ]; }
+
+# Dónde está nexo-dbus: en el PATH o junto a este cliente.
+find_dbus_bin() {
+    local p d
+    p=$(command -v nexo-dbus 2>/dev/null) && [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+    d=$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")
+    [ -f "$d/nexo-dbus" ] && { printf '%s' "$d/nexo-dbus"; return 0; }
+    return 1
+}
+
 install_in_guest() {
     local r=${1%/} name tmp mode=$GUEST_MODE
     name=$(basename "$r")
@@ -1261,6 +1281,16 @@ install_in_guest() {
     { printf '#!/usr/bin/env bash\n'; tail -n +2 "$SELF"; } > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$r/usr/local/bin/nexo" || { warn "$name: falló la copia"; return 1; }
     write_config "$NEXO_TOKEN" "$NEXO_PORT" "$r/etc/nexo/config" "$mode" || { warn "$name: no pude escribir la configuración"; return 1; }
     echo "✔ $name"
+    # nexo-dbus: si lo pediste, o si esa distro ya lo tenía (así se actualiza junto al cliente y no se queda viejo)
+    if [ -n "${DBUS_SRC:-}" ] && { [ "$WITH_DBUS" = 1 ] || [ -f "$r/usr/local/bin/nexo-dbus" ]; }; then
+        tmp="$r/usr/local/bin/nexo-dbus.tmp.$$"
+        { printf '#!/usr/bin/env python3\n'; tail -n +2 "$DBUS_SRC"; } > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$r/usr/local/bin/nexo-dbus" || { rm -f "$tmp"; warn "$name: no pude copiar nexo-dbus"; return 1; }
+        if guest_has "$r" python3; then
+            echo "   ↳ nexo-dbus copiado. Dentro de $name:  nexo setup-dbus"
+        else
+            echo "   ↳ nexo-dbus copiado, pero a $name le falta python3 (nexo setup-dbus lo instala si puede)"
+        fi
+    fi
     if [ ! -e "$r/usr/bin/bash" ] && [ ! -L "$r/usr/bin/bash" ] && [ ! -e "$r/bin/bash" ] && [ ! -L "$r/bin/bash" ]; then
         echo "   ↳ a $name le falta bash (en Alpine: apk add bash)"
     fi
@@ -1270,10 +1300,16 @@ install_in_guest() {
 }
 
 uninstall_in_guest() {
-    local r=${1%/} name
+    local r=${1%/} name h
     name=$(basename "$r")
-    rm -f "$r/usr/local/bin/nexo" "$r/etc/nexo/config"
+    rm -f "$r/usr/local/bin/nexo" "$r/usr/local/bin/nexo-dbus" "$r/etc/nexo/config"
     rmdir "$r/etc/nexo" 2>/dev/null
+    # el arranque automático de nexo-dbus que dejó «nexo setup-dbus» (root y usuarios de esa distro)
+    for h in "$r/root" "$r"/home/*; do
+        [ -d "$h" ] || continue
+        rm -f "$h/.config/autostart/nexo-dbus.desktop" "$h/.config/systemd/user/nexo-dbus.service" \
+              "$h/.config/systemd/user/default.target.wants/nexo-dbus.service"
+    done
     echo "✔ $name limpio"
 }
 
@@ -1281,13 +1317,16 @@ cmd_setup_guests() {
     [ -n "${PREFIX:-}" ] || die 2 "setup-guests se ejecuta desde Termux, no dentro de una distro."
     local root d op=install
     GUEST_MODE=644
+    WITH_DBUS=0
+    DBUS_SRC=""
     local list=() a
     for a in "$@"; do
         case $a in
             --list) op=list ;;
             --uninstall) op=uninstall ;;
             --private) GUEST_MODE=600 ;;
-            -*) die 2 "setup-guests: opción desconocida «$a» (--list, --uninstall, --private)" ;;
+            --with-dbus) WITH_DBUS=1 ;;
+            -*) die 2 "setup-guests: opción desconocida «$a» (--list, --uninstall, --private, --with-dbus)" ;;
             *) list+=("$a") ;;
         esac
     done
@@ -1302,7 +1341,11 @@ cmd_setup_guests() {
     [ "${#list[@]}" -gt 0 ] || die 1 "No encontré distros de proot-distro en $root"
     if [ "$op" = list ]; then
         for d in "${list[@]}"; do
-            if [ -x "$d/usr/local/bin/nexo" ]; then echo "✔ $(basename "$d")  (nexo instalado)"; else echo "- $(basename "$d")  (sin nexo)"; fi
+            if [ -x "$d/usr/local/bin/nexo" ]; then
+                echo "✔ $(basename "$d")  (nexo instalado)$([ -x "$d/usr/local/bin/nexo-dbus" ] && echo ' · con nexo-dbus')"
+            else
+                echo "- $(basename "$d")  (sin nexo)"
+            fi
         done
         return 0
     fi
@@ -1312,9 +1355,335 @@ cmd_setup_guests() {
     fi
     [ -n "$NEXO_TOKEN" ] || die 11 "Primero enlaza Termux con la app (pega el comando de instalación)."
     SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    DBUS_SRC=$(find_dbus_bin) || DBUS_SRC=""
+    if [ "$WITH_DBUS" = 1 ] && [ -z "$DBUS_SRC" ]; then
+        die 1 "No encuentro nexo-dbus en Termux. Vuelve a instalar el cliente con el comando de la app (trae los dos archivos) y repite."
+    fi
     for d in "${list[@]}"; do install_in_guest "$d"; done
     echo "Dentro de cada distro, el comando es: nexo status"
+    if [ "$WITH_DBUS" = 1 ]; then
+        echo "Para ver la música del móvil como reproductor (playerctl, Waybar, Quickshell…), dentro de la distro:  nexo setup-dbus"
+    fi
     [ "$GUEST_MODE" = 600 ] && echo "El enlace quedó en modo 600: solo root dentro de la distro puede leerlo."
+    return 0
+}
+
+# ------------------------------------------------------------------ nexo-dbus (la música del móvil como reproductor MPRIS)
+
+xdg_config_home() { printf '%s' "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"; }
+
+# El paquete de python3 se llama «python» en Termux y en Arch, y «python3» en casi todo lo demás.
+python_pkg() {
+    if [ -n "${PREFIX:-}" ] && have pkg; then echo python
+    elif have pacman; then echo python
+    else echo python3; fi
+}
+
+# Dónde deja «setup-dbus» sus cosas (se calculan una vez, las usan varias funciones)
+dbus_paths() {
+    D_UNIT=$(xdg_config_home)/systemd/user/nexo-dbus.service
+    D_DESKTOP=$(xdg_config_home)/autostart/nexo-dbus.desktop
+    D_RECORD=$(config_dir)/dbus-launchers          # archivos a los que se añadió el arranque con --launcher
+}
+
+# Quita de un archivo el bloque que añadió «setup-dbus --launcher» (si lo tiene).
+dbus_strip_block() {
+    local f=$1 tmp line skip=0
+    [ -f "$f" ] && grep -q '^# >>> nexo-dbus' "$f" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            '# >>> nexo-dbus'*) skip=1; continue ;;
+            '# <<< nexo-dbus'*) skip=0; continue ;;
+        esac
+        [ "$skip" = 1 ] || printf '%s\n' "$line"
+    done < "$f" > "$tmp"
+    cat "$tmp" > "$f"
+    rm -f "$tmp"
+}
+
+# Añade el bloque de arranque a un script: justo antes de su última línea «exec …» (si la tiene, porque lo que
+# viene después de un exec nunca se ejecuta), o al final si no hay ninguna. Imprime dónde quedó.
+dbus_add_block() {
+    local f=$1 exe=$2 xargs=$3 line n=0 last=0 tmp
+    if [ -s "$f" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            case $line in 'exec '*|exec) last=$n ;; esac
+        done < "$f"
+    fi
+    tmp=$(mktemp) || return 1
+    {
+        n=0
+        if [ -s "$f" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                n=$((n + 1))
+                if [ "$n" = "$last" ]; then dbus_block_text "$exe" "$xargs"; fi
+                printf '%s\n' "$line"
+            done < "$f"
+        fi
+        if [ "$last" = 0 ]; then dbus_block_text "$exe" "$xargs"; fi
+    } > "$tmp"
+    cat "$tmp" > "$f" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    if [ "$last" -gt 0 ]; then echo "antes de su línea «exec» (la $last)"; else echo "al final"; fi
+}
+dbus_block_text() {
+    printf '# >>> nexo-dbus (lo añadió «nexo setup-dbus --launcher»; se quita con «nexo setup-dbus --uninstall») >>>\n'
+    printf '%q start%s >/dev/null 2>&1\n' "$1" "$2"
+    printf '# <<< nexo-dbus <<<\n'
+}
+
+# systemd de usuario: ¿hay un gestor funcionando? (en proot casi nunca)
+systemd_user_ok() {
+    have systemctl || return 1
+    if have timeout; then timeout 5 systemctl --user show-environment >/dev/null 2>&1; else systemctl --user show-environment >/dev/null 2>&1; fi
+}
+
+# desktop_quote RUTA → la ruta lista para la línea Exec= de un .desktop
+desktop_quote() { case $1 in *[' ']*) printf '"%s"' "$1" ;; *) printf '%s' "$1" ;; esac; }
+
+# Quita lo que dejó antes «setup-dbus»: servicio de systemd, .desktop y bloques en tus archivos. (Así el arranque
+# automático es siempre uno solo y no dos a la vez.)  $1 = 1 → cuenta lo que quita.
+dbus_clear_autostart() {
+    local loud=${1:-0} a
+    dbus_paths
+    if [ -f "$D_UNIT" ]; then
+        if systemd_user_ok; then systemctl --user disable --now nexo-dbus.service >/dev/null 2>&1; fi
+        rm -f "$D_UNIT"
+        if systemd_user_ok; then systemctl --user daemon-reload >/dev/null 2>&1; fi
+        [ "$loud" = 1 ] && echo "✔ servicio de systemd quitado ($D_UNIT)"
+    fi
+    if [ -f "$D_DESKTOP" ]; then
+        rm -f "$D_DESKTOP"
+        [ "$loud" = 1 ] && echo "✔ arranque automático del escritorio quitado ($D_DESKTOP)"
+    fi
+    if [ -f "$D_RECORD" ]; then
+        while IFS= read -r a || [ -n "$a" ]; do
+            if [ -n "$a" ] && [ -f "$a" ] && grep -q '^# >>> nexo-dbus' "$a"; then
+                dbus_strip_block "$a"
+                [ "$loud" = 1 ] && echo "✔ quité el bloque de nexo-dbus de $a"
+            fi
+        done < "$D_RECORD"
+        rm -f "$D_RECORD"
+    fi
+    return 0
+}
+
+# ---- política del bus del sistema: en un Linux de verdad, el bus no deja a un usuario normal ocupar org.bluez ni
+# org.freedesktop.NetworkManager (ni a quien le escriba) hasta que un archivo de /etc/dbus-1/system.d lo permite.
+dbus_policy_file() { printf '%s/nexo.conf' "${NEXO_DBUS_POLICY_DIR:-/etc/dbus-1/system.d}"; }
+
+# run_priv ORDEN… → la ejecuta como root: directa si ya lo eres, con «sudo -n» si no pide clave, con sudo a secas si hay terminal.
+run_priv() {
+    if [ "$(id -u 2>/dev/null || echo 1)" = 0 ]; then "$@"; return; fi
+    have sudo || return 1
+    if sudo -n true >/dev/null 2>&1; then sudo -n "$@"; return; fi
+    if [ -t 0 ] && [ -t 2 ]; then sudo "$@"; return; fi
+    return 1
+}
+
+# dbus_policy_text USUARIO… → el contenido de nexo.conf
+dbus_policy_text() {
+    local u
+    printf '<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"\n'
+    printf ' "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">\n'
+    printf '<busconfig>\n'
+    printf '  <!-- nexo-dbus: política del bus del sistema. La escribió «nexo setup-dbus» con la opción de política: deja a\n'
+    printf '       estos usuarios ocupar org.bluez y org.freedesktop.NetworkManager (y hablarles). «nexo setup-dbus» con la\n'
+    printf '       opción de desinstalar la quita. (Un comentario XML no puede llevar dos guiones seguidos.) -->\n'
+    for u in "$@"; do
+        printf '  <policy user="%s">\n' "$u"
+        printf '    <allow own="org.bluez"/>\n    <allow send_destination="org.bluez"/>\n'
+        printf '    <allow own="org.freedesktop.NetworkManager"/>\n    <allow send_destination="org.freedesktop.NetworkManager"/>\n'
+        printf '  </policy>\n'
+    done
+    printf '</busconfig>\n'
+}
+
+# can_write_file ARCHIVO → 0 si puedes crearlo, cambiarlo o quitarlo sin privilegios (si existe, él y su carpeta son tuyos;
+# si no, lo es la primera carpeta que exista por encima). Con root siempre es cierto.
+can_write_file() {
+    local f=$1 d
+    if [ -e "$f" ]; then [ -w "$f" ] && [ -w "$(dirname "$f")" ]; return; fi
+    d=$(dirname "$f")
+    while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+    [ -w "$d" ]
+}
+
+# Pide al bus del sistema que relea sus políticas (dbus-daemon suele hacerlo solo al cambiar el archivo).
+# Primero como tú (vale en un bus que lo permite); si no, con privilegios.
+dbus_policy_reload() {
+    local d=org.freedesktop.DBus r
+    for r in command run_priv; do
+        if have busctl && $r busctl --system call $d /org/freedesktop/DBus $d ReloadConfig >/dev/null 2>&1; then return 0; fi
+        if have dbus-send && $r dbus-send --system --type=method_call --dest=$d /org/freedesktop/DBus $d.ReloadConfig >/dev/null 2>&1; then return 0; fi
+    done
+    return 1
+}
+
+# dbus_policy_install USUARIO… → 0 si quedó instalada; 1 si no se pudo (y dice cómo hacerlo a mano)
+dbus_policy_install() {
+    local f tmp as=run_priv
+    f=$(dbus_policy_file)
+    tmp=$(mktemp) || return 1
+    dbus_policy_text "$@" > "$tmp"
+    can_write_file "$f" && as=command   # la carpeta es tuya (o eres root): sin sudo
+    if $as mkdir -p "$(dirname "$f")" && $as cp "$tmp" "$f" && $as chmod 644 "$f"; then
+        rm -f "$tmp"
+        echo "✔ política del bus del sistema: $f (usuarios: $*)"
+        if dbus_policy_reload; then echo "✔ el bus del sistema ya la leyó"
+        else echo "• Si tu bus no la recoge solo:  sudo systemctl reload dbus   (o reinicia el equipo)"; fi
+        return 0
+    fi
+    warn "No pude escribir $f (hace falta ser root, o sudo)."
+    echo "  Hazlo a mano con:   sudo cp $tmp $f   y   sudo chmod 644 $f" >&2
+    echo "  (el archivo ya está preparado en $tmp)" >&2
+    return 1
+}
+
+# nexo dbus COMANDO → atajo a nexo-dbus
+cmd_dbus() {
+    local bin
+    bin=$(find_dbus_bin) || die 1 "No encuentro nexo-dbus (reinstala el cliente con el comando de la app)."
+    have python3 || die 1 "nexo-dbus necesita python3 (nexo setup-dbus lo instala)."
+    exec "$bin" "$@"
+}
+
+cmd_setup_dbus() {
+    local op=install start=1 launcher="" bin extra=() own=0 policy=0 pusers=() u
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --uninstall) op=uninstall ;;
+            --no-start) start=0 ;;
+            --own-bus) own=1; extra+=(--own-bus) ;;
+            --always) extra+=(--always) ;;
+            --system-policy) policy=1 ;;
+            --policy-user)
+                [ $# -ge 2 ] || die 2 "--policy-user necesita un nombre de usuario"
+                pusers+=("$2"); policy=1; shift ;;
+            --launcher)
+                [ $# -ge 2 ] || die 2 "--launcher necesita el archivo donde añadir el arranque"
+                launcher=$2; shift ;;
+            *) die 2 "setup-dbus: opción desconocida «$1» (--uninstall, --no-start, --own-bus, --always, --launcher ARCHIVO, --system-policy, --policy-user NOMBRE)" ;;
+        esac
+        shift
+    done
+    if [ "$policy" = 1 ]; then
+        [ "${#pusers[@]}" -gt 0 ] || pusers=("$(id -un 2>/dev/null || echo root)")
+        for u in "${pusers[@]}"; do   # el nombre va dentro de un archivo XML: solo caracteres de nombre de usuario
+            case $u in
+                ''|-*|*[!A-Za-z0-9_.-]*) die 2 "--policy-user: «$u» no parece un nombre de usuario" ;;
+            esac
+        done
+    fi
+    dbus_paths
+
+    if [ "$op" = uninstall ]; then
+        if bin=$(find_dbus_bin) && have python3; then "$bin" stop >/dev/null 2>&1; fi
+        dbus_clear_autostart 1
+        local pf
+        pf=$(dbus_policy_file)
+        if [ -f "$pf" ] && grep -q 'nexo-dbus: política del bus del sistema' "$pf" 2>/dev/null; then
+            local as=run_priv
+            can_write_file "$pf" && as=command
+            if $as rm -f "$pf"; then
+                echo "✔ política del bus del sistema quitada ($pf)"
+                dbus_policy_reload >/dev/null 2>&1
+            else
+                warn "No pude quitar $pf (hace falta root):  sudo rm $pf"
+            fi
+        fi
+        echo "nexo-dbus ya no se arrancará solo. (El programa sigue instalado; viene con el cliente y se quita con el instalador: --uninstall.)"
+        return 0
+    fi
+
+    bin=$(find_dbus_bin) || die 1 "No encuentro nexo-dbus. Reinstala el cliente con el comando de la app (trae los dos archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-dbus"
+    [ -n "$NEXO_TOKEN" ] || die 11 "Primero enlaza con la app (pega el comando de instalación, o: nexo pair TOKEN)."
+
+    # 1) python3
+    if ! have python3; then
+        echo "• Instalando python3 (lo necesita nexo-dbus)…"
+        install_pkg "$(python_pkg)" || true
+        have python3 || die 1 "No pude instalar python3. Instálalo con el gestor de paquetes de tu distro (paquete «$(python_pkg)») y repite."
+    fi
+    # 2) dbus-daemon, solo si se pidió un bus propio
+    if [ "$own" = 1 ] && ! have dbus-daemon; then
+        echo "• Instalando dbus (para el bus de sesión propio)…"
+        install_pkg dbus || true
+        have dbus-daemon || die 1 "No pude instalar dbus. Instala el paquete «dbus» y repite, o quita --own-bus si ya tienes un escritorio con bus de sesión."
+    fi
+    # 2b) política del bus del sistema (antes de arrancar: sin ella, un Linux de verdad no deja ocupar org.bluez)
+    if [ "$policy" = 1 ]; then dbus_policy_install "${pusers[@]}" || true; fi
+    local exe=$bin
+    case $bin in /*) ;; *) exe=$(command -v "$bin" 2>/dev/null || printf '%s' "$bin") ;; esac
+    local how="" xargs="" e
+    for e in "${extra[@]}"; do xargs+=" $e"; done
+
+    # 3) arranque automático (uno solo: lo que hubiera de antes se quita)
+    dbus_clear_autostart 0
+    if [ -n "$launcher" ]; then
+        local lf=$launcher where
+        case $lf in /*) ;; *) lf=$PWD/$lf ;; esac
+        mkdir -p "$(dirname "$lf")" 2>/dev/null
+        where=$(dbus_add_block "$lf" "$exe" "$xargs") || die 1 "No pude escribir en $lf"
+        mkdir -p "$(dirname "$D_RECORD")" 2>/dev/null
+        printf '%s\n' "$lf" >> "$D_RECORD"
+        how="tu archivo $lf ($where)"
+    elif systemd_user_ok; then
+        mkdir -p "$(dirname "$D_UNIT")" || die 1 "No pude crear $(dirname "$D_UNIT")"
+        cat > "$D_UNIT" <<UNIT
+[Unit]
+Description=Nexo: el móvil como MPRIS, BlueZ y NetworkManager
+
+[Service]
+Type=simple
+ExecStart=$exe run$xargs
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+        systemctl --user daemon-reload >/dev/null 2>&1
+        how="systemd (usuario): $D_UNIT"
+    else
+        mkdir -p "$(dirname "$D_DESKTOP")" || die 1 "No pude crear $(dirname "$D_DESKTOP")"
+        cat > "$D_DESKTOP" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Nexo (música del móvil)
+Comment=Muestra la música, el Bluetooth y el WiFi de Android a tus programas de Linux (D-Bus)
+Exec=$(desktop_quote "$exe") start$xargs
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+DESKTOP
+        how="arranque automático del escritorio: $D_DESKTOP"
+    fi
+    echo "✔ Arranque automático: $how"
+
+    # 4) arrancarlo ahora (si ya había uno, se reinicia: así recoge una versión nueva, y lo gestiona solo el método nuevo)
+    local rc=0
+    if [ "$start" = 1 ]; then
+        "$bin" stop >/dev/null 2>&1
+        if [ -f "$D_UNIT" ]; then
+            systemctl --user enable nexo-dbus.service >/dev/null 2>&1
+            systemctl --user restart nexo-dbus.service >/dev/null 2>&1 || rc=1
+            if [ "$rc" = 0 ]; then echo "✔ nexo-dbus en marcha (systemd)"; fi
+        else
+            "$bin" start "${extra[@]}"; rc=$?
+        fi
+        case $rc in
+            0) ;;
+            3) echo "• Ahora mismo no hay bus de sesión de D-Bus, así que no lo arranqué. Se arrancará solo cuando tu escritorio lo tenga;"
+               echo "  si no usas escritorio:  nexo setup-dbus --own-bus   y luego, en cada terminal:  eval \"\$(nexo-dbus env)\"" ;;
+            *) warn "nexo-dbus no arrancó (código $rc). Mira:  nexo dbus run -v" ;;
+        esac
+    fi
+    echo "Para probarlo:  nexo dbus status  (qué servicio está activo y, si no, por qué)"
+    echo "  · música:    pon algo en el móvil y  playerctl -l   (hace falta el «acceso a notificaciones» de la app: mira «nexo doctor»)"
+    echo "  · Bluetooth: bluetoothctl devices        · WiFi:  nmcli device wifi list"
     return 0
 }
 
@@ -1420,6 +1789,22 @@ cmd_doctor() {
     if [ -n "$NEXO_TOKEN" ]; then printf 'token      sí (%s caracteres)\n' "${#NEXO_TOKEN}"; else printf 'token      NO\n'; fi
     printf 'jq         %s\n' "$(command -v jq || echo 'no instalado (opcional)')"
     printf 'python3    %s\n' "$(command -v python3 || echo 'no instalado (opcional)')"
+    local dbin dver dstate
+    if dbin=$(find_dbus_bin); then
+        dver=$(grep -m1 '^VERSION = ' "$dbin" 2>/dev/null | sed 's/^VERSION = "\(.*\)".*/\1/')
+        if ! have python3; then dstate="sin python3: no puede arrancar"
+        elif "$dbin" status >/dev/null 2>&1; then dstate="en marcha"
+        else dstate="parado (nexo setup-dbus lo arranca)"; fi
+        printf 'nexo-dbus  %s %s — %s\n' "$dbin" "${dver:-?}" "$dstate"
+        if [ "$dstate" = "en marcha" ]; then      # qué hace cada servicio (MPRIS, BlueZ, NetworkManager) y, si no, por qué
+            "$dbin" status 2>/dev/null | sed -n 's/^  /           /p'
+        fi
+        if [ -n "$dver" ] && [ "$dver" != "$NEXO_VERSION" ]; then
+            echo "           ⚠ es de otra versión que el cliente ($NEXO_VERSION): reinstala con el comando de la app y haz «nexo dbus restart»"
+        fi
+    else
+        printf 'nexo-dbus  no instalado (opcional: MPRIS, BlueZ y NetworkManager para escritorios)\n'
+    fi
     if devtcp_ok; then echo "/dev/tcp   sí"; else echo "/dev/tcp   no (se usará python3)"; fi
 
     if [ "$fix" = 1 ]; then
@@ -1561,6 +1946,8 @@ main() {
         rekey) cmd_rekey "$@" ;;
         unpair) cmd_unpair ;;
         setup-guests|guests) cmd_setup_guests "$@" ;;
+        setup-dbus) cmd_setup_dbus "$@" ;;
+        dbus) cmd_dbus "$@" ;;
         start) cmd_start ;;
         doctor) cmd_doctor "$@" ;;
         version) cmd_version "$@" ;;

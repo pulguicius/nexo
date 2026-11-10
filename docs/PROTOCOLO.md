@@ -10,7 +10,7 @@ conozca, y una app nueva sigue atendiendo a los clientes viejos. La *revisión* 
 |---|---|---|
 | 1 | 0.1.x | WiFi, Bluetooth, eventos, bootstrap |
 | 2 | 0.2.x | audio, media, `wifi.saved/forget/reconnect`, `bt.forget/rename/info`, `logs`, `commands` en `hello`, `gateway/prefix/dns` en `wifi.status` |
-| 3 | 0.6.x (previsto) | notificaciones: `notify.send`, `notify.close` y el tema de eventos `notif` |
+| 3 | 0.4.0‑beta2 (previsto) | `net.status` (qué red usa el móvil) y el tema de eventos `net`; notificaciones: `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` |
 
 ## Transporte
 
@@ -28,7 +28,7 @@ Si el token es incorrecto, la app espera ~0,8 s, responde `unauthorized` y cierr
 {"id":"1","cmd":"hello","token":"<48 caracteres hex>","client":"mi-cliente/1.0"}
 ```
 ```json
-{"id":"1","ok":true,"data":{"app":"nexo","version":"0.2.0","proto":1,"minor":2,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
+{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.0-beta1","proto":1,"minor":2,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
 ```
 
 - `wifi` y `bluetooth` dicen si el móvil tiene esa radio.
@@ -180,7 +180,7 @@ y reconecta solo (con espera creciente) si se corta.
 {"cmd":"bootstrap"}
 ```
 
-La app responde con **un script de bash en texto plano** (no JSON) y cierra la conexión. Contiene el cliente (en base64) y el instalador,
+La app responde con **un script de bash en texto plano** (no JSON) y cierra la conexión. Contiene el cliente y `nexo-dbus` (cada uno en base64, en las variables de shell `NEXO_CLIENT_B64` y `NEXO_DBUS_B64`, sin `export`) y el instalador,
 **nunca el token**. El comando de una línea que copia la app comprueba el **SHA‑256** del script antes de ejecutarlo; así, otra app que
 se hubiera adelantado a ocupar el puerto no puede colarte código. La app limita la entrega (una cada 2 s, diez por minuto en total).
 
@@ -192,6 +192,14 @@ printf '%s\n' '{"id":"1","cmd":"hello","token":"TU_TOKEN"}' >&3;  read -r -t 5 l
 printf '%s\n' '{"id":"2","cmd":"wifi.status"}'               >&3;  read -r -t 5 l <&3; echo "$l"
 exec 3>&-
 ```
+
+## Un cliente que se queda conectado: `nexo-dbus`
+
+`nexo-dbus` es un buen ejemplo de cliente persistente (el `nexo watch` del cliente de bash hace algo parecido): abre **una** conexión, envía `hello` con `"client":"nexo-dbus/0.4.0-beta1"`,
+y se suscribe con `{"cmd":"subscribe","topics":["media","audio"]}`. Al suscribirse, la app manda el estado inicial de cada tema como eventos, y desde entonces `nexo-dbus` se mueve con ellos; `media.status` solo lo pide para recalibrar la posición (cada 10 s mientras suena).
+Para el resto usa `media.play|pause|playpause|stop|next|prev`, `media.seek` (`delta_ms` o `position_ms`), `media.art` (por `art_hash`) y `audio.volume` (`percent`).
+Manda un `ping` tras 20 s sin actividad (y da la conexión por muerta si no hay respuesta en 8 s: es lo que pasa cuando Android congela la app), reconecta con espera creciente (1 s hasta 15 s),
+y si recibe `unauthorized` espera 30 s **releyendo el archivo de enlace** por si el token cambió (`nexo rekey`). Ignora los campos y eventos que no conoce. Detecta una app anterior a la 0.2 porque `minor` es menor que 2 o `media.status` no está en `commands`.
 
 ## Versionado
 

@@ -1,0 +1,3927 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""nexo-dbus: el móvil (música, Bluetooth, WiFi y notificaciones) como servicios D-Bus estándar.
+
+Es el segundo binario de Nexo (el primero es el cliente `nexo`). Dentro de una distro de proot —donde no hay
+reproductor, ni BlueZ, ni NetworkManager— `nexo-dbus` finge ser lo que las barras y los escritorios esperan encontrar:
+
+  · MPRIS 2  (org.mpris.MediaPlayer2.nexo, bus de sesión)        → playerctl, Waybar, Quickshell, GNOME, KDE…
+  · BlueZ    (org.bluez, bus del sistema)                         → bluetoothctl, blueman, gnome-bluetooth, bluedevil…
+  · NetworkManager (org.freedesktop.NetworkManager, bus del sistema) → nmcli, nm-applet, plasma-nm, Waybar…
+  · y reenvía las notificaciones de Android al demonio del escritorio (org.freedesktop.Notifications: dunst, mako…)
+
+sin escribir una línea de configuración para cada barra o escritorio.
+
+  · Solo necesita python3 (3.7 o más). Habla D-Bus él solo: no usa pydbus, dbus-python, dbus-next ni GLib.
+  · Habla con la app por el mismo protocolo que el cliente (docs/PROTOCOLO.md): 127.0.0.1, JSON por línea y token.
+  · Va por distro y por sesión. Si ya hay un BlueZ o un NetworkManager de verdad, no los pisa (modo pasivo).
+
+Uso:  nexo-dbus run | start | stop | restart | status | env | version | help      (nexo-dbus help para ver todo)
+"""
+
+import binascii
+import collections
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from urllib.parse import quote, unquote_to_bytes
+
+VERSION = "0.4.0-beta1"
+CLIENT_NAME = "nexo-dbus/" + VERSION
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.nexo"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+BUS_NAME = "org.freedesktop.DBus"
+BUS_PATH = "/org/freedesktop/DBus"
+IF_PROPS = "org.freedesktop.DBus.Properties"
+IF_INTRO = "org.freedesktop.DBus.Introspectable"
+IF_PEER = "org.freedesktop.DBus.Peer"
+IF_OBJMGR = "org.freedesktop.DBus.ObjectManager"
+
+ERR_ACCESS = "org.freedesktop.DBus.Error.AccessDenied"
+ERR_NEEDS_USER = "org.nexo.Error.NeedsUserAction"
+ERR_FAILED = "org.freedesktop.DBus.Error.Failed"
+ERR_NOREPLY = "org.freedesktop.DBus.Error.NoReply"
+ERR_ARGS = "org.freedesktop.DBus.Error.InvalidArgs"
+ERR_NOOBJ = "org.freedesktop.DBus.Error.UnknownObject"
+ERR_NOMETHOD = "org.freedesktop.DBus.Error.UnknownMethod"
+ERR_NOIFACE = "org.freedesktop.DBus.Error.UnknownInterface"
+ERR_NOPROP = "org.freedesktop.DBus.Error.UnknownProperty"
+ERR_RO = "org.freedesktop.DBus.Error.PropertyReadOnly"
+ERR_UNSUPPORTED = "org.freedesktop.DBus.Error.NotSupported"
+
+EXIT_USAGE = 2
+EXIT_NOBUS = 3
+EXIT_NOTOKEN = 11
+
+# ----------------------------------------------------------------------------------------------------- utilidades
+
+
+class Log(object):
+    level = 1  # 0 = solo errores, 1 = normal, 2 = depuración
+    stream = sys.stderr
+    lock = threading.Lock()
+
+
+def log(msg, lvl=1):
+    if lvl > Log.level:
+        return
+    line = "%s %s\n" % (time.strftime("%H:%M:%S"), msg)
+    with Log.lock:
+        try:
+            Log.stream.write(line)
+            Log.stream.flush()
+        except Exception:
+            pass
+
+
+def dbg(msg):
+    log(msg, 2)
+
+
+def home_dir():
+    h = os.path.expanduser("~")
+    return h if h and h != "~" else "/tmp"
+
+
+def cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(home_dir(), ".cache")
+    return os.path.join(base, "nexo")
+
+
+def runtime_dir():
+    d = os.environ.get("XDG_RUNTIME_DIR")
+    if d and os.path.isdir(d) and os.access(d, os.W_OK):
+        return d
+    return cache_dir()
+
+
+def ensure_dir(path):
+    try:
+        os.makedirs(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def clean_text(s):
+    """Texto apto para D-Bus: UTF-8 válido y sin NUL."""
+    if s is None:
+        return ""
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", "replace")
+    return str(s).replace("\x00", "")
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: tipos
+
+_ALIGN = {"y": 1, "b": 4, "n": 2, "q": 2, "i": 4, "u": 4, "x": 8, "t": 8, "d": 8, "s": 4, "o": 4, "g": 1,
+          "a": 4, "(": 8, "{": 8, "v": 1, "h": 4}
+_FMT = {"y": "B", "b": "I", "n": "h", "q": "H", "i": "i", "u": "I", "x": "q", "t": "Q", "d": "d", "h": "I"}
+_SIZE = {"y": 1, "b": 4, "n": 2, "q": 2, "i": 4, "u": 4, "x": 8, "t": 8, "d": 8, "h": 4}
+
+MAX_MESSAGE = 16 * 1024 * 1024
+
+
+class ProtocolError(Exception):
+    pass
+
+
+class DBusError(Exception):
+    """Un error D-Bus con nombre (se devuelve al que llamó)."""
+
+    def __init__(self, name, message=""):
+        Exception.__init__(self, "%s: %s" % (name, message))
+        self.name = name
+        self.message = message
+
+
+class Variant(object):
+    __slots__ = ("sig", "value")
+
+    def __init__(self, sig, value):
+        self.sig = sig
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, Variant) and self.sig == other.sig and self.value == other.value
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self.sig)
+
+    def __repr__(self):
+        return "Variant(%r, %r)" % (self.sig, self.value)
+
+
+def _type_end(sig, i):
+    c = sig[i]
+    if c == "a":
+        if i + 1 >= len(sig):
+            raise ValueError("firma incompleta: " + sig)
+        return _type_end(sig, i + 1)
+    if c in "({":
+        depth = 0
+        for j in range(i, len(sig)):
+            if sig[j] in "({":
+                depth += 1
+            elif sig[j] in ")}":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+        raise ValueError("firma sin cerrar: " + sig)
+    return i + 1
+
+
+def split_sig(sig):
+    out = []
+    i = 0
+    while i < len(sig):
+        j = _type_end(sig, i)
+        out.append(sig[i:j])
+        i = j
+    return out
+
+
+class Writer(object):
+    def __init__(self):
+        self.b = bytearray()
+
+    def align(self, n):
+        pad = (-len(self.b)) & (n - 1)
+        if pad:
+            self.b += b"\0" * pad
+
+    def put(self, t, v):
+        c = t[0]
+        if c in "ynqiuxtdbh":
+            self.align(_SIZE[c])
+            if c == "b":
+                v = 1 if v else 0
+            elif c == "d":
+                v = float(v)
+            else:
+                v = int(v)
+            self.b += struct.pack("<" + _FMT[c], v)
+        elif c in "so":
+            data = clean_text(v).encode("utf-8", "replace")
+            self.align(4)
+            self.b += struct.pack("<I", len(data)) + data + b"\0"
+        elif c == "g":
+            data = str(v).encode("ascii")
+            self.b.append(len(data))
+            self.b += data + b"\0"
+        elif c == "v":
+            if not isinstance(v, Variant):
+                raise ValueError("se esperaba un Variant")
+            self.put("g", v.sig)
+            self.put(v.sig, v.value)
+        elif c == "a":
+            et = t[1:]
+            self.align(4)
+            lenpos = len(self.b)
+            self.b += b"\0\0\0\0"
+            self.align(_ALIGN[et[0]])
+            start = len(self.b)
+            if et[0] == "{":
+                items = v.items() if isinstance(v, dict) else v
+                for kv in items:
+                    self.put(et, kv)
+            else:
+                for e in v:
+                    self.put(et, e)
+            struct.pack_into("<I", self.b, lenpos, len(self.b) - start)
+        elif c == "(":
+            self.align(8)
+            parts = split_sig(t[1:-1])
+            if len(parts) != len(v):
+                raise ValueError("estructura con %d campos y firma de %d" % (len(v), len(parts)))
+            for st, sv in zip(parts, v):
+                self.put(st, sv)
+        elif c == "{":
+            self.align(8)
+            kt, vt = split_sig(t[1:-1])
+            self.put(kt, v[0])
+            self.put(vt, v[1])
+        else:
+            raise ValueError("tipo no soportado: " + c)
+
+
+class Reader(object):
+    def __init__(self, data, pos, fmt):
+        self.d = data
+        self.p = pos
+        self.f = fmt
+
+    def align(self, n):
+        self.p = (self.p + n - 1) & ~(n - 1)
+
+    def take(self, n):
+        if n < 0 or self.p + n > len(self.d):
+            raise ProtocolError("mensaje truncado")
+        b = self.d[self.p:self.p + n]
+        self.p += n
+        return b
+
+    def num(self, c):
+        size = _SIZE[c]
+        self.align(size)
+        return struct.unpack(self.f + _FMT[c], self.take(size))[0]
+
+    def get(self, t):
+        c = t[0]
+        if c in "ynqiuxtdh":
+            return self.num(c)
+        if c == "b":
+            return self.num("b") != 0
+        if c in "so":
+            n = self.num("u")
+            b = self.take(n)
+            self.take(1)
+            return b.decode("utf-8", "replace")
+        if c == "g":
+            n = self.take(1)[0]
+            b = self.take(n)
+            self.take(1)
+            return b.decode("ascii", "replace")
+        if c == "v":
+            sig = self.get("g")
+            if not sig or _type_end(sig, 0) != len(sig):
+                raise ProtocolError("variante con firma no válida")
+            return Variant(sig, self.get(sig))
+        if c == "a":
+            et = t[1:]
+            n = self.num("u")
+            if n > MAX_MESSAGE:
+                raise ProtocolError("array demasiado grande")
+            self.align(_ALIGN[et[0]])
+            end = self.p + n
+            if end > len(self.d):
+                raise ProtocolError("mensaje truncado")
+            if et[0] == "{":
+                kt, vt = split_sig(et[1:-1])
+                out = {}
+                while self.p < end:
+                    self.align(8)
+                    k = self.get(kt)
+                    out[k] = self.get(vt)
+            else:
+                out = []
+                while self.p < end:
+                    out.append(self.get(et))
+            if self.p != end:
+                raise ProtocolError("array mal formado")
+            return out
+        if c == "(":
+            self.align(8)
+            return tuple(self.get(x) for x in split_sig(t[1:-1]))
+        if c == "{":
+            self.align(8)
+            kt, vt = split_sig(t[1:-1])
+            return (self.get(kt), self.get(vt))
+        raise ProtocolError("tipo no soportado: " + c)
+
+
+MSG_CALL, MSG_RETURN, MSG_ERROR, MSG_SIGNAL = 1, 2, 3, 4
+FLAG_NO_REPLY = 0x1
+F_PATH, F_IFACE, F_MEMBER, F_ERROR, F_REPLY, F_DEST, F_SENDER, F_SIG = 1, 2, 3, 4, 5, 6, 7, 8
+
+
+class Message(object):
+    __slots__ = ("type", "flags", "serial", "path", "interface", "member", "error_name", "reply_serial",
+                 "destination", "sender", "signature", "body")
+
+    def __init__(self):
+        self.type = 0
+        self.flags = 0
+        self.serial = 0
+        self.path = None
+        self.interface = None
+        self.member = None
+        self.error_name = None
+        self.reply_serial = None
+        self.destination = None
+        self.sender = None
+        self.signature = ""
+        self.body = ()
+
+
+def build_message(mtype, serial, path=None, interface=None, member=None, dest=None, error_name=None,
+                  reply_serial=None, sig="", body=(), flags=0):
+    bw = Writer()
+    for t, v in zip(split_sig(sig), body):
+        bw.put(t, v)
+    payload = bytes(bw.b)
+    fields = []
+    if path:
+        fields.append((F_PATH, "o", path))
+    if interface:
+        fields.append((F_IFACE, "s", interface))
+    if member:
+        fields.append((F_MEMBER, "s", member))
+    if error_name:
+        fields.append((F_ERROR, "s", error_name))
+    if reply_serial is not None:
+        fields.append((F_REPLY, "u", reply_serial))
+    if dest:
+        fields.append((F_DEST, "s", dest))
+    if sig:
+        fields.append((F_SIG, "g", sig))
+    w = Writer()
+    w.b += struct.pack("<BBBBII", ord("l"), mtype, flags, 1, len(payload), serial)
+    w.align(4)
+    lenpos = len(w.b)
+    w.b += b"\0\0\0\0"
+    w.align(8)
+    start = len(w.b)
+    for code, t, v in fields:
+        w.align(8)
+        w.b.append(code)
+        w.put("v", Variant(t, v))
+    struct.pack_into("<I", w.b, lenpos, len(w.b) - start)
+    w.align(8)
+    return bytes(w.b) + payload
+
+
+def parse_message(buf):
+    """Devuelve (Message, bytes_usados) o None si todavía no ha llegado entero."""
+    if len(buf) < 16:
+        return None
+    e = buf[0:1]
+    if e == b"l":
+        fmt = "<"
+    elif e == b"B":
+        fmt = ">"
+    else:
+        raise ProtocolError("mensaje con endianness desconocido")
+    mtype, flags, ver = buf[1], buf[2], buf[3]
+    if ver != 1:
+        raise ProtocolError("versión de protocolo D-Bus no soportada")
+    blen, serial, flen = struct.unpack(fmt + "III", buf[4:16])
+    hdr = 16 + flen
+    total = hdr + ((-hdr) & 7) + blen
+    if total > MAX_MESSAGE or flen > MAX_MESSAGE:
+        raise ProtocolError("mensaje demasiado grande")
+    if len(buf) < total:
+        return None
+    data = bytes(buf[:total])
+    m = Message()
+    m.type, m.flags, m.serial = mtype, flags, serial
+    r = Reader(data, 16, fmt)
+    while r.p < hdr:
+        r.align(8)
+        code = r.take(1)[0]
+        v = r.get("v").value
+        if code == F_PATH:
+            m.path = v
+        elif code == F_IFACE:
+            m.interface = v
+        elif code == F_MEMBER:
+            m.member = v
+        elif code == F_ERROR:
+            m.error_name = v
+        elif code == F_REPLY:
+            m.reply_serial = v
+        elif code == F_DEST:
+            m.destination = v
+        elif code == F_SENDER:
+            m.sender = v
+        elif code == F_SIG:
+            m.signature = v
+    r.p = hdr + ((-hdr) & 7)
+    if m.signature:
+        m.body = tuple(r.get(t) for t in split_sig(m.signature))
+    return m, total
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: objetos
+
+
+class Method(object):
+    def __init__(self, name, in_sig, out_sig, fn, slow, args, outs):
+        self.name, self.in_sig, self.out_sig, self.fn, self.slow = name, in_sig, out_sig, fn, slow
+        self.args, self.outs = tuple(args), tuple(outs)
+
+
+class Prop(object):
+    def __init__(self, name, sig, get, set_, emits, present=None):
+        self.name, self.sig, self.get, self.set, self.emits = name, sig, get, set_, emits
+        self.present = present   # () -> bool: una propiedad opcional (p. ej. el Name de un dispositivo que aún no dio su nombre)
+
+
+class Interface(object):
+    """Una interfaz D-Bus que se exporta: métodos, propiedades y señales."""
+
+    def __init__(self, name):
+        self.name = name
+        self.methods = collections.OrderedDict()
+        self.props = collections.OrderedDict()
+        self.signals = collections.OrderedDict()
+
+    def method(self, name, in_sig="", out_sig="", fn=None, slow=False, args=(), outs=()):
+        """slow=True: puede tardar (habla con la app); se ejecuta en una cola ordenada y no frena a las demás llamadas."""
+        self.methods[name] = Method(name, in_sig, out_sig, fn, slow, args, outs)
+        return self
+
+    def prop(self, name, sig, get, set_=None, emits="true", present=None):
+        self.props[name] = Prop(name, sig, get, set_, emits, present)
+        return self
+
+    def snapshot(self):
+        """Las propiedades que tiene ahora mismo (las opcionales ausentes no salen): nombre → Variant."""
+        out = collections.OrderedDict()
+        for p in self.props.values():
+            if p.present is not None and not p.present():
+                continue
+            out[p.name] = Variant(p.sig, p.get())
+        return out
+
+    def signal(self, name, sig="", args=()):
+        self.signals[name] = (sig, tuple(args))
+        return self
+
+    @staticmethod
+    def _nm(names, i):
+        return ' name="%s"' % names[i] if i < len(names) else ""
+
+    def xml(self):
+        s = ['  <interface name="%s">\n' % self.name]
+        for m in self.methods.values():
+            s.append('    <method name="%s">\n' % m.name)
+            for i, t in enumerate(split_sig(m.in_sig)):
+                s.append('      <arg type="%s"%s direction="in"/>\n' % (t, self._nm(m.args, i)))
+            for i, t in enumerate(split_sig(m.out_sig)):
+                s.append('      <arg type="%s"%s direction="out"/>\n' % (t, self._nm(m.outs, i)))
+            s.append("    </method>\n")
+        for name, (sig, args) in self.signals.items():
+            s.append('    <signal name="%s">\n' % name)
+            for i, t in enumerate(split_sig(sig)):
+                s.append('      <arg type="%s"%s/>\n' % (t, self._nm(args, i)))
+            s.append("    </signal>\n")
+        for p in self.props.values():
+            s.append('    <property name="%s" type="%s" access="%s">\n' % (p.name, p.sig, "readwrite" if p.set else "read"))
+            s.append('      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="%s"/>\n' % p.emits)
+            s.append("    </property>\n")
+        s.append("  </interface>\n")
+        return "".join(s)
+
+
+_STD_XML = (
+    '  <interface name="org.freedesktop.DBus.Peer">\n'
+    '    <method name="Ping"/>\n'
+    '    <method name="GetMachineId"><arg type="s" name="machine_uuid" direction="out"/></method>\n'
+    "  </interface>\n"
+    '  <interface name="org.freedesktop.DBus.Introspectable">\n'
+    '    <method name="Introspect"><arg type="s" name="xml_data" direction="out"/></method>\n'
+    "  </interface>\n"
+    '  <interface name="org.freedesktop.DBus.Properties">\n'
+    '    <method name="Get"><arg type="s" name="interface_name" direction="in"/><arg type="s" name="property_name" direction="in"/>'
+    '<arg type="v" name="value" direction="out"/></method>\n'
+    '    <method name="GetAll"><arg type="s" name="interface_name" direction="in"/><arg type="a{sv}" name="properties" direction="out"/></method>\n'
+    '    <method name="Set"><arg type="s" name="interface_name" direction="in"/><arg type="s" name="property_name" direction="in"/>'
+    '<arg type="v" name="value" direction="in"/></method>\n'
+    '    <signal name="PropertiesChanged"><arg type="s" name="interface_name"/><arg type="a{sv}" name="changed_properties"/>'
+    '<arg type="as" name="invalidated_properties"/></signal>\n'
+    "  </interface>\n"
+)
+
+_INTRO_HEAD = ('<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"\n'
+               ' "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">\n<node>\n')
+
+
+def machine_id():
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(p) as f:
+                v = f.read().strip()
+            if re.match(r"^[0-9a-f]{32}$", v):
+                return v
+        except OSError:
+            pass
+    return hashlib.md5(("nexo:" + socket.gethostname()).encode()).hexdigest()
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: conexión
+
+
+def parse_address(addr):
+    """«unix:path=/x,guid=…;unix:abstract=/y» → [("unix", {"path": b"/x"}), …]"""
+    out = []
+    for part in addr.split(";"):
+        if not part.strip():
+            continue
+        transport, _, rest = part.partition(":")
+        params = {}
+        for kv in rest.split(","):
+            k, _, v = kv.partition("=")
+            if k:
+                params[k] = unquote_to_bytes(v)
+        out.append((transport, params))
+    return out
+
+
+def _open_socket(transport, params):
+    if transport != "unix":
+        raise OSError("transporte D-Bus no soportado: %s (solo unix)" % transport)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(5)
+        if "path" in params:
+            s.connect(os.fsdecode(params["path"]))
+        elif "abstract" in params:
+            s.connect(b"\0" + params["abstract"])
+        elif params.get("runtime") == b"yes":
+            s.connect(os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), "bus"))
+        else:
+            raise OSError("dirección D-Bus sin path ni abstract")
+    except Exception:
+        s.close()
+        raise
+    return s
+
+
+class _Pending(object):
+    def __init__(self):
+        self.event = threading.Event()
+        self.msg = None
+
+
+class Bus(object):
+    """Una conexión a un bus D-Bus: exporta objetos, atiende llamadas, emite señales y llama a otros."""
+
+    def __init__(self, address, label="bus"):
+        self.address = address
+        self.label = label
+        self.sock = None
+        self.unique_name = None
+        self.objects = {}
+        self.owned = set()
+        self.closed = threading.Event()
+        self.on_name_lost = None
+        self._serial = 0
+        self._slock = threading.Lock()
+        self._wlock = threading.Lock()
+        self._pending = {}
+        self._actions = collections.deque()
+        self._acond = threading.Condition()
+
+    # ---- conexión
+
+    def connect(self):
+        last = None
+        sock = None
+        for transport, params in parse_address(self.address):
+            try:
+                sock = _open_socket(transport, params)
+                break
+            except OSError as e:
+                last = e
+        if sock is None:
+            raise OSError("no pude conectar con el bus (%s): %s" % (self.address, last))
+        try:
+            self._auth(sock)
+        except Exception:
+            sock.close()
+            raise
+        sock.settimeout(None)
+        self.sock = sock
+        threading.Thread(target=self._read_loop, name=self.label + "-lectura", daemon=True).start()
+        threading.Thread(target=self._action_loop, name=self.label + "-acciones", daemon=True).start()
+        self.unique_name = self.call(BUS_NAME, BUS_PATH, BUS_NAME, "Hello")[0]
+        dbg("conectado a %s como %s" % (self.label, self.unique_name))
+
+    @staticmethod
+    def _auth_line(s):
+        buf = b""
+        while not buf.endswith(b"\r\n"):
+            c = s.recv(1)
+            if not c:
+                raise ConnectionError("el bus cerró la conexión durante la autenticación")
+            buf += c
+            if len(buf) > 1024:
+                raise ConnectionError("respuesta de autenticación demasiado larga")
+        return buf[:-2]
+
+    def _auth(self, s):
+        s.sendall(b"\0")
+        uid = str(os.getuid()).encode()
+        for first in (b"AUTH EXTERNAL " + binascii.hexlify(uid), b"AUTH EXTERNAL"):
+            s.sendall(first + b"\r\n")
+            line = self._auth_line(s)
+            if line.startswith(b"DATA"):
+                s.sendall(b"DATA\r\n")
+                line = self._auth_line(s)
+            if line.startswith(b"OK"):
+                s.sendall(b"BEGIN\r\n")
+                return
+        raise ConnectionError("el bus rechazó la autenticación (EXTERNAL)")
+
+    def close(self):
+        self.closed.set()
+        s = self.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+        with self._acond:
+            self._acond.notify_all()
+        self._fail_pending()
+
+    def _fail_pending(self):
+        for p in list(self._pending.values()):
+            p.event.set()
+
+    def _next_serial(self):
+        with self._slock:
+            self._serial += 1
+            return self._serial
+
+    def _send(self, data):
+        with self._wlock:
+            try:
+                self.sock.sendall(data)
+            except (OSError, AttributeError) as e:
+                self.closed.set()
+                raise DBusError(ERR_FAILED, "conexión con el bus perdida: %s" % e)
+
+    # ---- hilo lector
+
+    def _read_loop(self):
+        buf = b""
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    r = parse_message(buf)
+                    if r is None:
+                        break
+                    msg, used = r
+                    buf = buf[used:]
+                    try:
+                        self._dispatch(msg)
+                    except Exception as e:  # un fallo en un mensaje no debe tirar la conexión
+                        log("error atendiendo un mensaje D-Bus: %r" % (e,))
+                        dbg(repr(sys.exc_info()))
+        except (OSError, ProtocolError) as e:
+            dbg("lectura del bus terminada: %r" % (e,))
+        finally:
+            self.closed.set()
+            self._fail_pending()
+            with self._acond:
+                self._acond.notify_all()
+
+    def _dispatch(self, msg):
+        if msg.type in (MSG_RETURN, MSG_ERROR):
+            p = self._pending.get(msg.reply_serial)
+            if p is not None:
+                p.msg = msg
+                p.event.set()
+        elif msg.type == MSG_SIGNAL:
+            if msg.sender == BUS_NAME and msg.member in ("NameLost", "NameAcquired") and msg.body:
+                name = msg.body[0]
+                if msg.member == "NameLost":
+                    self.owned.discard(name)
+                    cb = self.on_name_lost
+                    if cb:
+                        threading.Thread(target=cb, args=(name,), daemon=True).start()
+                else:
+                    self.owned.add(name)
+        elif msg.type == MSG_CALL:
+            self._on_call(msg)
+
+    # ---- llamadas salientes
+
+    def call(self, dest, path, iface, member, sig="", body=(), timeout=8.0):
+        serial = self._next_serial()
+        p = _Pending()
+        self._pending[serial] = p
+        try:
+            self._send(build_message(MSG_CALL, serial, path=path, interface=iface, member=member, dest=dest,
+                                     sig=sig, body=body))
+            if not p.event.wait(timeout):
+                raise DBusError(ERR_NOREPLY, "%s no contestó a %s" % (dest, member))
+        finally:
+            self._pending.pop(serial, None)
+        m = p.msg
+        if m is None:
+            raise DBusError(ERR_FAILED, "se perdió la conexión con el bus")
+        if m.type == MSG_ERROR:
+            raise DBusError(m.error_name or ERR_FAILED, m.body[0] if m.body and isinstance(m.body[0], str) else "")
+        return m.body
+
+    def request_name(self, name, allow_replacement=True, replace=False):
+        """1 = dueño; 4 = ya lo era; 3 = lo tiene otro; 2 = en cola."""
+        flags = 0x4 | (0x1 if allow_replacement else 0) | (0x2 if replace else 0)
+        r = self.call(BUS_NAME, BUS_PATH, BUS_NAME, "RequestName", "su", (name, flags))[0]
+        if r in (1, 4):
+            self.owned.add(name)
+        return r
+
+    def release_name(self, name):
+        try:
+            r = self.call(BUS_NAME, BUS_PATH, BUS_NAME, "ReleaseName", "s", (name,))[0]
+        finally:
+            self.owned.discard(name)
+        return r
+
+    def name_has_owner(self, name):
+        return bool(self.call(BUS_NAME, BUS_PATH, BUS_NAME, "NameHasOwner", "s", (name,))[0])
+
+    def list_activatable(self):
+        return list(self.call(BUS_NAME, BUS_PATH, BUS_NAME, "ListActivatableNames")[0])
+
+    # ---- objetos exportados
+
+    def export(self, path, iface):
+        self.objects.setdefault(path, collections.OrderedDict())[iface.name] = iface
+
+    def unexport(self, path, iface_name=None):
+        if iface_name is None:
+            self.objects.pop(path, None)
+        elif path in self.objects:
+            self.objects[path].pop(iface_name, None)
+            if not self.objects[path]:
+                del self.objects[path]
+
+    def emit(self, path, iface, member, sig="", body=()):
+        if self.closed.is_set() or self.sock is None:
+            return
+        try:
+            self._send(build_message(MSG_SIGNAL, self._next_serial(), path=path, interface=iface, member=member,
+                                     sig=sig, body=body))
+        except DBusError as e:
+            dbg("no pude emitir %s: %s" % (member, e))
+        except (ValueError, TypeError, struct.error) as e:
+            log("no pude emitir %s (dato no válido: %s)" % (member, e))
+
+    def properties_changed(self, path, iface_name, values, invalidated=()):
+        """values: {nombre: valor de Python}; se mandan con el tipo que declara la interfaz."""
+        it = self.objects.get(path, {}).get(iface_name)
+        if it is None or not (values or invalidated):
+            return
+        changed, invalid = {}, list(invalidated)
+        for name, val in values.items():
+            p = it.props.get(name)
+            if p is None or p.emits in ("false", "const"):
+                continue
+            if p.emits == "invalidates":
+                invalid.append(name)
+            else:
+                changed[name] = Variant(p.sig, val)
+        if changed or invalid:
+            self.emit(path, IF_PROPS, "PropertiesChanged", "sa{sv}as", (iface_name, changed, invalid))
+
+    # ---- llamadas entrantes
+
+    def _children(self, path):
+        prefix = path.rstrip("/") + "/"
+        kids = set()
+        for p in list(self.objects):
+            if p.startswith(prefix) and p != path:
+                kids.add(p[len(prefix):].split("/", 1)[0])
+        return sorted(kids)
+
+    def _introspect(self, path):
+        parts = [_INTRO_HEAD, _STD_XML]
+        for it in list(self.objects.get(path, {}).values()):
+            parts.append(it.xml())
+        for kid in self._children(path):
+            parts.append('  <node name="%s"/>\n' % kid)
+        parts.append("</node>\n")
+        return "".join(parts)
+
+    def _find_method(self, msg):
+        ifaces = self.objects.get(msg.path)
+        if not ifaces:
+            return None
+        if msg.interface:
+            it = ifaces.get(msg.interface)
+            return it.methods.get(msg.member) if it else None
+        for it in list(ifaces.values()):
+            if msg.member in it.methods:
+                return it.methods[msg.member]
+        return None
+
+    def _on_call(self, msg):
+        slow = False
+        if msg.interface in (IF_PROPS, None) and msg.member == "Set":
+            slow = True
+        else:
+            m = self._find_method(msg)
+            slow = bool(m and m.slow)
+        if slow:
+            with self._acond:
+                self._actions.append(msg)
+                self._acond.notify()
+        else:
+            self._execute(msg)
+
+    def _action_loop(self):
+        while not self.closed.is_set():
+            with self._acond:
+                while not self._actions and not self.closed.is_set():
+                    self._acond.wait(1.0)
+                if self.closed.is_set():
+                    return
+                msg = self._actions.popleft()
+            self._execute(msg)
+
+    def _execute(self, msg):
+        try:
+            sig, body = self._invoke(msg)
+        except DBusError as e:
+            self._reply_error(msg, e.name, e.message)
+            return
+        except Exception as e:
+            log("error en %s.%s: %r" % (msg.interface, msg.member, e))
+            dbg(traceback.format_exc())
+            self._reply_error(msg, ERR_FAILED, "error interno de nexo-dbus")
+            return
+        if not (msg.flags & FLAG_NO_REPLY):
+            try:
+                self._send(build_message(MSG_RETURN, self._next_serial(), reply_serial=msg.serial, dest=msg.sender,
+                                         sig=sig, body=body))
+            except DBusError as e:
+                dbg("no pude responder: %s" % e)
+
+    def _reply_error(self, msg, name, text):
+        if msg.flags & FLAG_NO_REPLY:
+            return
+        try:
+            self._send(build_message(MSG_ERROR, self._next_serial(), error_name=name, reply_serial=msg.serial,
+                                     dest=msg.sender, sig="s", body=(text,)))
+        except DBusError:
+            pass
+
+    @staticmethod
+    def _args(msg, sig):
+        if msg.signature != sig:
+            raise DBusError(ERR_ARGS, "se esperaba la firma «%s» y llegó «%s»" % (sig, msg.signature))
+        return msg.body
+
+    def _invoke(self, msg):
+        if msg.interface == IF_PEER:
+            if msg.member == "Ping":
+                return "", ()
+            if msg.member == "GetMachineId":
+                return "s", (machine_id(),)
+            raise DBusError(ERR_NOMETHOD, "Peer no tiene " + str(msg.member))
+        ifaces = self.objects.get(msg.path)
+        if not ifaces:
+            if msg.member == "Introspect" and msg.interface in (None, IF_INTRO) and self._children(msg.path or "/"):
+                return "s", (self._introspect(msg.path),)
+            raise DBusError(ERR_NOOBJ, "No hay ningún objeto en %s" % msg.path)
+        if msg.member == "Introspect" and msg.interface in (None, IF_INTRO):
+            return "s", (self._introspect(msg.path),)
+        if msg.member in ("Get", "GetAll", "Set") and msg.interface in (None, IF_PROPS):
+            return self._props_call(msg, ifaces)
+        m = self._find_method(msg)
+        if m is None:
+            raise DBusError(ERR_NOMETHOD, "%s no tiene el método %s" % (msg.interface or msg.path, msg.member))
+        if msg.signature != m.in_sig:
+            raise DBusError(ERR_ARGS, "%s espera «%s» y llegó «%s»" % (m.name, m.in_sig, msg.signature))
+        res = m.fn(*msg.body)
+        outs = split_sig(m.out_sig)
+        if not outs:
+            return "", ()
+        if len(outs) == 1:
+            return m.out_sig, (res,)
+        return m.out_sig, tuple(res)
+
+    def _props_call(self, msg, ifaces):
+        if msg.member == "GetAll":
+            (name,) = self._args(msg, "s")
+            if name and name not in ifaces:
+                raise DBusError(ERR_NOIFACE, "Interfaz desconocida: " + name)
+            out = {}
+            for it in ([ifaces[name]] if name else list(ifaces.values())):
+                out.update(it.snapshot())
+            return "a{sv}", (out,)
+        if msg.member == "Get":
+            name, prop = self._args(msg, "ss")
+        else:
+            name, prop, var = self._args(msg, "ssv")
+        cands = [ifaces[name]] if name in ifaces else ([] if name else list(ifaces.values()))
+        if name and not cands:
+            raise DBusError(ERR_NOIFACE, "Interfaz desconocida: " + name)
+        for it in cands:
+            p = it.props.get(prop)
+            if p is None:
+                continue
+            if msg.member == "Get":
+                if p.present is not None and not p.present():
+                    raise DBusError(ERR_ARGS, "No such property '%s'" % prop)   # igual que BlueZ
+                return "v", (Variant(p.sig, p.get()),)
+            if p.set is None:
+                raise DBusError(ERR_RO, "La propiedad %s es de solo lectura" % prop)
+            if var.sig != p.sig:
+                raise DBusError(ERR_ARGS, "%s es de tipo «%s», no «%s»" % (prop, p.sig, var.sig))
+            p.set(var.value)
+            return "", ()
+        raise DBusError(ERR_NOPROP, "Propiedad desconocida: " + prop)
+
+
+# ----------------------------------------------------------------------------------------------------- D-Bus: árbol de objetos
+
+
+class Tree(object):
+    """Los objetos que un servicio exporta en su bus, con el ObjectManager que BlueZ, NetworkManager y UDisks2 exigen.
+
+    El servicio dice cómo debe verse todo AHORA (update) y el árbol lo compara con lo que ya había: exporta lo nuevo,
+    retira lo que sobra y emite InterfacesAdded, InterfacesRemoved y PropertiesChanged. GetManagedObjects responde
+    desde lo que hay exportado de verdad, así que lo que dice el ObjectManager y lo que dicen las señales no se separan."""
+
+    def __init__(self, om_path):
+        self.om_path = om_path
+        self.bus = None
+        self.live = collections.OrderedDict()   # ruta → {nombre de interfaz: (Interface, instantánea)}
+        self.lock = threading.RLock()
+
+    def attach(self, bus):
+        self.bus = bus
+        om = Interface(IF_OBJMGR)
+        om.method("GetManagedObjects", "", "a{oa{sa{sv}}}", self._managed, outs=("objects",))
+        om.signal("InterfacesAdded", "oa{sa{sv}}", ("object_path", "interfaces_and_properties"))
+        om.signal("InterfacesRemoved", "oas", ("object_path", "interfaces"))
+        bus.export(self.om_path, om)
+
+    def detach(self):
+        bus = self.bus
+        self.update(collections.OrderedDict(), announce=False)
+        if bus is not None:
+            bus.unexport(self.om_path, IF_OBJMGR)
+        self.bus = None
+
+    def _managed(self):
+        with self.lock:
+            return dict((path, dict((n, it.snapshot()) for n, (it, _snap) in ifs.items()))
+                        for path, ifs in self.live.items())
+
+    @staticmethod
+    def _diff(it, old, new):
+        changed, invalid = {}, []
+        for name, val in new.items():
+            p = it.props.get(name)
+            if p is None or p.emits in ("false", "const"):
+                continue
+            if name not in old or old[name] != val:
+                if p.emits == "invalidates":
+                    invalid.append(name)
+                else:
+                    changed[name] = val
+        for name in old:
+            if name not in new:
+                invalid.append(name)
+        return changed, invalid
+
+    def update(self, desired, announce=True):
+        """desired: ruta → lista de Interface (lo que debe verse). announce=False: sin señales (primera exportación)."""
+        bus = self.bus
+        if bus is None:
+            return
+        with self.lock:
+            new = collections.OrderedDict()
+            for path, ifs in desired.items():
+                new[path] = collections.OrderedDict((it.name, (it, it.snapshot())) for it in ifs)
+            added, gone, props = [], [], []
+            for path, cur in new.items():
+                old = self.live.get(path) or {}
+                fresh = dict((n, s) for n, (_it, s) in cur.items() if n not in old)
+                if fresh:
+                    added.append((path, fresh))
+                lost = [n for n in old if n not in cur]
+                if lost:
+                    gone.append((path, lost))
+                for n, (it, snap) in cur.items():
+                    if n in old:
+                        ch, inv = self._diff(it, old[n][1], snap)
+                        if ch or inv:
+                            props.append((path, n, ch, inv))
+            for path, old in self.live.items():
+                if path not in new:
+                    gone.append((path, list(old)))
+            for path, names in gone:           # lo que desaparece: primero el aviso, luego se retira
+                if announce:
+                    bus.emit(self.om_path, IF_OBJMGR, "InterfacesRemoved", "oas", (path, names))
+                for n in names:
+                    bus.unexport(path, n)
+            for path, cur in new.items():      # lo demás se (re)exporta: así las lecturas ven ya el estado nuevo
+                for it, _snap in cur.values():
+                    bus.export(path, it)
+            if announce:
+                for path, fresh in added:
+                    bus.emit(self.om_path, IF_OBJMGR, "InterfacesAdded", "oa{sa{sv}}", (path, fresh))
+                for path, n, ch, inv in props:
+                    bus.emit(path, IF_PROPS, "PropertiesChanged", "sa{sv}as", (n, ch, inv))
+            self.live = new
+
+
+# ----------------------------------------------------------------------------------------------------- la app Nexo
+
+
+class BridgeError(Exception):
+    def __init__(self, code, message="", extra=None):
+        Exception.__init__(self, message or code)
+        self.code = code
+        self.message = message or code
+        self.extra = extra or {}
+
+
+class _Waiter(object):
+    def __init__(self):
+        self.event = threading.Event()
+        self.resp = None
+
+
+def load_config():
+    """Mismo orden que el cliente `nexo`: variables de entorno, y luego el primer archivo de enlace que exista."""
+    cfg = {"NEXO_PORT": os.environ.get("NEXO_PORT", ""), "NEXO_TOKEN": os.environ.get("NEXO_TOKEN", ""),
+           "NEXO_HOST": os.environ.get("NEXO_HOST", "")}
+    paths = []
+    if os.environ.get("NEXO_CONFIG"):
+        paths.append(os.environ["NEXO_CONFIG"])
+    paths.append(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home_dir(), ".config"), "nexo", "config"))
+    paths.append("/etc/nexo/config")
+    if os.environ.get("PREFIX"):
+        paths.append(os.path.join(os.environ["PREFIX"], "etc", "nexo", "config"))
+    used = None
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            k, sep, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip("\r").strip("\"'")
+            if sep and k in ("NEXO_PORT", "NEXO_TOKEN") and not cfg[k]:
+                cfg[k] = v
+        used = p
+        break
+    cfg["file"] = used
+    if not cfg["NEXO_PORT"]:
+        cfg["NEXO_PORT"] = "8765"
+    if not cfg["NEXO_HOST"]:
+        cfg["NEXO_HOST"] = "127.0.0.1"
+    return cfg
+
+
+class Bridge(object):
+    """Conexión persistente con la app: eventos en vivo y comandos por la misma línea."""
+
+    PING_AFTER = 20.0      # sin tráfico durante tanto → ping
+    PING_TIMEOUT = 8.0     # y si el ping no se contesta, se reconecta
+
+    def __init__(self, host, port, token, topics, on_event, reload=None):
+        self.host, self.port = host, port
+        self._token = token
+        self.topics = list(topics)
+        self.on_event = on_event
+        self.reload = reload   # () -> (host, puerto, token): se vuelve a leer el enlace al reconectar (nexo rekey)
+        self.ready = threading.Event()
+        self.info = {}
+        self.last_ready = 0.0
+        self.last_error = ""
+        self._sock = None
+        self._wlock = threading.Lock()
+        self._ilock = threading.Lock()
+        self._ids = 0
+        self._waiters = {}
+        self._stop = threading.Event()
+        self._hello_done = threading.Event()
+        self.rejected = False
+
+    def start(self):
+        threading.Thread(target=self._loop, name="app-nexo", daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+        s = self._sock
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def _loop(self):
+        delay = 1.0
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                self._session()
+            except Exception as e:
+                msg = "%s" % (e,)
+                if msg != self.last_error:
+                    log("sin conexión con la app Nexo en %s:%s (%s); reintento" % (self.host, self.port, msg))
+                self.last_error = msg
+                dbg(repr(e))
+            finally:
+                if self.ready.is_set():
+                    log("se perdió la conexión con la app Nexo")
+                self.ready.clear()
+                self.last_ready = time.monotonic()
+                self._fail_waiters()
+            if self._stop.is_set():
+                break
+            delay = 1.0 if time.monotonic() - t0 > 30 else min(delay * 2, 15.0)
+            if self.rejected:
+                self._wait_rejected()
+            else:
+                self._stop.wait(delay)
+
+    def _refresh_config(self):
+        """Vuelve a leer el enlace: «nexo rekey» cambia el token mientras nexo-dbus sigue en marcha."""
+        if self.reload is None:
+            return False
+        try:
+            link = self.reload()
+        except Exception as e:
+            dbg("no pude releer la configuración: %r" % (e,))
+            return False
+        if not link or not link[2] or tuple(link) == (self.host, self.port, self._token):
+            return False
+        self.host, self.port, self._token = link
+        log("el enlace con la app cambió en el archivo de configuración: uso el nuevo")
+        return True
+
+    def _wait_rejected(self):
+        """Con el token rechazado no tiene sentido insistir: espera, pero mirando el archivo por si lo arreglan."""
+        end = time.monotonic() + 30.0
+        while not self._stop.wait(2.0):
+            if time.monotonic() >= end or self._refresh_config():
+                return
+
+    def _fail_waiters(self):
+        for w in list(self._waiters.values()):
+            w.event.set()
+
+    def _send(self, obj):
+        data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        with self._wlock:
+            s = self._sock
+            if s is None:
+                raise BridgeError("no_connection", "No hay conexión con la app Nexo")
+            try:
+                s.sendall(data)
+            except OSError as e:
+                raise BridgeError("no_connection", "No pude escribir a la app Nexo: %s" % e)
+
+    def _session(self):
+        self._refresh_config()
+        s = socket.create_connection((self.host, self.port), timeout=4)
+        s.settimeout(1.0)
+        self._sock = s
+        self._hello_done.clear()
+        self.rejected = False
+        buf = b""
+        t_hello = time.monotonic()
+        self._send({"id": "hello", "cmd": "hello", "token": self._token, "client": CLIENT_NAME})
+        last_rx = time.monotonic()
+        last_ping = None
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    chunk = None
+                if chunk == b"":
+                    raise ConnectionError("la app cerró la conexión")
+                now = time.monotonic()
+                if chunk:
+                    last_rx, last_ping = now, None
+                    buf += chunk
+                    if len(buf) > (1 << 20) and b"\n" not in buf:
+                        raise ConnectionError("línea demasiado larga")
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        self._on_line(line)
+                else:
+                    if not self._hello_done.is_set() and now - t_hello > 8:
+                        raise ConnectionError("la app no contestó al hello (¿está congelada?)")
+                    if self._hello_done.is_set():
+                        if last_ping is None and now - last_rx > self.PING_AFTER:
+                            self._send({"id": "ping", "cmd": "ping"})
+                            last_ping = now
+                        elif last_ping is not None and now - last_ping > self.PING_TIMEOUT:
+                            raise ConnectionError("la app no responde al ping")
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _on_line(self, raw):
+        try:
+            o = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if not isinstance(o, dict):
+            return
+        if "event" in o:
+            try:
+                self.on_event(o["event"], o.get("data") or {})
+            except Exception as e:
+                log("error procesando un evento: %r" % (e,))
+            return
+        rid = o.get("id")
+        if rid == "hello":
+            if not o.get("ok"):
+                self.rejected = o.get("error") == "unauthorized"
+                raise ConnectionError("la app rechazó el enlace (%s): ejecuta «nexo pair» o «nexo rekey»" % o.get("error", "?")
+                                      if self.rejected else "hello falló: %s" % o.get("error", "?"))
+            self.info = o.get("data") or {}
+            self._hello_done.set()
+            self.last_error = ""
+            self.ready.set()
+            self.last_ready = time.monotonic()
+            log("conectado con la app Nexo %s (%s)" % (self.info.get("version", "?"), self.info.get("device", "?")))
+            cmds = self.info.get("commands")
+            if self.info.get("minor", 1) < 2 or (isinstance(cmds, list) and "media.status" not in cmds):
+                log("esta versión de la app Nexo (%s) no sabe de música: instala el APK nuevo para usar MPRIS" % self.info.get("version", "?"))
+            self._send({"id": "sub", "cmd": "subscribe", "topics": self.topics})
+            return
+        w = self._waiters.get(rid)
+        if w is not None:
+            w.resp = o
+            w.event.set()
+
+    def call(self, cmd, timeout=8.0, **params):
+        if not self.ready.is_set():
+            raise BridgeError("no_connection", "No hay conexión con la app Nexo")
+        with self._ilock:
+            self._ids += 1
+            rid = "c%d" % self._ids
+        w = _Waiter()
+        self._waiters[rid] = w
+        req = dict(params)
+        req["id"] = rid
+        req["cmd"] = cmd
+        try:
+            self._send(req)
+            if not w.event.wait(timeout):
+                raise BridgeError("timeout", "La app no contestó a tiempo (¿la congeló Android?)")
+        finally:
+            self._waiters.pop(rid, None)
+        r = w.resp
+        if r is None:
+            raise BridgeError("no_connection", "Se perdió la conexión con la app Nexo")
+        if r.get("ok"):
+            return r.get("data") or {}
+        extra = dict((k, r[k]) for k in ("action", "opens", "permission") if k in r)
+        raise BridgeError(r.get("error", "failed"), r.get("message", ""), extra)
+
+
+# ----------------------------------------------------------------------------------------------------- MPRIS
+
+ART_EXT = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+
+
+class Mpris(object):
+    """org.mpris.MediaPlayer2.nexo: la sesión de medios activa de Android como un reproductor más."""
+
+    LABEL = "MPRIS"
+    TOPICS = ("media", "audio")
+
+    def __init__(self, bridge, always=False, grace=3.0, grace_down=30.0, force=False):
+        self.bridge = bridge
+        self.always = always
+        self.grace = grace
+        self.grace_down = grace_down
+        self.force = force
+        self.lock = threading.RLock()
+        self.status = {}
+        self.t_status = time.monotonic()
+        self.volume = None
+        self.muted = False
+        self.art = None
+        self._art_fetching = None
+        self._art_missing = set()
+        self.bus = None
+        self.owned = False
+        self.yielded = False
+        self.unwant_since = None
+        self.t_resync = time.monotonic()
+        self._resyncing = False
+        self._last_view = {}
+        self._seeked = None
+        self._warned_listener = False
+        self.root, self.player = self._interfaces()
+
+    # ---- interfaces
+
+    def _interfaces(self):
+        root = Interface(MPRIS_ROOT)
+        root.method("Raise", fn=lambda: None).method("Quit", fn=lambda: None)
+        root.prop("CanQuit", "b", lambda: False, emits="const")
+        root.prop("CanRaise", "b", lambda: False, emits="const")
+        root.prop("HasTrackList", "b", lambda: False, emits="const")
+        root.prop("Identity", "s", lambda: self._view()["Identity"])
+        root.prop("SupportedUriSchemes", "as", lambda: [], emits="const")
+        root.prop("SupportedMimeTypes", "as", lambda: [], emits="const")
+
+        pl = Interface(MPRIS_PLAYER)
+        for name, cmd in (("Next", "media.next"), ("Previous", "media.prev"), ("Pause", "media.pause"),
+                          ("PlayPause", "media.playpause"), ("Stop", "media.stop"), ("Play", "media.play")):
+            pl.method(name, fn=(lambda c: lambda: self._act(c))(cmd), slow=True)
+        pl.method("Seek", "x", fn=self._seek, slow=True, args=("Offset",))
+        pl.method("SetPosition", "ox", fn=self._set_position, slow=True, args=("TrackId", "Position"))
+        pl.method("OpenUri", "s", fn=self._open_uri, slow=True, args=("Uri",))
+        pl.signal("Seeked", "x", ("Position",))
+        pl.prop("PlaybackStatus", "s", lambda: self._view()["PlaybackStatus"])
+        pl.prop("Rate", "d", lambda: self._view()["Rate"])
+        pl.prop("Metadata", "a{sv}", lambda: self._view()["Metadata"])
+        pl.prop("Volume", "d", lambda: self._view()["Volume"], self._set_volume)
+        pl.prop("Position", "x", self._position_us, emits="false")
+        pl.prop("MinimumRate", "d", lambda: self._view()["MinimumRate"])
+        pl.prop("MaximumRate", "d", lambda: self._view()["MaximumRate"])
+        for p in ("CanGoNext", "CanGoPrevious", "CanPlay", "CanPause", "CanSeek", "CanControl"):
+            pl.prop(p, "b", (lambda k: lambda: self._view()[k])(p))
+        return root, pl
+
+    # ---- estado → propiedades
+
+    def _available(self):
+        return bool(self.status.get("available"))
+
+    def _state(self):
+        st = self.status.get("state") if self._available() else "none"
+        if st in ("playing", "buffering"):
+            return "Playing"
+        if st == "paused":
+            return "Paused"
+        return "Stopped"
+
+    def _trackid(self):
+        st = self.status
+        key = st.get("track_id") or "|".join(clean_text(st.get(k)) for k in ("package", "title", "artist", "album", "duration_ms"))
+        return "/org/nexo/track/" + hashlib.sha1(clean_text(key).encode("utf-8", "replace")).hexdigest()[:20]
+
+    def _art_url(self):
+        a = self.art
+        if a and a[0] == self.status.get("art_hash") and os.path.exists(a[1]):
+            return "file://" + quote(a[1])
+        return None
+
+    def _metadata(self):
+        st = self.status
+        if not self._available():
+            return {"mpris:trackid": Variant("o", NO_TRACK)}
+        md = {"mpris:trackid": Variant("o", self._trackid())}
+        dur = st.get("duration_ms")
+        if isinstance(dur, (int, float)) and dur > 0:
+            md["mpris:length"] = Variant("x", int(dur * 1000))
+        url = self._art_url()
+        if url:
+            md["mpris:artUrl"] = Variant("s", url)
+        if st.get("title"):
+            md["xesam:title"] = Variant("s", clean_text(st["title"]))
+        if st.get("artist"):
+            md["xesam:artist"] = Variant("as", [clean_text(st["artist"])])
+        if st.get("album"):
+            md["xesam:album"] = Variant("s", clean_text(st["album"]))
+        if st.get("album_artist"):
+            md["xesam:albumArtist"] = Variant("as", [clean_text(st["album_artist"])])
+        return md
+
+    def _view(self):
+        """Todas las propiedades (menos Position) tal como las vería un cliente MPRIS ahora mismo."""
+        with self.lock:
+            st = self.status
+            av = self._available()
+            speed = st.get("speed")
+            rate = float(speed) if isinstance(speed, (int, float)) and speed > 0 else 1.0
+            listener = bool(st.get("listener"))
+            vol = self.volume
+            if vol is None:
+                vol = 0.0
+            elif self.muted:
+                vol = 0.0
+            return {
+                "Identity": clean_text(st.get("app")) if av and st.get("app") else "Nexo",
+                "PlaybackStatus": self._state(),
+                "Rate": rate,
+                "MinimumRate": min(1.0, rate),
+                "MaximumRate": max(1.0, rate),
+                "Metadata": self._metadata(),
+                "Volume": float(vol),
+                "CanGoNext": av and bool(st.get("can_next")),
+                "CanGoPrevious": av and bool(st.get("can_prev")),
+                "CanPlay": av and bool(st.get("can_play")),
+                "CanPause": av and bool(st.get("can_pause")),
+                "CanSeek": av and bool(st.get("can_seek")),
+                "CanControl": av and listener,
+            }
+
+    def _position_us(self):
+        with self.lock:
+            st = self.status
+            if not self._available():
+                return 0
+            pos = float(st.get("position_ms") or 0)
+            if st.get("state") in ("playing", "buffering"):
+                speed = st.get("speed")
+                pos += (time.monotonic() - self.t_status) * 1000.0 * (float(speed) if isinstance(speed, (int, float)) and speed > 0 else 1.0)
+            dur = st.get("duration_ms")
+            if isinstance(dur, (int, float)) and dur > 0 and pos > dur:
+                pos = float(dur)
+            return int(max(0.0, pos) * 1000)
+
+    # ---- eventos de la app
+
+    def on_event(self, topic, data):
+        if topic == "media":
+            self.apply_media(data)
+        elif topic == "audio":
+            self.apply_audio(data)
+
+    def apply_media(self, data):
+        with self.lock:
+            had = self._available()
+            before_pos = self._position_us()
+            before_track = self._trackid() if had else None
+            before_state = self._state()
+            self.status = dict(data) if isinstance(data, dict) else {}
+            self.t_status = time.monotonic()
+            if self.status.get("listener") is False and not self._warned_listener:
+                self._warned_listener = True
+                log("Android no le ha dado a Nexo el «acceso a notificaciones»: sin él no se puede ver la música. "
+                    "En Android 13 o más, antes hay que pulsar «Permitir ajustes restringidos» en la info de la app.")
+            if self.status.get("listener"):
+                self._warned_listener = False
+            self._want_art()
+            after_pos = self._position_us()
+            seeked = (had and self._available() and before_track == self._trackid() and before_state == self._state()
+                      and abs(after_pos - before_pos) > 1500000)
+        self._flush_changes()
+        if seeked:
+            self._emit_seeked(after_pos)
+
+    def apply_audio(self, data):
+        if not isinstance(data, dict):
+            return
+        with self.lock:
+            v = data.get("volume")
+            self.volume = max(0.0, min(1.0, float(v) / 100.0)) if isinstance(v, (int, float)) else self.volume
+            self.muted = bool(data.get("muted"))
+        self._flush_changes()
+
+    def _flush_changes(self):
+        """Emite PropertiesChanged por lo que cambió desde la última vez."""
+        bus = self.bus
+        with self.lock:
+            cur = self._view()
+            last = self._last_view
+            self._last_view = cur
+            if bus is None or not self.owned:
+                return
+            ch_root = {"Identity": cur["Identity"]} if cur["Identity"] != last.get("Identity") else {}
+            ch_player = dict((k, v) for k, v in cur.items() if k != "Identity" and v != last.get(k))
+        if ch_root:
+            bus.properties_changed(MPRIS_PATH, MPRIS_ROOT, ch_root)
+        if ch_player:
+            bus.properties_changed(MPRIS_PATH, MPRIS_PLAYER, ch_player)
+
+    def _emit_seeked(self, pos_us):
+        """Seeked, sin repetirlo: el salto lo notan a la vez la respuesta a Seek y el evento que manda la app."""
+        now = time.monotonic()
+        with self.lock:
+            last = self._seeked
+            if last and now - last[0] < 1.5 and abs(pos_us - last[1]) < 1500000:
+                return
+            self._seeked = (now, pos_us)
+        bus = self.bus
+        if bus is not None and self.owned:
+            bus.emit(MPRIS_PATH, MPRIS_PLAYER, "Seeked", "x", (int(pos_us),))
+
+    # ---- carátula
+
+    def _want_art(self):
+        h = self.status.get("art_hash")
+        if not h or not self._available():
+            return
+        if self.art and self.art[0] == h and os.path.exists(self.art[1]):
+            return
+        if h in self._art_missing or self._art_fetching == h:
+            return
+        cached = self._art_path(h, None)
+        if cached:
+            self.art = (h, cached)
+            return
+        self._art_fetching = h
+        threading.Thread(target=self._fetch_art, args=(h,), name="caratula", daemon=True).start()
+
+    @staticmethod
+    def _art_base(h):
+        return os.path.join(cache_dir(), "art", hashlib.sha1(clean_text(h).encode("utf-8", "replace")).hexdigest()[:24])
+
+    def _art_path(self, h, ext):
+        base = self._art_base(h)
+        for e in ([ext] if ext else sorted(set(ART_EXT.values()))):
+            if os.path.exists(base + "." + e):
+                return base + "." + e
+        return None
+
+    def _fetch_art(self, h):
+        path = None
+        try:
+            d = self.bridge.call("media.art", timeout=8.0)
+            import base64
+            raw = base64.b64decode(d.get("data") or "", validate=False)
+            if not raw:
+                raise BridgeError("not_found", "sin carátula")
+            ext = ART_EXT.get(str(d.get("mime", "")).lower(), "jpg")
+            ensure_dir(os.path.join(cache_dir(), "art"))
+            path = self._art_base(h) + "." + ext
+            tmp = path + ".tmp%d" % os.getpid()
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+            self._prune_art()
+        except (BridgeError, OSError, ValueError) as e:
+            dbg("sin carátula para %s: %s" % (h, e))
+            path = None
+        with self.lock:
+            self._art_fetching = None
+            if path:
+                self.art = (h, path)
+            else:
+                self._art_missing.add(h)
+        self._flush_changes()
+
+    @staticmethod
+    def _prune_art(keep=30):
+        d = os.path.join(cache_dir(), "art")
+        try:
+            files = [os.path.join(d, f) for f in os.listdir(d)]
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for p in files[keep:]:
+                os.remove(p)
+        except OSError:
+            pass
+
+    # ---- métodos MPRIS
+
+    def _err(self, e):
+        if e.code == "needs_user_action":
+            return DBusError(ERR_FAILED, e.message or "Falta el acceso a notificaciones en Android")
+        if e.code == "timeout":
+            return DBusError(ERR_NOREPLY, e.message)
+        return DBusError(ERR_FAILED, e.message)
+
+    def _act(self, cmd, **params):
+        try:
+            r = self.bridge.call(cmd, **params)
+        except BridgeError as e:
+            raise self._err(e)
+        with self.lock:
+            if self._available():
+                here = self._position_us() // 1000
+                if isinstance(r.get("state"), str) and cmd not in ("media.next", "media.prev"):
+                    self.status["state"] = r["state"]
+                    self.status["position_ms"] = 0 if r["state"] == "stopped" else here
+                    self.t_status = time.monotonic()
+                if isinstance(r.get("position_ms"), int):
+                    self.status["position_ms"] = r["position_ms"]
+                    self.t_status = time.monotonic()
+        self._flush_changes()
+        return r
+
+    def _seek(self, offset_us):
+        r = self._act("media.seek", delta_ms=int(offset_us // 1000))
+        self._emit_seeked(self._position_us())
+        return r
+
+    def _set_position(self, track_id, pos_us):
+        with self.lock:
+            if not self._available() or track_id != self._trackid():
+                return
+        self._act("media.seek", position_ms=max(0, int(pos_us // 1000)))
+        self._emit_seeked(self._position_us())
+
+    def _open_uri(self, uri):
+        raise DBusError(ERR_UNSUPPORTED, "Nexo no puede abrir direcciones en el móvil")
+
+    def _set_volume(self, v):
+        try:
+            pct = int(round(max(0.0, min(1.0, float(v))) * 100))
+        except (TypeError, ValueError):
+            raise DBusError(ERR_ARGS, "Volume debe ser un número entre 0 y 1")
+        try:
+            d = self.bridge.call("audio.volume", percent=pct)
+        except BridgeError as e:
+            raise self._err(e)
+        self.apply_audio(d)
+
+    # ---- ciclo de vida
+
+    def attach(self, bus):
+        self.bus = bus
+        self.owned = False
+        bus.on_name_lost = self._name_lost
+
+    def _name_lost(self, name):
+        if name != MPRIS_NAME or not self.owned:
+            return  # si lo soltamos nosotros (_release), el bus también manda NameLost: eso no es que nos lo quiten
+        self.owned = False
+        if not self.force:
+            self.yielded = True
+        log("otro programa reclamó %s: cedo el nombre%s" % (MPRIS_NAME, "" if not self.force else " (y lo reclamo otra vez: NEXO_DBUS_FORCE=1)"))
+
+    def _acquire(self):
+        bus = self.bus
+        if bus is None or self.yielded:
+            return
+        try:
+            with self.lock:
+                self._last_view = self._view()
+            bus.export(MPRIS_PATH, self.root)
+            bus.export(MPRIS_PATH, self.player)
+            r = bus.request_name(MPRIS_NAME, allow_replacement=True, replace=self.force)
+        except DBusError as e:
+            log("no pude registrar %s: %s" % (MPRIS_NAME, e.message or e.name))
+            bus.unexport(MPRIS_PATH)
+            return
+        if r in (1, 4):
+            self.owned = True
+            log("reproductor MPRIS «%s» disponible" % MPRIS_NAME)
+        else:
+            bus.unexport(MPRIS_PATH)
+            self.yielded = not self.force
+            log("%s ya lo tiene otro programa: no lo toco (modo pasivo; NEXO_DBUS_FORCE=1 lo reclama)" % MPRIS_NAME)
+
+    def _release(self):
+        bus = self.bus
+        self.owned = False
+        if bus is None:
+            return
+        try:
+            bus.release_name(MPRIS_NAME)
+        except DBusError:
+            pass
+        bus.unexport(MPRIS_PATH)
+        log("no suena nada en Android: retiro %s" % MPRIS_NAME)
+
+    def tick(self):
+        """Se llama cada medio segundo: decide si el reproductor debe verse y corrige la posición."""
+        now = time.monotonic()
+        with self.lock:
+            bridge_ok = self.bridge.ready.is_set() or (now - self.bridge.last_ready) < self.grace_down
+            want = self.always or (self._available() and bridge_ok)
+            if want:
+                self.unwant_since = None
+            elif self.unwant_since is None:
+                self.unwant_since = now
+            drop = (not want) and self.unwant_since is not None and (now - self.unwant_since) >= self.grace
+            playing = self._state() == "Playing"
+        if want and not self.owned:
+            self._acquire()
+        elif drop and self.owned:
+            self._release()
+        if self.owned and playing and self.bridge.ready.is_set() and not self._resyncing and now - self.t_resync > 10.0:
+            self.t_resync = now
+            self._resyncing = True
+            threading.Thread(target=self._resync, name="resync", daemon=True).start()
+
+    def _resync(self):
+        try:
+            self.apply_media(self.bridge.call("media.status", timeout=6.0))
+        except BridgeError as e:
+            dbg("resincronización fallida: %s" % e.message)
+        finally:
+            self._resyncing = False
+
+    def detach(self):
+        if self.bus is not None and self.owned:
+            self._release()
+        self.bus = None
+
+    def stop(self):
+        pass
+
+    def describe(self):
+        """(estado, texto) para «nexo-dbus status» y «nexo doctor»."""
+        if self.bus is None:
+            return "nobus", "sin conexión al bus de sesión"
+        if self.owned:
+            return "active", "%s activo (suena algo en Android)" % MPRIS_NAME
+        if self.yielded:
+            return "passive", "%s lo tiene otro programa: no lo toco (NEXO_DBUS_FORCE=1 lo reclama)" % MPRIS_NAME
+        if not (self.bridge.ready.is_set() or (time.monotonic() - self.bridge.last_ready) < self.grace_down):
+            return "link", "esperando a la app Nexo (¿responde? mira: nexo doctor)"
+        return "idle", "esperando música: aparece cuando suena algo en Android (--always lo deja siempre)"
+
+
+# ----------------------------------------------------------------------------------------------------- servicios con nombre propio
+
+
+def norm_mode(value, default="auto"):
+    """auto | on | off a partir de lo que ponga el usuario (1/on/si → on; 0/off/no → off; vacío → auto)."""
+    v = (value or "").strip().lower()
+    if v in ("1", "on", "yes", "si", "sí", "true", "siempre"):
+        return "on"
+    if v in ("0", "off", "no", "false", "nunca"):
+        return "off"
+    return default
+
+
+class NameService(object):
+    """Base de los servicios que ocupan un nombre en un bus (BlueZ, NetworkManager, UDisks2).
+
+    Reglas (docs/INTEGRACION-ESCRITORIO.md):
+      · Si el nombre ya lo tiene un programa de verdad, no se toca (modo pasivo). NEXO_DBUS_FORCE=1 lo reclama.
+      · Si luego se lo reclaman a Nexo, cede y lo anota.
+      · Solo se ve mientras hay algo que servir: la app responde (o respondió hace poco) y el móvil tiene esa función.
+    Cada servicio tiene su propia conexión al bus: lo que le pase a uno no arrastra a los demás."""
+
+    NAME = ""        # el nombre de bus que ocupa
+    LABEL = ""       # cómo aparece en el registro
+    TOPICS = ()      # temas de la app que necesita
+    OM_PATH = "/"    # dónde va su ObjectManager
+    SYSTEMD_UNIT = ""   # p. ej. "bluetooth.service": si systemd lo gestiona en este equipo, no se ocupa el nombre
+
+    def __init__(self, bridge, mode="auto", force=False, grace_down=30.0):
+        self.bridge = bridge
+        self.mode = mode
+        self.force = force
+        self.grace_down = grace_down
+        self.lock = threading.RLock()
+        self.bus = None
+        self.owned = False
+        self.yielded = False
+        self.denied = False
+        self.denied_at = 0.0
+        self.denied_retry = max(1.0, env_float("NEXO_DBUS_DENIED_RETRY", 30.0))
+        self.why = ""                 # por qué está pasivo o sin permiso (lo cuenta «nexo-dbus status»)
+        self.tree = Tree(self.OM_PATH)
+        self._said = set()
+
+    # ---- para que los servicios lo sobrescriban
+
+    def _have_data(self):
+        return False
+
+    def _desired(self):
+        return collections.OrderedDict()
+
+    def _on_acquired(self):
+        pass
+
+    def _on_released(self):
+        pass
+
+    def _on_tick(self):
+        pass
+
+    def on_event(self, topic, data):
+        pass
+
+    def _passive_reason(self):
+        """Por qué no debería ocupar el nombre (o None). Los servicios añaden sus propias pistas."""
+        if self.force:
+            return None
+        try:
+            if self.bus.name_has_owner(self.NAME):
+                return "ya hay un %s de verdad en este bus" % self.LABEL
+        except DBusError as e:
+            dbg("%s: no pude preguntar por %s: %s" % (self.LABEL, self.NAME, e))
+        # En un equipo donde manda systemd y el programa de verdad está instalado, su servicio arranca por D-Bus cuando
+        # haga falta: ocupar el nombre antes lo dejaría sin poder arrancar. En un proot no hay systemd: ahí no se aplica.
+        if self.SYSTEMD_UNIT and self.mode != "on" and os.path.isdir(os.environ.get("NEXO_DBUS_SYSTEMD_DIR", "/run/systemd/system")):
+            try:
+                if self.NAME in self.bus.list_activatable():
+                    return "systemd gestiona %s en este equipo" % self.SYSTEMD_UNIT
+            except DBusError:
+                pass
+        return None
+
+    def describe(self):
+        """(estado, texto) para «nexo-dbus status» y «nexo doctor»."""
+        if self.mode == "off":
+            return "off", "apagado"
+        if self.bus is None:
+            return "nobus", "sin conexión al bus del sistema"
+        if self.owned:
+            return "active", "%s activo" % self.NAME
+        if self.denied:
+            return "denied", "el bus no deja a este usuario ocupar %s: instala la política con  nexo setup-dbus --system-policy" % self.NAME
+        if self.yielded:
+            return "passive", "pasivo: %s (NEXO_DBUS_FORCE=1 lo reclama)" % (self.why or "%s lo tiene otro programa" % self.NAME)
+        if not self.link_ok():
+            return "link", "esperando a la app Nexo (¿responde? mira: nexo doctor)"
+        if not self._have_data():
+            return "nodata", "el móvil no ofrece esta función, o la app aún no la ha contado"
+        return "wait", "a punto de registrarse"
+
+    # ---- utilidades
+
+    def say_once(self, key, msg):
+        if key not in self._said:
+            self._said.add(key)
+            log(msg)
+
+    def link_ok(self):
+        b = self.bridge
+        return b.ready.is_set() or (b.last_ready > 0 and (time.monotonic() - b.last_ready) < self.grace_down)
+
+    def publish(self):
+        """Pone al día los objetos exportados (y emite las señales) tras un cambio de estado."""
+        if not self.owned:
+            return
+        with self.lock:
+            self.tree.update(self._desired())
+
+    # ---- ciclo de vida
+
+    def attach(self, bus):
+        self.bus = bus
+        self.owned = False
+        self.denied = False
+        self.tree = Tree(self.OM_PATH)
+        self.tree.attach(bus)
+        bus.on_name_lost = self._name_lost
+
+    def detach(self):
+        if self.bus is not None and self.owned:
+            self._release("me desconecto del bus")
+        self.tree.detach()
+        self.bus = None
+
+    def tick(self):
+        """Cada medio segundo: ocupa el nombre cuando hay algo que servir y lo suelta cuando deja de haberlo."""
+        if self.bus is None or self.mode == "off":
+            return
+        want = self.link_ok() and self._have_data()
+        if self.denied and time.monotonic() - self.denied_at >= self.denied_retry:
+            self.denied = False      # por si mientras tanto se instaló la política (nexo setup-dbus --system-policy): se vuelve a probar
+        if want and not self.owned and not self.yielded and not self.denied:
+            self._acquire()
+        elif not want and self.owned:
+            self._release("la app Nexo no responde" if not self.link_ok() else "el móvil no tiene esta función")
+        if self.owned:
+            self._on_tick()
+
+    def _acquire(self):
+        bus = self.bus
+        why = self._passive_reason()
+        if why:
+            self.yielded = True
+            self.why = why
+            log("%s: %s: no toco %s (modo pasivo; NEXO_DBUS_FORCE=1 lo reclama)" % (self.LABEL, why, self.NAME))
+            return
+        try:
+            with self.lock:
+                self.tree.update(self._desired(), announce=False)
+            r = bus.request_name(self.NAME, allow_replacement=True, replace=self.force)
+        except DBusError as e:
+            with self.lock:
+                self.tree.update(collections.OrderedDict(), announce=False)
+            if e.name == ERR_ACCESS:
+                self.denied = True
+                self.denied_at = time.monotonic()
+                self.say_once("denied", "%s: el bus no deja a este usuario ocupar %s. Instala la política:  nexo setup-dbus --system-policy  "
+                              "(pide root; en un proot basta  nexo setup-dbus --own-bus)" % (self.LABEL, self.NAME))
+            else:
+                log("%s: no pude registrar %s: %s" % (self.LABEL, self.NAME, e.message or e.name))
+            return
+        if r in (1, 4):
+            self.owned = True
+            log("%s: %s disponible" % (self.LABEL, self.NAME))
+            self._on_acquired()
+        else:
+            with self.lock:
+                self.tree.update(collections.OrderedDict(), announce=False)
+            self.yielded = not self.force
+            self.why = "%s ya lo tiene otro programa" % self.NAME
+            log("%s: %s ya lo tiene otro programa: no lo toco (modo pasivo; NEXO_DBUS_FORCE=1 lo reclama)" % (self.LABEL, self.NAME))
+
+    def _release(self, why=""):
+        bus = self.bus
+        self.owned = False
+        with self.lock:
+            self.tree.update(collections.OrderedDict(), announce=True)
+        if bus is not None:
+            try:
+                bus.release_name(self.NAME)
+            except DBusError:
+                pass
+        self._on_released()
+        log("%s: retiro %s%s" % (self.LABEL, self.NAME, " (%s)" % why if why else ""))
+
+    def _name_lost(self, name):
+        if name != self.NAME or not self.owned:
+            return  # si lo soltamos nosotros (_release), el bus también manda NameLost: eso no es que nos lo quiten
+        self.owned = False
+        with self.lock:
+            self.tree.update(collections.OrderedDict(), announce=False)
+        if not self.force:
+            self.yielded = True
+            self.why = "otro programa reclamó %s" % self.NAME
+        log("%s: otro programa reclamó %s: cedo el nombre%s" % (self.LABEL, self.NAME,
+            "" if not self.force else " (y lo reclamo otra vez: NEXO_DBUS_FORCE=1)"))
+
+    def stop(self):
+        pass
+
+
+# ----------------------------------------------------------------------------------------------------- BlueZ
+
+BLUEZ_NAME = "org.bluez"
+BZ_ROOT = "/org/bluez"
+BZ_ADAPTER = "/org/bluez/hci0"
+IF_ADAPTER = "org.bluez.Adapter1"
+IF_DEVICE = "org.bluez.Device1"
+IF_BATTERY = "org.bluez.Battery1"
+IF_AGENTMGR = "org.bluez.AgentManager1"
+BZ_ERR = "org.bluez.Error."
+# clase principal del «Class of Device» de Bluetooth (bits 8-12) para cada categoría que da la app
+BT_MAJOR = {"computer": 0x0100, "phone": 0x0200, "networking": 0x0300, "audio": 0x0400, "peripheral": 0x0500,
+            "imaging": 0x0600, "wearable": 0x0700, "toy": 0x0800, "health": 0x0900}
+
+
+def norm_btaddr(a):
+    a = str(a or "").strip().upper().replace("-", ":")
+    return a if re.match(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", a) else None
+
+
+def bz_dev_path(addr):
+    return "%s/dev_%s" % (BZ_ADAPTER, addr.replace(":", "_"))
+
+
+def bz_error(e):
+    """Un BridgeError de la app → el error D-Bus que un cliente de BlueZ espera encontrar."""
+    c, msg = e.code, e.message or e.code
+    if c == "needs_user_action":
+        return DBusError(ERR_NEEDS_USER, msg)
+    if c in ("bluetooth_disabled", "no_connection"):
+        return DBusError(BZ_ERR + "NotReady", msg)
+    if c in ("not_paired", "not_found"):
+        return DBusError(BZ_ERR + "DoesNotExist", msg)
+    if c == "bad_request":
+        return DBusError(BZ_ERR + "InvalidArguments", msg)
+    if c == "unsupported":
+        return DBusError(BZ_ERR + "NotSupported", msg)
+    if c in ("permission_denied", "unauthorized"):
+        return DBusError(BZ_ERR + "NotAuthorized", msg)
+    if c == "timeout":
+        return DBusError(ERR_NOREPLY, msg)
+    return DBusError(BZ_ERR + "Failed", msg)
+
+
+class Bluez(NameService):
+    """org.bluez en el bus del SISTEMA: el Bluetooth de Android como un adaptador (hci0) con sus dispositivos emparejados.
+
+    · Adapter1 (Powered ↔ bt.enable/disable, Discovering) y Device1 (+ Battery1 si el dispositivo da su batería).
+    · Connect/Disconnect no se pueden hacer sin root en Android: la app deja una notificación que abre los ajustes
+      del móvil y el cliente D-Bus recibe org.nexo.Error.NeedsUserAction.
+    · Nexo no escanea: Android no deja a una app normal buscar dispositivos nuevos por aquí. StartDiscovery solo se
+      asegura de que el Bluetooth esté encendido (bt on); los dispositivos son los emparejados en Android."""
+
+    NAME = BLUEZ_NAME
+    LABEL = "BlueZ"
+    TOPICS = ("bt",)
+    OM_PATH = "/"
+    SYSTEMD_UNIT = "bluetooth.service"
+
+    def __init__(self, bridge, mode="auto", force=False, grace_down=30.0):
+        NameService.__init__(self, bridge, mode, force, grace_down)
+        self.status = None
+        self.devices = collections.OrderedDict()   # DIRECCIÓN → {name, connected, profiles, type, cls, alias, uuids, battery, info_t}
+        self.trusted = {}
+        self.discovering = False
+        self.discover_until = 0.0
+        self.we_enabled = False
+        self.restore = os.environ.get("NEXO_DBUS_DISCOVERY_RESTORE") == "1"
+        self.discover_secs = env_float("NEXO_DBUS_DISCOVERY_SECS", 120.0)
+        self.refresh_every = max(1.0, env_float("NEXO_DBUS_REFRESH", 60.0))
+        self._addr = None
+        self._kick = threading.Event()
+        self._halt = threading.Event()
+        self._dirty = True
+        self._was_ready = False
+        self._t_list = 0.0
+        threading.Thread(target=self._worker, name="bluez-refresco", daemon=True).start()
+
+    def stop(self):
+        self._halt.set()
+        self._kick.set()
+
+    # ---- estado → propiedades
+
+    def _st(self):
+        return self.status or {}
+
+    def _have_data(self):
+        return bool(self._st().get("available"))
+
+    def _enabled(self):
+        return bool(self._st().get("enabled"))
+
+    def _name(self):
+        return clean_text(self._st().get("name") or self.bridge.info.get("device") or "Nexo")
+
+    def _address(self):
+        """Android no da la dirección de su adaptador: se inventa una estable (con el bit de «administrada localmente»)."""
+        if self._addr is None:
+            seed = clean_text(self.bridge.info.get("device") or "nexo")
+            h = bytearray(hashlib.sha1(("nexo-bt:" + seed).encode("utf-8", "replace")).digest())
+            self._addr = "02:%02X:%02X:%02X:%02X:%02X" % tuple(h[:5])
+        return self._addr
+
+    def _power_state(self):
+        s = self._st().get("state")
+        return {"on": "on", "off": "off", "turning_on": "off-enabling", "turning_off": "on-disabling"}.get(
+            s, "on" if self._enabled() else "off")
+
+    @staticmethod
+    def _icon(d):
+        c = d.get("cls")
+        if c == "audio":
+            return "audio-headset" if "headset" in (d.get("profiles") or []) else "audio-card"
+        return {"phone": "phone", "computer": "computer", "networking": "network-wireless"}.get(c)
+
+    # ---- los objetos
+
+    def _adapter(self):
+        it = Interface(IF_ADAPTER)
+        it.method("StartDiscovery", fn=self._start_discovery, slow=True)
+        it.method("StopDiscovery", fn=self._stop_discovery, slow=True)
+        it.method("SetDiscoveryFilter", "a{sv}", fn=lambda f: None, args=("properties",))
+        it.method("GetDiscoveryFilters", "", "as", fn=lambda: [], outs=("filters",))
+        it.method("RemoveDevice", "o", fn=self._remove_device, slow=True, args=("device",))
+        name, addr, powered = self._name(), self._address(), self._enabled()
+        pstate, disc = self._power_state(), bool(self.discovering and powered)
+        it.prop("Address", "s", lambda: addr, emits="const")
+        it.prop("AddressType", "s", lambda: "public", emits="const")
+        it.prop("Name", "s", lambda: name)
+        it.prop("Alias", "s", lambda: name, self._set_adapter_alias)
+        it.prop("Class", "u", lambda: 0x5a020c, emits="const")     # «teléfono inteligente»
+        it.prop("Powered", "b", lambda: powered, self._set_powered)
+        it.prop("PowerState", "s", lambda: pstate)
+        it.prop("Discoverable", "b", lambda: False, self._set_discoverable)
+        it.prop("DiscoverableTimeout", "u", lambda: 180)
+        it.prop("Pairable", "b", lambda: True, self._set_pairable)
+        it.prop("PairableTimeout", "u", lambda: 0)
+        it.prop("Discovering", "b", lambda: disc)
+        it.prop("UUIDs", "as", lambda: [])
+        return it
+
+    def _device(self, addr, d):
+        it = Interface(IF_DEVICE)
+        it.method("Connect", fn=lambda: self._dev_cmd("bt.connect", addr), slow=True)
+        it.method("Disconnect", fn=lambda: self._dev_cmd("bt.disconnect", addr), slow=True)
+        it.method("ConnectProfile", "s", fn=lambda uuid: self._dev_cmd("bt.connect", addr), slow=True, args=("UUID",))
+        it.method("DisconnectProfile", "s", fn=lambda uuid: self._dev_cmd("bt.disconnect", addr), slow=True, args=("UUID",))
+        it.method("Pair", fn=self._pair)
+        it.method("CancelPairing", fn=self._cancel_pairing)
+        name = d.get("name")
+        alias = clean_text(d.get("alias") or name or addr.replace(":", "-"))
+        cls = BT_MAJOR.get(d.get("cls"))
+        icon = self._icon(d)
+        uuids = [clean_text(u).lower() for u in (d.get("uuids") or [])]
+        conn = bool(d.get("connected"))
+        trusted = self.trusted.get(addr, True)
+        it.prop("Address", "s", lambda: addr, emits="const")
+        it.prop("AddressType", "s", lambda: "public", emits="const")
+        it.prop("Name", "s", lambda: clean_text(name), present=lambda: bool(name))
+        it.prop("Alias", "s", lambda: alias, lambda v: self._set_alias(addr, v))
+        it.prop("Class", "u", lambda: cls, present=lambda: cls is not None)
+        it.prop("Icon", "s", lambda: icon, present=lambda: bool(icon))
+        it.prop("UUIDs", "as", lambda: uuids)
+        it.prop("Paired", "b", lambda: True)
+        it.prop("Bonded", "b", lambda: True)
+        it.prop("Connected", "b", lambda: conn)
+        it.prop("Trusted", "b", lambda: trusted, lambda v: self._set_trusted(addr, v))
+        it.prop("Blocked", "b", lambda: False, lambda v: self._set_blocked(addr, v))
+        it.prop("Adapter", "o", lambda: BZ_ADAPTER)
+        it.prop("LegacyPairing", "b", lambda: False)
+        it.prop("ServicesResolved", "b", lambda: conn)
+        return it
+
+    @staticmethod
+    def _battery(d):
+        pct = d.get("battery")
+        if isinstance(pct, bool) or not isinstance(pct, int) or not 0 <= pct <= 100:
+            return None
+        it = Interface(IF_BATTERY)
+        it.prop("Percentage", "y", lambda: pct)
+        return it
+
+    def _desired(self):
+        out = collections.OrderedDict()
+        if not self._have_data():
+            return out
+        mgr = Interface(IF_AGENTMGR)     # los applets registran un agente de emparejamiento: aquí no se usa (se empareja en Android)
+        mgr.method("RegisterAgent", "os", fn=lambda p, c: None, args=("agent", "capability"))
+        mgr.method("UnregisterAgent", "o", fn=lambda p: None, args=("agent",))
+        mgr.method("RequestDefaultAgent", "o", fn=lambda p: None, args=("agent",))
+        out[BZ_ROOT] = [mgr]
+        out[BZ_ADAPTER] = [self._adapter()]
+        for addr, d in self.devices.items():
+            ifs = [self._device(addr, d)]
+            b = self._battery(d)
+            if b is not None:
+                ifs.append(b)
+            out[bz_dev_path(addr)] = ifs
+        return out
+
+    # ---- eventos y refresco
+
+    def on_event(self, topic, data):
+        if topic == "bt":
+            self.apply_status(data)
+            self._dirty = True
+            self._kick.set()
+
+    def apply_status(self, data):
+        if not isinstance(data, dict):
+            return
+        with self.lock:
+            self.status = dict(data)
+            if not self._enabled():
+                self.discovering = False
+                for d in self.devices.values():
+                    d["connected"] = False
+        self.publish()
+
+    def _on_tick(self):
+        with self.lock:
+            expired = self.discovering and time.monotonic() >= self.discover_until
+            if expired:
+                self.discovering = False
+                self.we_enabled = False
+        if expired:
+            self.publish()
+
+    def _worker(self):
+        while not self._halt.is_set():
+            kicked = self._kick.wait(1.0)
+            if self._halt.is_set():
+                return
+            if kicked:
+                self._halt.wait(0.3)       # junta una ráfaga de eventos en una sola consulta
+                self._kick.clear()
+            try:
+                self._maybe_refresh()
+            except Exception as e:
+                log("BlueZ: fallo al actualizar los dispositivos: %r" % (e,))
+                dbg(traceback.format_exc())
+
+    def _maybe_refresh(self):
+        ready = self.bridge.ready.is_set()
+        if ready and not self._was_ready:
+            self._dirty = True
+        self._was_ready = ready
+        if not ready or self.bus is None or self.mode == "off" or self.yielded or self.denied or not self._have_data():
+            return
+        now = time.monotonic()
+        if self._dirty or now - self._t_list > self.refresh_every:
+            self._dirty = False
+            self._t_list = now
+            self._refresh()
+
+    def _has_info(self):
+        info = self.bridge.info
+        cmds = info.get("commands")
+        return ("bt.info" in cmds) if isinstance(cmds, list) else info.get("minor", 1) >= 2
+
+    def _refresh(self):
+        if not self._enabled():
+            with self.lock:
+                for d in self.devices.values():
+                    d["connected"] = False
+            self.publish()
+            return
+        try:
+            data = self.bridge.call("bt.paired", timeout=10.0)
+        except BridgeError as e:
+            if e.code == "permission_denied":
+                self.say_once("perm", "BlueZ: Android no le dio a Nexo el permiso «Dispositivos cercanos» (BLUETOOTH_CONNECT): "
+                                      "no puedo ver los dispositivos emparejados")
+            elif e.code != "bluetooth_disabled":
+                dbg("BlueZ: bt.paired falló: %s" % e.message)
+                self._dirty = True
+            return
+        now = time.monotonic()
+        with self.lock:
+            old = self.devices
+            new = collections.OrderedDict()
+            need = []
+            for d in data.get("devices") or []:
+                addr = norm_btaddr(d.get("address"))
+                if not addr:
+                    continue
+                e = dict(old.get(addr) or {})
+                e.update(name=d.get("name") or None, connected=bool(d.get("connected")),
+                         profiles=list(d.get("profiles") or []), type=d.get("type"), cls=d.get("class"))
+                prev = old.get(addr)
+                if self._has_info() and (prev is None or "info_t" not in prev or prev.get("connected") != e["connected"]
+                                         or (e["connected"] and now - prev["info_t"] > self.refresh_every)):
+                    need.append(addr)
+                new[addr] = e
+            self.devices = new
+        self.publish()
+        changed = False
+        for addr in need:
+            try:
+                inf = self.bridge.call("bt.info", address=addr, timeout=8.0)
+            except BridgeError as e:
+                dbg("BlueZ: bt.info %s falló: %s" % (addr, e.message))
+                continue
+            with self.lock:
+                d = self.devices.get(addr)
+                if d is None:
+                    continue
+                alias = clean_text(inf.get("alias")) if inf.get("alias") else None
+                d["alias"] = alias if alias and alias != d.get("name") else None
+                d["uuids"] = [u for u in (inf.get("uuids") or []) if isinstance(u, str)]
+                d["battery"] = inf.get("battery")
+                d["info_t"] = time.monotonic()
+                changed = True
+        if changed:
+            self.publish()
+
+    # ---- métodos y propiedades que escriben
+
+    def _dev_cmd(self, cmd, addr):
+        try:
+            self.bridge.call(cmd, address=addr)
+        except BridgeError as e:
+            raise bz_error(e)
+
+    @staticmethod
+    def _pair():
+        raise DBusError(BZ_ERR + "AlreadyExists", "Already Exists (Nexo solo muestra dispositivos ya emparejados en Android)")
+
+    @staticmethod
+    def _cancel_pairing():
+        raise DBusError(BZ_ERR + "DoesNotExist", "Does Not Exist")
+
+    def _set_powered(self, v):
+        try:
+            d = self.bridge.call("bt.enable" if v else "bt.disable", timeout=15.0)
+        except BridgeError as e:
+            raise bz_error(e)
+        self.apply_status(d)
+        self._dirty = True
+        self._kick.set()
+
+    def _start_discovery(self):
+        with self.lock:
+            first = not self.discovering
+        if not self._enabled():
+            try:
+                d = self.bridge.call("bt.enable", timeout=15.0)
+            except BridgeError as e:
+                raise bz_error(e)
+            self.we_enabled = True
+            self.apply_status(d)
+        elif first:
+            self.we_enabled = False     # ya estaba encendido: StopDiscovery no tiene nada que devolver a su sitio
+        with self.lock:
+            self.discovering = True
+            self.discover_until = time.monotonic() + self.discover_secs
+        self.say_once("scan", "BlueZ: StartDiscovery solo enciende el Bluetooth del móvil: Nexo no busca dispositivos nuevos "
+                              "(se emparejan en los ajustes de Android; aquí salen los ya emparejados)")
+        self.publish()
+
+    def _stop_discovery(self):
+        with self.lock:
+            if not self.discovering:
+                raise DBusError(BZ_ERR + "Failed", "No discovery started")
+            self.discovering = False
+        restore, self.we_enabled = self.restore and self.we_enabled, False
+        if restore:     # NEXO_DBUS_DISCOVERY_RESTORE=1: lo vuelve a apagar si fue StartDiscovery quien lo encendió
+            try:
+                self.apply_status(self.bridge.call("bt.disable", timeout=15.0))
+            except BridgeError as e:
+                log("BlueZ: no pude volver a apagar el Bluetooth: %s" % e.message)
+        self.publish()
+
+    def _remove_device(self, path):
+        addr = next((a for a in self.devices if bz_dev_path(a) == path), None)
+        if addr is None:
+            raise DBusError(BZ_ERR + "DoesNotExist", "Does Not Exist")
+        try:
+            self.bridge.call("bt.forget", address=addr, timeout=10.0)
+        except BridgeError as e:
+            raise bz_error(e)
+        with self.lock:
+            self.devices.pop(addr, None)
+        self._dirty = True
+        self._kick.set()
+        self.publish()
+
+    def _set_alias(self, addr, v):
+        try:
+            d = self.bridge.call("bt.rename", address=addr, name=clean_text(v))
+        except BridgeError as e:
+            raise bz_error(e)
+        with self.lock:
+            dev = self.devices.get(addr)
+            if dev is not None:
+                al = clean_text(d.get("alias")) if d.get("alias") else None
+                dev["alias"] = al if al and al != dev.get("name") else None
+        self.publish()
+
+    def _set_trusted(self, addr, v):
+        with self.lock:      # Android no tiene «dispositivo de confianza»: solo se recuerda aquí, para los applets
+            self.trusted[addr] = bool(v)
+        self.publish()
+
+    @staticmethod
+    def _set_blocked(addr, v):
+        if v:
+            raise DBusError(BZ_ERR + "NotSupported", "Nexo no puede bloquear dispositivos Bluetooth en Android")
+
+    @staticmethod
+    def _set_adapter_alias(v):
+        raise DBusError(BZ_ERR + "NotSupported", "Nexo no puede cambiar el nombre Bluetooth del móvil: se hace en los ajustes de Android")
+
+    @staticmethod
+    def _set_discoverable(v):
+        if v:
+            raise DBusError(BZ_ERR + "NotSupported", "Android no deja que una app normal haga visible el Bluetooth del móvil")
+
+    @staticmethod
+    def _set_pairable(v):
+        if not v:
+            raise DBusError(BZ_ERR + "NotSupported", "Nexo no puede impedir los emparejamientos de Android")
+
+
+# ----------------------------------------------------------------------------------------------------- NetworkManager
+
+NM_NAME = "org.freedesktop.NetworkManager"
+NM_ROOT = "/org/freedesktop/NetworkManager"
+NM_NONE = "/"
+NM_WIFI = NM_ROOT + "/Devices/1"
+NM_IFACE = "wlan0"
+IF_NM = "org.freedesktop.NetworkManager"
+IF_NM_DEVICE = IF_NM + ".Device"
+IF_NM_WIRELESS = IF_NM + ".Device.Wireless"
+IF_NM_AP = IF_NM + ".AccessPoint"
+IF_NM_ACTIVE = IF_NM + ".Connection.Active"
+IF_NM_IP4 = IF_NM + ".IP4Config"
+IF_NM_SETTINGS = IF_NM + ".Settings"
+IF_NM_CONN = IF_NM + ".Settings.Connection"
+IF_NM_AGENT = IF_NM + ".AgentManager"
+NM_ERR = IF_NM + ".Error."
+NMS_ERR = IF_NM + ".Settings.Error."
+NM_BAND_RATE = {"2.4GHz": 144000, "5GHz": 433000, "6GHz": 1201000}     # kbit/s orientativos: Android no da la tasa máxima de las redes que no son la actual
+NM_PERMISSIONS = {"enable-disable-network": "yes", "enable-disable-wifi": "yes", "enable-disable-wwan": "no",
+                  "enable-disable-wimax": "no", "sleep-wake": "no", "network-control": "yes", "wifi.share.protected": "no",
+                  "wifi.share.open": "no", "settings.modify.system": "yes", "settings.modify.own": "yes",
+                  "settings.modify.hostname": "no", "settings.modify.global-dns": "no", "reload": "no",
+                  "checkpoint-rollback": "no", "enable-disable-statistics": "no", "enable-disable-connectivity-check": "no",
+                  "wifi.scan": "yes"}
+
+
+def nm_mac(seed):
+    """Android no da la MAC del WiFi (devuelve siempre 02:00:00:00:00:00): se inventa una estable, «administrada localmente»."""
+    h = bytearray(hashlib.sha1(("nexo-wifi:" + seed).encode("utf-8", "replace")).digest())
+    return "02:%02X:%02X:%02X:%02X:%02X" % tuple(h[:5])
+
+
+def nm_uuid(ssid):
+    """El UUID de la conexión guardada de una red: sale del nombre, así es el mismo siempre."""
+    h = bytearray(hashlib.sha1(("nexo-conn:" + ssid).encode("utf-8", "replace")).digest()[:16])
+    h[6] = (h[6] & 0x0F) | 0x50
+    h[8] = (h[8] & 0x3F) | 0x80
+    x = binascii.hexlify(bytes(h)).decode("ascii")
+    return "%s-%s-%s-%s-%s" % (x[:8], x[8:12], x[12:16], x[16:20], x[20:])
+
+
+def nm_strength(rssi, level=None):
+    """dBm → «Strength» (0-100) como lo calcula NetworkManager: de -100 dBm (0) a -50 dBm (100)."""
+    if isinstance(rssi, (int, float)) and not isinstance(rssi, bool):
+        return max(0, min(100, int(2 * (rssi + 100))))
+    if isinstance(level, int) and not isinstance(level, bool):
+        return (0, 25, 50, 75, 100)[max(0, min(4, level))]
+    return 0
+
+
+def nm_freq(n):
+    f = n.get("frequency")
+    if isinstance(f, int) and not isinstance(f, bool) and f > 0:
+        return f
+    return {"2.4GHz": 2437, "5GHz": 5180, "6GHz": 5955}.get(n.get("band"), 2437)
+
+
+def nm_ap_flags(sec):
+    """security de la app → (Flags, WpaFlags, RsnFlags) de NetworkManager."""
+    return {"OPEN": (0, 0, 0), "WEP": (1, 0, 0), "WPA": (1, 0x1CC, 0), "WPA2": (1, 0, 0x188), "WPA3": (1, 0, 0x488),
+            "OWE": (1, 0, 0x888)}.get(str(sec or "OPEN").upper(), (1, 0, 0x188))
+
+
+def nm_key_mgmt(sec):
+    return {"OPEN": None, "WEP": "none", "WPA": "wpa-psk", "WPA2": "wpa-psk", "WPA3": "sae",
+            "OWE": "owe"}.get(str(sec or "OPEN").upper(), "wpa-psk")
+
+
+def ip_u32(a):
+    """Una IPv4 como la quiere NetworkManager: un entero con los bytes en el orden de la red."""
+    try:
+        return struct.unpack("<I", socket.inet_aton(str(a)))[0]
+    except (OSError, struct.error, ValueError):
+        return 0
+
+
+def nm_error(e):
+    """Un BridgeError de la app → el error D-Bus que un cliente de NetworkManager espera encontrar."""
+    c, msg = e.code, e.message or e.code
+    if c == "needs_user_action":
+        return DBusError(ERR_NEEDS_USER, msg)
+    if c in ("permission_denied", "unauthorized"):
+        return DBusError(NM_ERR + "PermissionDenied", msg)
+    if c == "not_found":
+        return DBusError(NM_ERR + "UnknownConnection", msg)
+    if c == "bad_request":
+        return DBusError(NM_ERR + "InvalidArguments", msg)
+    if c == "timeout":
+        return DBusError(ERR_NOREPLY, msg)
+    return DBusError(NM_ERR + "Failed", msg)
+
+
+def nm_unsupported(msg):
+    raise DBusError(ERR_UNSUPPORTED, msg)
+
+
+def nm_variant_text(settings, section, key):
+    v = (settings.get(section) or {}).get(key)
+    if isinstance(v, Variant):
+        v = v.value
+    if isinstance(v, (list, tuple, bytearray)):
+        try:
+            v = bytes(bytearray(v)).decode("utf-8", "replace")
+        except (TypeError, ValueError):
+            return None
+    elif isinstance(v, bytes):
+        v = v.decode("utf-8", "replace")
+    return clean_text(v) if isinstance(v, str) and v else None
+
+
+class NetworkManager(NameService):
+    """org.freedesktop.NetworkManager en el bus del SISTEMA: el WiFi de Android como un dispositivo wlan0.
+
+    · Las redes que se ven salen de wifi.scan (Ssid, BSSID, Strength = dBm → 0-100, Frequency, seguridad), la red actual y su
+      IP/puerta de enlace/DNS salen de wifi.status, y las conexiones guardadas de wifi.saved.
+    · ActivateConnection / AddAndActivateConnection → wifi.connect, Disconnect → wifi.disconnect, RequestScan → wifi.scan,
+      WirelessEnabled ↔ wifi.enable/disable, Settings.Connection.Delete → wifi.forget.
+    · Android limita lo que puede hacer una app: encender o apagar el WiFi y algunas conexiones piden un toque del
+      usuario (org.nexo.Error.NeedsUserAction, con el aviso de la app) y las claves guardadas no se pueden leer."""
+
+    NAME = NM_NAME
+    LABEL = "NetworkManager"
+    TOPICS = ("wifi", "net")
+    OM_PATH = "/org/freedesktop"
+    SYSTEMD_UNIT = "NetworkManager.service"
+
+    def __init__(self, bridge, mode="auto", force=False, grace_down=30.0):
+        NameService.__init__(self, bridge, mode, force, grace_down)
+        self.status = None            # wifi.status
+        self.net = None               # net.status (apps con el protocolo 1.3)
+        self.scan = []                # wifi.scan: una red por nombre
+        self.scan_mono = 0.0
+        self.last_scan_ms = 0
+        self.saved = []               # wifi.saved
+        self.ap_ids = {}              # nombre de red → número (la ruta de su punto de acceso no cambia entre escaneos)
+        self.conn_ids = {}            # nombre de red → número de su conexión guardada
+        self.uuids = {}               # nombre de red → UUID que pidió un cliente (si no, sale del nombre)
+        self.active_n = 0
+        self.active_key = None
+        self.connecting = None        # {"ssid": …} mientras wifi.connect trabaja
+        self.reason = 0
+        self.hostname = socket.gethostname() or "nexo"
+        self.scan_every = max(10.0, env_float("NEXO_DBUS_NM_SCAN", 120.0))
+        self.status_every = max(2.0, env_float("NEXO_DBUS_NM_REFRESH", 20.0))
+        self.assume_online = os.environ.get("NEXO_DBUS_NM_ASSUME_ONLINE", "") == "1"
+        self._mac = None
+        self._sig = None
+        self._pending_sig = None
+        self._kick = threading.Event()
+        self._halt = threading.Event()
+        self._want_status = self._want_scan = self._want_saved = True
+        self._t_status = self._t_scan = self._t_saved = 0.0
+        self._was_ready = False
+        threading.Thread(target=self._worker, name="nm-refresco", daemon=True).start()
+
+    def stop(self):
+        self._halt.set()
+        self._kick.set()
+
+    # ---- estado → propiedades
+
+    def _st(self):
+        return self.status or {}
+
+    def _have_data(self):
+        return bool(self._st().get("available"))
+
+    def _enabled(self):
+        return bool(self._st().get("enabled"))
+
+    def _connected(self):
+        return self._enabled() and bool(self._st().get("connected"))
+
+    def _ssid(self):
+        s = self._st().get("ssid")
+        return clean_text(s) if s else None
+
+    def _hw(self):
+        if self._mac is None:
+            self._mac = nm_mac(clean_text(self.bridge.info.get("device") or "nexo"))
+        return self._mac
+
+    def _ap_path(self, ssid):
+        n = self.ap_ids.get(ssid)
+        if n is None:
+            n = self.ap_ids[ssid] = len(self.ap_ids) + 1
+        return "%s/AccessPoint/%d" % (NM_ROOT, n)
+
+    def _conn_path(self, ssid):
+        n = self.conn_ids.get(ssid)
+        if n is None:
+            n = self.conn_ids[ssid] = len(self.conn_ids) + 1
+        return "%s/Settings/%d" % (NM_ROOT, n)
+
+    def _active_path(self):
+        return "%s/ActiveConnection/%d" % (NM_ROOT, max(self.active_n, 1))
+
+    def _ip4_path(self):
+        return "%s/IP4Config/%d" % (NM_ROOT, max(self.active_n, 1))
+
+    def _aps(self):
+        """Los puntos de acceso que se ven: wifi.scan da uno por nombre de red; el de la red actual toma los datos de wifi.status."""
+        if not self._enabled():
+            return []
+        st = self._st()
+        cur = self._ssid() if self._connected() else None
+        out, seen = [], False
+        for n in self.scan:
+            ssid = clean_text(n.get("ssid") or "")
+            if not ssid:
+                continue
+            ap = {"ssid": ssid, "bssid": norm_btaddr(n.get("bssid")), "freq": nm_freq(n), "band": n.get("band"),
+                  "strength": nm_strength(n.get("rssi"), n.get("level")), "rate": NM_BAND_RATE.get(n.get("band"), 54000),
+                  "security": n.get("security") or ("WPA2" if n.get("secured") else "OPEN"), "active": False}
+            if cur is not None and ssid == cur and not seen:
+                seen = True
+                self._as_active(ap, st)
+            out.append(ap)
+        if cur is not None and not seen:
+            sec = next((s.get("security") for s in self.saved if s.get("ssid") == cur), None) or "WPA2"
+            ap = {"ssid": cur, "bssid": None, "freq": 2437, "band": None, "strength": 0, "rate": 54000, "security": sec, "active": False}
+            self._as_active(ap, st)
+            out.append(ap)
+        return out
+
+    @staticmethod
+    def _as_active(ap, st):
+        ap["active"] = True
+        ap["strength"] = nm_strength(st.get("rssi"), st.get("level"))
+        if st.get("frequency"):
+            ap["freq"] = nm_freq(st)
+        if norm_btaddr(st.get("bssid")):
+            ap["bssid"] = norm_btaddr(st.get("bssid"))
+        if isinstance(st.get("link_speed"), int) and st["link_speed"] > 0:
+            ap["rate"] = st["link_speed"] * 1000
+
+    def _conns(self):
+        """Las conexiones guardadas ([{ssid, security, hidden, uuid}]); si Android no deja leerlas, al menos las que se usan ahora."""
+        out, seen = [], set()
+        for s in self.saved:
+            ssid = clean_text(s.get("ssid") or "")
+            if ssid and ssid not in seen:
+                seen.add(ssid)
+                out.append({"ssid": ssid, "security": s.get("security"), "hidden": bool(s.get("hidden"))})
+        for ssid in ((self._ssid() if self._connected() else None), self.connecting.get("ssid") if self.connecting else None):
+            if ssid and ssid not in seen:
+                seen.add(ssid)
+                sec = next((n.get("security") for n in self.scan if n.get("ssid") == ssid), None)
+                out.append({"ssid": ssid, "security": sec, "hidden": False})
+        for c in out:
+            c["uuid"] = self.uuids.get(c["ssid"]) or nm_uuid(c["ssid"])
+        return out
+
+    def _global(self):
+        """(State, Connectivity, Metered) del equipo según el móvil."""
+        if self.connecting:
+            return 40, 1, 0
+        net = self.net if isinstance(self.net, dict) and self.net.get("type") else None
+        if net is None:
+            # la app no cuenta qué red usa el móvil (protocolo < 1.3): solo se sabe si el WiFi está conectado, salvo que se
+            # pida dar siempre por bueno el internet (NEXO_DBUS_NM_ASSUME_ONLINE=1: sales por datos móviles, por ejemplo)
+            return (70, 4, 0) if self._connected() or self.assume_online else (20, 1, 0)
+        if net.get("type") == "none":
+            return 20, 1, 2
+        metered = 1 if net.get("metered") else 2
+        if net.get("validated"):
+            return 70, 4, metered
+        return (60, 3, metered) if net.get("internet", True) else (50, 1, metered)
+
+    # ---- los objetos
+
+    def _root(self, aps_active, global_state):
+        state, conn, metered = global_state
+        enabled = self._enabled()
+        active = [self._active_path()] if aps_active else []
+        primary = self._active_path() if (aps_active and self._connected()) else NM_NONE
+        it = Interface(IF_NM)
+        it.method("Reload", "u", fn=lambda flags: None, args=("flags",))
+        it.method("GetDevices", "", "ao", fn=lambda: [NM_WIFI], outs=("devices",))
+        it.method("GetAllDevices", "", "ao", fn=lambda: [NM_WIFI], outs=("devices",))
+        it.method("GetDeviceByIpIface", "s", "o", fn=self._device_by_iface, args=("iface",), outs=("device",))
+        it.method("ActivateConnection", "ooo", "o", fn=self._activate, slow=True,
+                  args=("connection", "device", "specific_object"), outs=("active_connection",))
+        it.method("AddAndActivateConnection", "a{sa{sv}}oo", "oo", fn=self._add_and_activate, slow=True,
+                  args=("connection", "device", "specific_object"), outs=("path", "active_connection"))
+        it.method("AddAndActivateConnection2", "a{sa{sv}}ooa{sv}", "ooa{sv}",
+                  fn=lambda c, d, s, o: tuple(self._add_and_activate(c, d, s)) + ({},), slow=True,
+                  args=("connection", "device", "specific_object", "options"), outs=("path", "active_connection", "result"))
+        it.method("DeactivateConnection", "o", fn=self._deactivate, slow=True, args=("active_connection",))
+        it.method("Sleep", "b", fn=lambda sleep: nm_unsupported("Nexo no duerme la red del móvil"), args=("sleep",))
+        it.method("Enable", "b", fn=lambda enable: None if enable else nm_unsupported("Nexo no apaga toda la red del móvil: apaga el WiFi con «nmcli radio wifi off»"),
+                  args=("enable",))
+        it.method("GetPermissions", "", "a{ss}", fn=lambda: dict((IF_NM + "." + k, v) for k, v in NM_PERMISSIONS.items()), outs=("permissions",))
+        it.method("SetLogging", "ss", fn=lambda level, domains: None, args=("level", "domains"))
+        it.method("GetLogging", "", "ss", fn=lambda: ("INFO", "PLATFORM,RFKILL,WIFI"), outs=("level", "domains"))
+        it.method("CheckConnectivity", "", "u", fn=lambda: conn, outs=("connectivity",))
+        it.method("state", "", "u", fn=lambda: state, outs=("state",))
+        it.signal("StateChanged", "u", ("state",))
+        it.signal("DeviceAdded", "o", ("device_path",))
+        it.signal("DeviceRemoved", "o", ("device_path",))
+        it.signal("CheckPermissions")
+        it.prop("Devices", "ao", lambda: [NM_WIFI])
+        it.prop("AllDevices", "ao", lambda: [NM_WIFI])
+        it.prop("Checkpoints", "ao", lambda: [])
+        it.prop("NetworkingEnabled", "b", lambda: True)
+        it.prop("WirelessEnabled", "b", lambda: enabled, self._set_wireless)
+        it.prop("WirelessHardwareEnabled", "b", lambda: True)
+        it.prop("WwanEnabled", "b", lambda: False, lambda v: nm_unsupported("Nexo no maneja los datos móviles") if v else None)
+        it.prop("WwanHardwareEnabled", "b", lambda: False)
+        it.prop("ActiveConnections", "ao", lambda: active)
+        it.prop("PrimaryConnection", "o", lambda: primary)
+        it.prop("PrimaryConnectionType", "s", lambda: "802-11-wireless" if primary != NM_NONE else "")
+        it.prop("Metered", "u", lambda: metered)
+        it.prop("ActivatingConnection", "o", lambda: self._active_path() if self.connecting else NM_NONE)
+        it.prop("Startup", "b", lambda: False)
+        it.prop("Version", "s", lambda: "1.42.0", emits="const")
+        it.prop("Capabilities", "au", lambda: [], emits="const")
+        it.prop("State", "u", lambda: state)
+        it.prop("Connectivity", "u", lambda: conn)
+        it.prop("ConnectivityCheckAvailable", "b", lambda: False)
+        it.prop("ConnectivityCheckEnabled", "b", lambda: False, lambda v: None)
+        it.prop("ConnectivityCheckUri", "s", lambda: "")
+        it.prop("GlobalDnsConfiguration", "a{sv}", lambda: {}, lambda v: nm_unsupported("Nexo no cambia el DNS global"))
+        return it
+
+    def _device(self, dstate, active, ip4, conns):
+        st = self._st()
+        ip = ip_u32(st.get("ip")) if self._connected() else 0
+        reason = self.reason
+        it = Interface(IF_NM_DEVICE)
+        it.method("Reapply", "a{sa{sv}}tu", fn=lambda c, v, f: None, args=("connection", "version_id", "flags"))
+        it.method("GetAppliedConnection", "u", "a{sa{sv}}t", fn=self._applied, args=("flags",), outs=("connection", "version_id"))
+        it.method("Disconnect", fn=self._disconnect, slow=True)
+        it.method("Delete", fn=lambda: nm_unsupported("El WiFi del móvil no se puede borrar"))
+        it.signal("StateChanged", "uuu", ("new_state", "old_state", "reason"))
+        it.prop("Udi", "s", lambda: "/sys/devices/nexo/net/" + NM_IFACE, emits="const")
+        it.prop("Interface", "s", lambda: NM_IFACE, emits="const")
+        it.prop("IpInterface", "s", lambda: NM_IFACE if dstate >= 70 else "")
+        it.prop("Driver", "s", lambda: "nexo", emits="const")
+        it.prop("DriverVersion", "s", lambda: VERSION, emits="const")
+        it.prop("FirmwareVersion", "s", lambda: "", emits="const")
+        it.prop("Capabilities", "u", lambda: 3, emits="const")
+        it.prop("Ip4Address", "u", lambda: ip)
+        it.prop("State", "u", lambda: dstate)
+        it.prop("StateReason", "(uu)", lambda: (dstate, reason))
+        it.prop("ActiveConnection", "o", lambda: active or NM_NONE)
+        it.prop("Ip4Config", "o", lambda: ip4 or NM_NONE)
+        it.prop("Dhcp4Config", "o", lambda: NM_NONE)
+        it.prop("Ip6Config", "o", lambda: NM_NONE)
+        it.prop("Dhcp6Config", "o", lambda: NM_NONE)
+        it.prop("Managed", "b", lambda: True, lambda v: None)
+        it.prop("Autoconnect", "b", lambda: True, lambda v: None)
+        it.prop("FirmwareMissing", "b", lambda: False, emits="const")
+        it.prop("NmPluginMissing", "b", lambda: False, emits="const")
+        it.prop("DeviceType", "u", lambda: 2, emits="const")
+        it.prop("AvailableConnections", "ao", lambda: list(conns))
+        it.prop("PhysicalPortId", "s", lambda: "", emits="const")
+        it.prop("Mtu", "u", lambda: 1500)
+        it.prop("Metered", "u", lambda: 0)
+        it.prop("LldpNeighbors", "aa{sv}", lambda: [])
+        it.prop("Real", "b", lambda: True, emits="const")
+        it.prop("Ip4Connectivity", "u", lambda: 4 if dstate == 100 else 1)
+        it.prop("Ip6Connectivity", "u", lambda: 1)
+        it.prop("InterfaceFlags", "u", lambda: 1 if dstate >= 30 else 0)
+        it.prop("HwAddress", "s", self._hw, emits="const")
+        it.prop("Ports", "ao", lambda: [])
+        return it
+
+    def _wireless(self, aps, active_ap):
+        st = self._st()
+        paths = [self._ap_path(a["ssid"]) for a in aps]
+        speed = st["link_speed"] * 1000 if self._connected() and isinstance(st.get("link_speed"), int) and st["link_speed"] > 0 else 0
+        last = self.last_scan_ms
+        it = Interface(IF_NM_WIRELESS)
+        it.method("GetAccessPoints", "", "ao", fn=lambda: list(paths), outs=("access_points",))
+        it.method("GetAllAccessPoints", "", "ao", fn=lambda: list(paths), outs=("access_points",))
+        it.method("RequestScan", "a{sv}", fn=self._request_scan, slow=True, args=("options",))
+        it.signal("AccessPointAdded", "o", ("access_point",))
+        it.signal("AccessPointRemoved", "o", ("access_point",))
+        it.prop("HwAddress", "s", self._hw, emits="const")
+        it.prop("PermHwAddress", "s", self._hw, emits="const")
+        it.prop("Mode", "u", lambda: 2)
+        it.prop("Bitrate", "u", lambda: speed)
+        it.prop("AccessPoints", "ao", lambda: list(paths))
+        it.prop("ActiveAccessPoint", "o", lambda: active_ap or NM_NONE)
+        it.prop("WirelessCapabilities", "u", lambda: 0x73F, emits="const")
+        it.prop("LastScan", "x", lambda: last)
+        return it
+
+    def _access_point(self, ap):
+        flags, wpa, rsn = nm_ap_flags(ap["security"])
+        ssid, bssid, freq, strength, rate = ap["ssid"], ap["bssid"] or "00:00:00:00:00:00", ap["freq"], ap["strength"], ap["rate"]
+        seen = int(self.scan_mono) if self.scan_mono else -1
+        it = Interface(IF_NM_AP)
+        it.prop("Flags", "u", lambda: flags)
+        it.prop("WpaFlags", "u", lambda: wpa)
+        it.prop("RsnFlags", "u", lambda: rsn)
+        it.prop("Ssid", "ay", lambda: ssid.encode("utf-8", "replace"))
+        it.prop("Frequency", "u", lambda: freq)
+        it.prop("HwAddress", "s", lambda: bssid)
+        it.prop("Mode", "u", lambda: 2)
+        it.prop("MaxBitrate", "u", lambda: rate)
+        it.prop("Bandwidth", "u", lambda: 20)
+        it.prop("Strength", "y", lambda: strength)
+        it.prop("LastSeen", "i", lambda: seen, emits="false")
+        return it
+
+    def _active_connection(self, c, ap_path, astate, ip4):
+        st = self._st()
+        path = self._conn_path(c["ssid"])
+        ssid, uuid = c["ssid"], c["uuid"]
+        flags = 0x4 | 0x8 if astate == 2 else 0
+        it = Interface(IF_NM_ACTIVE)
+        it.signal("StateChanged", "uu", ("state", "reason"))
+        it.prop("Connection", "o", lambda: path)
+        it.prop("SpecificObject", "o", lambda: ap_path or NM_NONE)
+        it.prop("Id", "s", lambda: ssid)
+        it.prop("Uuid", "s", lambda: uuid)
+        it.prop("Type", "s", lambda: "802-11-wireless", emits="const")
+        it.prop("Devices", "ao", lambda: [NM_WIFI])
+        it.prop("State", "u", lambda: astate)
+        it.prop("StateFlags", "u", lambda: flags)
+        it.prop("Default", "b", lambda: astate == 2)
+        it.prop("Ip4Config", "o", lambda: ip4 or NM_NONE)
+        it.prop("Dhcp4Config", "o", lambda: NM_NONE)
+        it.prop("Default6", "b", lambda: False)
+        it.prop("Ip6Config", "o", lambda: NM_NONE)
+        it.prop("Dhcp6Config", "o", lambda: NM_NONE)
+        it.prop("Vpn", "b", lambda: False, emits="const")
+        it.prop("Master", "o", lambda: NM_NONE)
+        return it
+
+    def _ip4(self):
+        st = self._st()
+        ip, gw = st.get("ip"), st.get("gateway")
+        prefix = st.get("prefix") if isinstance(st.get("prefix"), int) and not isinstance(st.get("prefix"), bool) else 24
+        dns = [d for d in (st.get("dns") or []) if isinstance(d, str)]
+        addr = [{"address": Variant("s", ip), "prefix": Variant("u", prefix)}] if ip else []
+        old_addr = [[ip_u32(ip), prefix, ip_u32(gw)]] if ip else []
+        routes = [{"dest": Variant("s", "0.0.0.0"), "prefix": Variant("u", 0), "next-hop": Variant("s", gw), "metric": Variant("u", 600)}] if gw else []
+        it = Interface(IF_NM_IP4)
+        it.prop("Addresses", "aau", lambda: old_addr)
+        it.prop("AddressData", "aa{sv}", lambda: addr)
+        it.prop("Gateway", "s", lambda: clean_text(gw))
+        it.prop("Routes", "aau", lambda: [])
+        it.prop("RouteData", "aa{sv}", lambda: routes)
+        it.prop("NameserverData", "aa{sv}", lambda: [{"address": Variant("s", d)} for d in dns])
+        it.prop("Nameservers", "au", lambda: [ip_u32(d) for d in dns])
+        it.prop("Domains", "as", lambda: [])
+        it.prop("Searches", "as", lambda: [])
+        it.prop("DnsOptions", "as", lambda: [])
+        it.prop("DnsPriority", "i", lambda: 0)
+        it.prop("WinsServerData", "as", lambda: [])
+        it.prop("WinsServers", "au", lambda: [])
+        return it
+
+    def _settings_root(self, conns):
+        paths = [self._conn_path(c["ssid"]) for c in conns]
+        host = self.hostname
+        it = Interface(IF_NM_SETTINGS)
+        it.method("ListConnections", "", "ao", fn=lambda: list(paths), outs=("connections",))
+        it.method("GetConnectionByUuid", "s", "o", fn=self._conn_by_uuid, args=("uuid",), outs=("connection",))
+        for name in ("AddConnection", "AddConnectionUnsaved"):
+            it.method(name, "a{sa{sv}}", "o", fn=self._add_connection, args=("connection",), outs=("path",))
+        it.method("LoadConnections", "as", "bas", fn=lambda files: (False, list(files)), args=("filenames",), outs=("status", "failures"))
+        it.method("ReloadConnections", "", "b", fn=self._reload, slow=True, outs=("status",))
+        it.method("SaveHostname", "s", fn=lambda h: nm_unsupported("Nexo no cambia el nombre del equipo"), args=("hostname",))
+        it.signal("NewConnection", "o", ("connection",))
+        it.signal("ConnectionRemoved", "o", ("connection",))
+        it.prop("Connections", "ao", lambda: list(paths))
+        it.prop("Hostname", "s", lambda: host)
+        it.prop("CanModify", "b", lambda: True)
+        return it
+
+    def _connection(self, c):
+        ssid = c["ssid"]
+        it = Interface(IF_NM_CONN)
+        for name in ("Update", "UpdateUnsaved"):
+            it.method(name, "a{sa{sv}}", fn=self._read_only, args=("properties",))
+        it.method("Delete", fn=lambda: self._forget(ssid), slow=True)
+        it.method("GetSettings", "", "a{sa{sv}}", fn=lambda: self._settings_of(c), outs=("settings",))
+        it.method("GetSecrets", "s", "a{sa{sv}}", fn=lambda setting: {}, args=("setting_name",), outs=("secrets",))
+        it.method("ClearSecrets", fn=lambda: None)
+        it.method("Save", fn=lambda: None)
+        it.signal("Updated")
+        it.signal("Removed")
+        it.prop("Unsaved", "b", lambda: False)
+        it.prop("Flags", "u", lambda: 0)
+        it.prop("Filename", "s", lambda: "")
+        return it
+
+    @staticmethod
+    def _settings_of(c):
+        d = collections.OrderedDict()
+        d["connection"] = collections.OrderedDict([("id", Variant("s", c["ssid"])), ("uuid", Variant("s", c["uuid"])),
+                                                   ("type", Variant("s", "802-11-wireless")), ("autoconnect", Variant("b", True))])
+        w = collections.OrderedDict([("ssid", Variant("ay", c["ssid"].encode("utf-8", "replace"))), ("mode", Variant("s", "infrastructure"))])
+        if c.get("hidden"):
+            w["hidden"] = Variant("b", True)
+        km = nm_key_mgmt(c.get("security"))
+        if km:
+            w["security"] = Variant("s", "802-11-wireless-security")
+        d["802-11-wireless"] = w
+        if km:
+            d["802-11-wireless-security"] = collections.OrderedDict([("key-mgmt", Variant("s", km))])
+        d["ipv4"] = collections.OrderedDict([("method", Variant("s", "auto"))])
+        d["ipv6"] = collections.OrderedDict([("method", Variant("s", "auto"))])
+        return d
+
+    def _desired(self):
+        out = collections.OrderedDict()
+        if not self._have_data():
+            return out
+        with self.lock:
+            connected, enabled = self._connected(), self._enabled()
+            connecting = self.connecting is not None
+            aps, conns = self._aps(), self._conns()
+            gstate = self._global()
+            if not enabled:
+                dstate = 20
+            elif connecting:
+                dstate = 50
+            elif connected:
+                dstate = 100
+            else:
+                dstate = 30
+            cur = self._ssid() if connected else None
+            act_ssid = self.connecting.get("ssid") if connecting else cur
+            active_conn = next((c for c in conns if c["ssid"] == act_ssid), None) if act_ssid else None
+            if active_conn is None and (connected or connecting):
+                active_conn = {"ssid": act_ssid or "Wi-Fi", "security": None, "hidden": False,
+                               "uuid": self.uuids.get(act_ssid or "") or nm_uuid(act_ssid or "Wi-Fi")}
+            astate = 1 if connecting else (2 if connected else 0)
+            active = self._active_path() if active_conn is not None else None
+            ip4 = self._ip4_path() if connected and self._st().get("ip") else None
+            active_ap = next((self._ap_path(a["ssid"]) for a in aps if a["active"]), None)
+            conn_paths = [self._conn_path(c["ssid"]) for c in conns]
+            out[NM_ROOT] = [self._root(active is not None, gstate)]
+            out[NM_ROOT + "/Settings"] = [self._settings_root(conns)]
+            out[NM_ROOT + "/AgentManager"] = [self._agent_manager()]
+            out[NM_WIFI] = [self._device(dstate, active, ip4, conn_paths), self._wireless(aps, active_ap)]
+            for ap in aps:
+                out[self._ap_path(ap["ssid"])] = [self._access_point(ap)]
+            for c in conns:
+                out[self._conn_path(c["ssid"])] = [self._connection(c)]
+            if active is not None:
+                out[active] = [self._active_connection(active_conn, active_ap, astate, ip4)]
+            if ip4 is not None:
+                out[ip4] = [self._ip4()]
+            self._pending_sig = {"state": gstate[0], "dev": dstate, "reason": self.reason, "aps": [self._ap_path(a["ssid"]) for a in aps],
+                                 "conns": conn_paths, "active": active, "astate": astate}
+        return out
+
+    @staticmethod
+    def _agent_manager():
+        it = Interface(IF_NM_AGENT)      # los applets registran un agente de claves: aquí las claves las guarda Android
+        it.method("Register", "s", fn=lambda ident: None, args=("identifier",))
+        it.method("RegisterWithCapabilities", "su", fn=lambda ident, caps: None, args=("identifier", "capabilities"))
+        it.method("Unregister", fn=lambda: None)
+        return it
+
+    # ---- señales que no son de ObjectManager ni de propiedades
+
+    def publish(self):
+        if not self.owned:
+            return
+        with self.lock:
+            desired = self._desired()
+            cur = self._pending_sig
+            prev = self._sig
+            self.tree.update(desired)
+            self._sig = cur
+            self._emit_changes(prev, cur)
+
+    def _on_acquired(self):
+        self._sig = self._pending_sig
+
+    def _on_released(self):
+        self._sig = None
+
+    def _emit_changes(self, prev, cur):
+        bus = self.bus
+        if bus is None or prev is None or cur is None:
+            return
+        if cur["state"] != prev["state"]:
+            bus.emit(NM_ROOT, IF_NM, "StateChanged", "u", (cur["state"],))
+        if cur["dev"] != prev["dev"]:
+            bus.emit(NM_WIFI, IF_NM_DEVICE, "StateChanged", "uuu", (cur["dev"], prev["dev"], cur["reason"]))
+        for p in cur["aps"]:
+            if p not in prev["aps"]:
+                bus.emit(NM_WIFI, IF_NM_WIRELESS, "AccessPointAdded", "o", (p,))
+        for p in prev["aps"]:
+            if p not in cur["aps"]:
+                bus.emit(NM_WIFI, IF_NM_WIRELESS, "AccessPointRemoved", "o", (p,))
+        for p in cur["conns"]:
+            if p not in prev["conns"]:
+                bus.emit(NM_ROOT + "/Settings", IF_NM_SETTINGS, "NewConnection", "o", (p,))
+        for p in prev["conns"]:
+            if p not in cur["conns"]:
+                bus.emit(p, IF_NM_CONN, "Removed", "", ())
+                bus.emit(NM_ROOT + "/Settings", IF_NM_SETTINGS, "ConnectionRemoved", "o", (p,))
+        if cur["active"] is not None and cur["active"] == prev["active"] and cur["astate"] != prev["astate"]:
+            bus.emit(cur["active"], IF_NM_ACTIVE, "StateChanged", "uu", (cur["astate"], 0))
+        elif prev["active"] is not None and cur["active"] != prev["active"]:
+            bus.emit(prev["active"], IF_NM_ACTIVE, "StateChanged", "uu", (4, 0))
+
+    # ---- pasivo o no: lo de systemd y lo de «ya hay otro» lo hace NameService
+
+    # ---- eventos y refresco
+
+    def on_event(self, topic, data):
+        if not isinstance(data, dict):
+            return
+        if topic == "wifi":
+            self._apply_status(data)
+        elif topic == "net":
+            with self.lock:
+                self.net = dict(data)
+            self.publish()
+
+    def _apply_status(self, data):
+        with self.lock:
+            old = self.status or {}
+            self.status = dict(data)
+            key = self._ssid() if self._connected() else None
+            if key != self.active_key:
+                self.active_key = key
+                if key is not None and not (self.connecting and self.connecting.get("ssid") == key):
+                    self.active_n += 1
+            if bool(old.get("enabled")) != self._enabled() or old.get("ssid") != self._st().get("ssid"):
+                self._want_saved = True
+                if self._enabled():
+                    self._want_scan = True
+        self.publish()
+        self._kick.set()
+
+    def _worker(self):
+        while not self._halt.is_set():
+            kicked = self._kick.wait(1.0)
+            if self._halt.is_set():
+                return
+            if kicked:
+                self._halt.wait(0.3)
+                self._kick.clear()
+            try:
+                self._maybe_refresh()
+            except Exception as e:
+                log("NetworkManager: fallo al actualizar el WiFi: %r" % (e,))
+                dbg(traceback.format_exc())
+
+    def _maybe_refresh(self):
+        ready = self.bridge.ready.is_set()
+        if ready and not self._was_ready:
+            self._want_status = self._want_scan = self._want_saved = True
+        self._was_ready = ready
+        if not ready or self.bus is None or self.mode == "off" or self.yielded or self.denied:
+            return
+        now = time.monotonic()
+        if self._want_status or now - self._t_status > self.status_every or not self._have_data():
+            self._want_status = False
+            self._t_status = now
+            self._refresh_status()
+        if not self._have_data() or not self._enabled():
+            return
+        if self._want_scan or now - self._t_scan > self.scan_every:
+            first = self._t_scan == 0.0
+            self._want_scan = False
+            self._t_scan = now
+            self._refresh_scan(fresh=not first)
+        if self._want_saved or now - self._t_saved > 60.0:
+            self._want_saved = False
+            self._t_saved = now
+            self._refresh_saved()
+
+    def _refresh_status(self):
+        try:
+            d = self.bridge.call("wifi.status", timeout=8.0)
+        except BridgeError as e:
+            dbg("NetworkManager: wifi.status falló: %s" % e.message)
+            return
+        self._apply_status(d)
+
+    def _refresh_scan(self, fresh=True, strict=False):
+        try:
+            d = self.bridge.call("wifi.scan", fresh=fresh, timeout_ms=4000, timeout=12.0)
+        except BridgeError as e:
+            if e.code == "permission_denied":
+                self.say_once("scan-perm", "NetworkManager: Android no deja ver las redes sin el permiso de ubicación: "
+                                           "dáselo a Nexo y activa la ubicación del móvil")
+            else:
+                dbg("NetworkManager: wifi.scan falló: %s" % e.message)
+            if strict:
+                raise nm_error(e)
+            return
+        nets = [n for n in (d.get("networks") or []) if isinstance(n, dict)]
+        with self.lock:
+            self.scan = nets
+            self.scan_mono = time.monotonic()
+            self.last_scan_ms = int(time.monotonic() * 1000)
+        self.publish()
+
+    def _refresh_saved(self):
+        try:
+            d = self.bridge.call("wifi.saved", timeout=8.0)
+        except BridgeError as e:
+            if e.code == "permission_denied":
+                self.say_once("saved-perm", "NetworkManager: sin el permiso de ubicación Android no deja leer las redes guardadas; "
+                                            "solo saldrá la red a la que estás conectado")
+            else:
+                dbg("NetworkManager: wifi.saved falló: %s" % e.message)
+            return
+        with self.lock:
+            self.saved = [n for n in (d.get("networks") or []) if isinstance(n, dict)]
+        dbg("NetworkManager: wifi.saved → %d redes" % len(self.saved))
+        self.publish()
+
+    # ---- métodos y propiedades que escriben
+
+    @staticmethod
+    def _device_by_iface(iface):
+        if iface != NM_IFACE:
+            raise DBusError(NM_ERR + "UnknownDevice", "No device found for the requested iface")
+        return NM_WIFI
+
+    @staticmethod
+    def _read_only(*_args):
+        raise DBusError(NMS_ERR + "ReadOnlyConnection", "Las redes guardadas las gestiona Android: nexo no las puede editar")
+
+    def _add_connection(self, settings):
+        raise DBusError(NMS_ERR + "NotSupported", "Nexo no guarda redes sin conectarse a ellas: usa «nmcli device wifi connect» "
+                                                   "o AddAndActivateConnection")
+
+    def _conn_by_uuid(self, uuid):
+        for c in self._conns():
+            if c["uuid"] == uuid:
+                return self._conn_path(c["ssid"])
+        raise DBusError(NMS_ERR + "InvalidConnection", "No connection with this UUID")
+
+    def _reload(self):
+        self._want_saved = self._want_scan = True
+        self._kick.set()
+        return True
+
+    def _applied(self, flags):
+        if not self._connected():
+            raise DBusError(IF_NM_DEVICE + ".NotActive", "Device is not activated")
+        c = next((c for c in self._conns() if c["ssid"] == self._ssid()), None)
+        if c is None:
+            raise DBusError(IF_NM_DEVICE + ".NotActive", "Device is not activated")
+        return self._settings_of(c), 1
+
+    def _set_wireless(self, v):
+        try:
+            d = self.bridge.call("wifi.enable" if v else "wifi.disable", timeout=15.0)
+        except BridgeError as e:
+            raise nm_error(e)
+        self._apply_status(d)
+
+    def _request_scan(self, options):
+        if not self._enabled():
+            raise DBusError(NM_ERR + "Failed", "El WiFi del móvil está apagado")
+        self._refresh_scan(fresh=True, strict=True)
+
+    def _disconnect(self):
+        if not self._connected():
+            raise DBusError(IF_NM_DEVICE + ".NotActive", "Device is not active")
+        try:
+            self.bridge.call("wifi.disconnect", timeout=10.0)
+        except BridgeError as e:
+            raise nm_error(e)
+        self._want_status = True
+        self._kick.set()
+
+    def _deactivate(self, path):
+        if not (self._connected() or self.connecting) or path != self._active_path():
+            raise DBusError(NM_ERR + "ConnectionNotActive", "The connection was not active.")
+        self._disconnect()
+
+    def _forget(self, ssid):
+        try:
+            self.bridge.call("wifi.forget", ssid=ssid, timeout=10.0)
+        except BridgeError as e:
+            raise nm_error(e)
+        with self.lock:
+            self.saved = [s for s in self.saved if s.get("ssid") != ssid]
+        self._want_saved = self._want_status = True
+        self._kick.set()
+        self.publish()
+
+    def _activate(self, conn_path, dev_path, specific):
+        c = next((c for c in self._conns() if self._conn_path(c["ssid"]) == conn_path), None)
+        if c is None:
+            raise DBusError(NM_ERR + "UnknownConnection", "Connection does not exist")
+        if dev_path not in (NM_WIFI, NM_NONE, ""):
+            raise DBusError(NM_ERR + "UnknownDevice", "Device does not exist")
+        return self._connect(c["ssid"], None, c.get("hidden", False))
+
+    def _add_and_activate(self, settings, dev_path, specific):
+        if dev_path not in (NM_WIFI, NM_NONE, ""):
+            raise DBusError(NM_ERR + "UnknownDevice", "Device does not exist")
+        ssid = nm_variant_text(settings, "802-11-wireless", "ssid")
+        if not ssid and specific:
+            ssid = next((a["ssid"] for a in self._aps() if self._ap_path(a["ssid"]) == specific), None)
+        if not ssid:
+            raise DBusError(NM_ERR + "InvalidArguments", "Falta el nombre de la red (802-11-wireless.ssid)")
+        psk = nm_variant_text(settings, "802-11-wireless-security", "psk") or nm_variant_text(settings, "802-11-wireless-security", "wep-key0")
+        hidden = (settings.get("802-11-wireless") or {}).get("hidden")
+        hidden = bool(hidden.value if isinstance(hidden, Variant) else hidden)
+        active = self._connect(ssid, psk, hidden, nm_variant_text(settings, "connection", "uuid"))
+        return self._conn_path(ssid), active
+
+    def _connect(self, ssid, password=None, hidden=False, uuid=None):
+        """wifi.connect espera hasta 15 s a que Android confirme la conexión: mientras tanto el dispositivo está «configurándose»."""
+        if not self._enabled():
+            raise DBusError(NM_ERR + "Failed", "El WiFi del móvil está apagado: enciéndelo (nmcli radio wifi on)")
+        with self.lock:
+            if self.connecting:
+                raise DBusError(NM_ERR + "Failed", "Ya hay una conexión en marcha")
+            if self._connected() and self._ssid() == ssid and not password:
+                return self._active_path()
+            if uuid:
+                self.uuids[ssid] = uuid
+            self.connecting = {"ssid": ssid}
+            self.active_n += 1
+            self.active_key = ssid
+            self.reason = 0
+        self.publish()
+        err = None
+        try:
+            params = {"ssid": ssid, "wait_ms": 15000}
+            if password:
+                params["password"] = password
+            if hidden:
+                params["hidden"] = True
+            d = self.bridge.call("wifi.connect", timeout=25.0, **params)
+            if not d.get("connected"):
+                err = DBusError(NM_ERR + "Failed", "No pude conectar con «%s»: %s" % (
+                    ssid, d.get("hint") or "clave incorrecta, sin cobertura o señal muy débil"))
+        except BridgeError as e:
+            err = nm_error(e)
+        with self.lock:
+            self.connecting = None
+            if err is not None:
+                self.reason = 1
+        self._refresh_status()
+        with self.lock:
+            self.active_key = self._ssid() if self._connected() else None
+        self._want_saved = True
+        self._kick.set()
+        self.publish()
+        if err is not None:
+            raise err
+        return self._active_path()
+
+
+# ----------------------------------------------------------------------------------------------------- el servicio
+
+
+# Los servicios del bus del sistema (clase, nombre de la opción en Opts) y el de notificaciones (cliente del bus de sesión).
+# Cada parte que se añade (NetworkManager, UDisks2, notificaciones) se apunta aquí.
+SYSTEM_SERVICES = [(Bluez, "bluez"), (NetworkManager, "nm")]
+NOTIFIER = None
+
+
+class Opts(object):
+    def __init__(self):
+        self.verbose = False
+        self.log = None
+        self.bus = os.environ.get("NEXO_DBUS_BUS") or None
+        self.system_bus = os.environ.get("NEXO_DBUS_SYSTEM_BUS") or None   # «none» desactiva todo lo del bus del sistema
+        self.own_bus = False
+        self.always = os.environ.get("NEXO_DBUS_ALWAYS") == "1"
+        self.force = os.environ.get("NEXO_DBUS_FORCE") == "1"
+        self.grace = env_float("NEXO_DBUS_GRACE", 3.0)
+        self.grace_down = env_float("NEXO_DBUS_GRACE_DOWN", 30.0)
+        self.mpris = norm_mode(os.environ.get("NEXO_DBUS_MPRIS"), "on") != "off"
+        self.bluez = norm_mode(os.environ.get("NEXO_DBUS_BLUEZ"))
+        self.nm = norm_mode(os.environ.get("NEXO_DBUS_NM"))
+        self.notify = norm_mode(os.environ.get("NEXO_DBUS_NOTIFY"), "on") != "off"
+        self.passthrough = []
+
+    def system_off(self):
+        return (self.system_bus or "").strip().lower() in ("none", "off", "0", "no")
+
+
+def own_bus_file(kind="session"):
+    return os.path.join(cache_dir(), "session-bus" if kind == "session" else "system-bus")
+
+
+def _socket_alive(address):
+    for transport, params in parse_address(address):
+        try:
+            _open_socket(transport, params).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def find_session_bus():
+    """La dirección del bus de sesión: la del entorno, el de systemd/dbus-broker, o el que creó --own-bus."""
+    a = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if a:
+        return a
+    for d in (os.environ.get("XDG_RUNTIME_DIR"), "/run/user/%d" % os.getuid()):
+        if d and os.path.exists(os.path.join(d, "bus")):
+            return "unix:path=" + os.path.join(d, "bus")
+    try:
+        with open(own_bus_file("session")) as f:
+            a = f.read().strip()
+        if a and _socket_alive(a):
+            return a
+    except OSError:
+        pass
+    return None
+
+
+def system_sockets():
+    """Dónde suele estar el socket del bus del sistema. NEXO_DBUS_SYSTEM_SOCKET (para distros raras y para las pruebas)
+    lo sustituye: entonces no se mira ningún otro."""
+    only = os.environ.get("NEXO_DBUS_SYSTEM_SOCKET")
+    if only:
+        return [only]
+    return ["/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket"]
+
+
+def own_system_bus_to_export():
+    """La dirección del bus «del sistema» propio de Nexo, si existe y hace falta anunciarla (si está en el socket de
+    siempre, los clientes lo encuentran solos)."""
+    try:
+        with open(own_bus_file("system")) as f:
+            a = f.read().strip()
+    except OSError:
+        return None
+    if not a or not _socket_alive(a) or a in ["unix:path=" + p for p in system_sockets()]:
+        return None
+    return a
+
+
+def any_bus_possible(o):
+    """¿Hay (o se va a crear) algún bus al que conectarse con estas opciones?"""
+    if o.own_bus:
+        return True
+    if (o.mpris or o.notify) and (o.bus or find_session_bus()):
+        return True
+    if not o.system_off() and (o.bluez != "off" or o.nm != "off") and (o.system_bus or find_system_bus()):
+        return True
+    return False
+
+
+def find_system_bus():
+    """La dirección del bus del sistema: la del entorno, el socket de siempre, o el que creó --own-bus."""
+    a = os.environ.get("DBUS_SYSTEM_BUS_ADDRESS")
+    if a:
+        return a
+    for p in system_sockets():
+        if os.path.exists(p) and _socket_alive("unix:path=" + p):
+            return "unix:path=" + p
+    try:
+        with open(own_bus_file("system")) as f:
+            a = f.read().strip()
+        if a and _socket_alive(a):
+            return a
+    except OSError:
+        pass
+    return None
+
+
+def ensure_own_bus(kind="session"):
+    """Arranca (si hace falta) un dbus-daemon propio para esta distro y devuelve su dirección.
+
+    kind="session": el bus de sesión que no hay en una terminal sin escritorio.
+    kind="system": un bus «del sistema» para BlueZ y NetworkManager (en un proot casi nunca hay uno). Se hace con la
+    configuración de sesión de dbus-daemon, que deja a su dueño ocupar cualquier nombre. Si eres root se pone en el
+    socket de siempre (/run/dbus/system_bus_socket) y bluetoothctl o nmcli lo encuentran sin configurar nada; si no,
+    va en tu carpeta de ejecución y hace falta  eval "$(nexo-dbus env)"  en cada terminal."""
+    import shutil
+    if kind == "system":
+        paths = ([system_sockets()[0]] if os.getuid() == 0 else []) + [os.path.join(runtime_dir(), "nexo-system-bus")]
+    else:
+        paths = [os.path.join(runtime_dir(), "nexo-bus")]
+    for path in paths:
+        if _socket_alive("unix:path=" + path):
+            return "unix:path=" + path
+    exe = shutil.which("dbus-daemon")
+    if not exe:
+        raise OSError("no encuentro dbus-daemon: instala el paquete dbus de tu distro")
+    err = None
+    for path in paths:
+        addr = "unix:path=" + path
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            d = os.path.dirname(path)
+            if not os.path.isdir(d):
+                os.makedirs(d, 0o755 if path == system_sockets()[0] else 0o700)
+        except OSError as e:
+            err = e
+            continue
+        subprocess.Popen([exe, "--session", "--nofork", "--nopidfile", "--address=" + addr], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        for _ in range(40):
+            if _socket_alive(addr):
+                break
+            time.sleep(0.1)
+        else:
+            err = OSError("dbus-daemon no llegó a arrancar en %s" % path)
+            continue
+        ensure_dir(cache_dir())
+        with open(own_bus_file(kind), "w") as f:
+            f.write(addr + "\n")
+        if kind == "session":
+            log("bus de sesión propio en %s (para otras terminales: eval \"$(nexo-dbus env)\")" % addr)
+        elif path == system_sockets()[0]:
+            log("bus del sistema propio en %s (el de siempre: bluetoothctl y nmcli lo encuentran solos)" % addr)
+        else:
+            log("bus del sistema propio en %s (para otras terminales: eval \"$(nexo-dbus env)\")" % addr)
+        return addr
+    raise err or OSError("no pude arrancar un bus propio")
+
+
+def pid_file():
+    return os.path.join(runtime_dir(), "nexo-dbus.pid")
+
+
+def state_file():
+    """Lo que cada servicio está haciendo, para «nexo-dbus status» y «nexo doctor» (lo escribe el demonio al cambiar algo)."""
+    return os.path.join(runtime_dir(), "nexo-dbus.state")
+
+
+def read_state(pid):
+    """La lista [(nombre, estado, texto)] que dejó el demonio con ese PID; vacía si no hay (o es de otro)."""
+    try:
+        with open(state_file(), encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("pid") != pid:
+            return []
+        return [(x["name"], x["state"], x["text"]) for x in d["services"]]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
+def read_pid():
+    try:
+        with open(pid_file()) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"nexo-dbus" not in f.read():
+                return None
+    except OSError:
+        pass
+    return pid
+
+
+class Slot(object):
+    """Un servicio y su conexión a un bus. Cada uno se conecta, se reconecta y falla por separado."""
+
+    def __init__(self, service, kind):
+        self.service = service
+        self.kind = kind                      # "session" | "system"
+        self.label = service.LABEL
+        self.bus = None
+        self.next_try = 0.0
+        self.waited = False
+        self.error = None
+
+
+class Daemon(object):
+    def __init__(self, opts, cfg):
+        self.opts = opts
+        self.stop = threading.Event()
+        self.bridge = Bridge(cfg["NEXO_HOST"], int(cfg["NEXO_PORT"]), cfg["NEXO_TOKEN"], [], self._on_event, reload=self._link)
+        self.slots = []
+        self._last_state = None
+        self.mpris = None
+        if opts.mpris:
+            self.mpris = Mpris(self.bridge, always=opts.always, grace=opts.grace, grace_down=opts.grace_down, force=opts.force)
+            self.slots.append(Slot(self.mpris, "session"))
+        if opts.notify and NOTIFIER is not None:
+            self.slots.append(Slot(NOTIFIER(self.bridge, grace_down=opts.grace_down), "session"))
+        if not opts.system_off():
+            for cls, mode in SYSTEM_SERVICES:
+                m = getattr(opts, mode)
+                if m != "off":
+                    self.slots.append(Slot(cls(self.bridge, m, opts.force, opts.grace_down), "system"))
+        topics = []
+        for s in self.slots:
+            for t in s.service.TOPICS:
+                if t not in topics:
+                    topics.append(t)
+        self.bridge.topics = topics
+
+    def _on_event(self, topic, data):
+        for s in self.slots:
+            if topic in s.service.TOPICS:
+                s.service.on_event(topic, data)
+
+    def _services_state(self):
+        """[{"name","state","text"}] de todos los servicios, también los apagados, para el archivo de estado."""
+        o = self.opts
+        out = []
+        if self.mpris is None:
+            out.append({"name": "MPRIS", "state": "off", "text": "apagado"})
+        for s in self.slots:
+            if s.bus is None:
+                kind = "de sesión" if s.kind == "session" else "del sistema"
+                st, tx = "nobus", (s.error or "esperando un bus %s de D-Bus (¿sin escritorio? mira: nexo setup-dbus --own-bus)" % kind)
+            else:
+                try:
+                    st, tx = s.service.describe()
+                except Exception as e:      # un servicio con un fallo raro no debe tumbar el resumen de los demás
+                    st, tx = "error", "no pude averiguar su estado: %r" % e
+            out.append({"name": s.label, "state": st, "text": tx})
+        have = set(x["name"] for x in out)
+        for cls, mode in SYSTEM_SERVICES:
+            if cls.LABEL not in have:
+                why = "sin bus del sistema (NEXO_DBUS_SYSTEM_BUS=none)" if o.system_off() else "apagado"
+                out.append({"name": cls.LABEL, "state": "off", "text": why})
+        return out
+
+    def _write_state(self):
+        """Escribe el resumen solo si cambió (así no hay escrituras inútiles cada medio segundo)."""
+        try:
+            services = self._services_state()
+            if services == self._last_state:
+                return
+            self._last_state = services
+            tmp = state_file() + ".%d.tmp" % os.getpid()
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "version": VERSION, "services": services}, f, ensure_ascii=False)
+            os.replace(tmp, state_file())
+        except OSError as e:
+            dbg("no pude escribir %s: %s" % (state_file(), e))
+
+    @staticmethod
+    def _link():
+        cfg = load_config()
+        return cfg["NEXO_HOST"], int(cfg["NEXO_PORT"]), cfg["NEXO_TOKEN"]
+
+    def _address(self, slot):
+        o = self.opts
+        if slot.kind == "session":
+            addr = o.bus or find_session_bus()
+        else:
+            addr = o.system_bus or find_system_bus()
+        if not addr and o.own_bus:
+            addr = ensure_own_bus(slot.kind)
+        return addr
+
+    def _connect(self, slot):
+        try:
+            addr = self._address(slot)
+        except OSError as e:
+            slot.error = "no pude arrancar un bus propio: %s" % e
+            return False
+        if not addr:
+            slot.error = None
+            return False
+        bus = Bus(addr, "%s-%s" % (slot.kind, slot.label))
+        try:
+            bus.connect()
+        except (OSError, DBusError, ConnectionError, ProtocolError) as e:
+            slot.error = "No pude conectar con el bus %s: %s" % ("de sesión" if slot.kind == "session" else "del sistema", e)
+            dbg(slot.error)
+            return False
+        slot.error = None
+        slot.bus = bus
+        slot.service.attach(bus)
+        log("%s: conectado al bus %s (%s)" % (slot.label, "de sesión" if slot.kind == "session" else "del sistema", bus.unique_name))
+        return True
+
+    def run(self):
+        for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                signal.signal(sg, lambda *_: self.stop.set())
+            except (ValueError, OSError):
+                pass
+        if not self.slots:
+            log("No hay nada que hacer: todos los servicios están apagados (mira NEXO_DBUS_MPRIS, _BLUEZ y _NM, o las opciones --no-…).")
+            raise SystemExit(EXIT_USAGE)
+        if not [s for s in self.slots if self._connect(s)]:
+            errs = [s.error for s in self.slots if s.error]
+            sys.stderr.write((errs[0] + "\n") if errs else no_bus_message())
+            raise SystemExit(EXIT_NOBUS)
+        self.bridge.start()
+        while not self.stop.is_set():
+            now = time.monotonic()
+            for s in self.slots:
+                if s.bus is not None and s.bus.closed.is_set():
+                    log("%s: se perdió la conexión con el bus; reconecto" % s.label)
+                    s.service.detach()
+                    s.bus, s.waited, s.next_try = None, False, 0.0
+                if s.bus is None:
+                    if now >= s.next_try:
+                        s.next_try = now + 3.0
+                        if self._connect(s):
+                            s.waited = False
+                        elif not s.waited:
+                            s.waited = True
+                            log("%s: esperando un bus %s de D-Bus…" % (s.label, "de sesión" if s.kind == "session" else "del sistema"))
+                    continue
+                try:
+                    s.service.tick()
+                except Exception as e:
+                    log("%s: error inesperado: %r" % (s.label, e))
+                    dbg(traceback.format_exc())
+            self._write_state()
+            self.stop.wait(0.5)
+        for s in self.slots:
+            try:
+                s.service.detach()
+                s.service.stop()
+            except Exception as e:
+                dbg("al parar %s: %r" % (s.label, e))
+        self.bridge.stop()
+        for s in self.slots:
+            if s.bus is not None:
+                s.bus.close()
+        try:
+            os.remove(state_file())
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------------------------------- línea de comandos
+
+HELP = """nexo-dbus %s: el móvil como servicios D-Bus (MPRIS, BlueZ, NetworkManager y notificaciones)
+
+Uso:
+  nexo-dbus run [opciones]      Se queda en primer plano (para systemd o para probar)
+  nexo-dbus start [opciones]    Lo arranca en segundo plano (no hace nada si ya está)
+  nexo-dbus stop                Lo para
+  nexo-dbus restart             Lo para y lo vuelve a arrancar
+  nexo-dbus status              Dice si está en marcha (código 0) o no (1) y qué hace cada servicio (o por qué no)
+  nexo-dbus env                 Imprime «export DBUS_…_BUS_ADDRESS=…» de los buses propios (para eval)
+  nexo-dbus version
+
+Opciones de run/start:
+  -v, --verbose        Anota también los detalles
+  --log ARCHIVO        Dónde anotar (start: ~/.cache/nexo/dbus.log)
+  --bus DIRECCIÓN      Un bus de sesión concreto (por omisión: DBUS_SESSION_BUS_ADDRESS)
+  --system-bus DIREC.  Un bus del sistema concreto (por omisión: DBUS_SYSTEM_BUS_ADDRESS o /run/dbus/system_bus_socket);
+                       «none» desactiva BlueZ y NetworkManager
+  --own-bus            Si falta algún bus (de sesión o del sistema) arranca uno propio con dbus-daemon: para proot y terminales sin escritorio
+  --always             Que el reproductor MPRIS se vea siempre, aunque no suene nada (por omisión solo mientras suena algo)
+  --no-mpris  --no-bluez  --no-nm  --no-notify     Apaga ese servicio
+
+Qué hace (cada servicio tiene su propia conexión y falla por separado):
+  MPRIS            org.mpris.MediaPlayer2.nexo en el bus de SESIÓN mientras Android reproduce algo   → playerctl, Waybar…
+  BlueZ            org.bluez en el bus del SISTEMA: adaptador hci0 y dispositivos emparejados       → bluetoothctl, blueman…
+  NetworkManager   org.freedesktop.NetworkManager en el bus del SISTEMA: wlan0 y las redes del móvil → nmcli, nm-applet…
+  Notificaciones   las notificaciones de Android salen por org.freedesktop.Notifications (dunst, mako…)
+  Si ya hay un BlueZ o un NetworkManager de verdad, no los pisa (modo pasivo).
+
+Variables: NEXO_DBUS_BUS, NEXO_DBUS_SYSTEM_BUS, NEXO_DBUS_ALWAYS=1, NEXO_PORT, NEXO_TOKEN, NEXO_CONFIG,
+           NEXO_DBUS_FORCE=1 (reclama el nombre aunque ya lo tenga otro),
+           NEXO_DBUS_MPRIS / _BLUEZ / _NM / _NOTIFY = 0 (apagado) · 1 (siempre) · auto (por omisión),
+           NEXO_DBUS_GRACE=segundos (espera antes de retirar el reproductor cuando deja de sonar, 3 por omisión),
+           NEXO_DBUS_GRACE_DOWN=segundos (ídem si la app Nexo no responde, 30),
+           NEXO_DBUS_DISCOVERY_RESTORE=1 (StopDiscovery vuelve a apagar el Bluetooth si lo encendió StartDiscovery),
+           NEXO_DBUS_DISCOVERY_SECS=segundos (cuánto dura «Discovering», 120),
+           NEXO_DBUS_REFRESH=segundos (cada cuánto relee los dispositivos Bluetooth aunque no pase nada, 60),
+           NEXO_DBUS_DENIED_RETRY=segundos (cada cuánto reintenta ocupar un nombre que el bus le negó por política, 30),
+           NEXO_DBUS_NM_ASSUME_ONLINE=1 (NetworkManager dice «conectado» aunque el WiFi del móvil no lo esté, mientras la app
+             no cuente qué red usa el móvil; para salir por datos móviles sin que Firefox y otras apps crean que no hay internet),
+           NEXO_DBUS_NM_SCAN=segundos (cada cuánto escanea redes WiFi, 120) · NEXO_DBUS_NM_REFRESH=segundos (cada cuánto relee el estado, 20),
+           NEXO_DBUS_SYSTEM_SOCKET=ruta (el socket del bus del sistema, si no es /run/dbus/system_bus_socket)
+
+Arranque automático en tu escritorio o distro:  nexo setup-dbus   (lo hace el cliente «nexo»)
+Pruebas:  playerctl -p nexo metadata · bluetoothctl devices · nmcli device wifi list
+Códigos de salida: 0 bien · 1 error · 2 uso · 3 sin bus de D-Bus · 11 sin token
+""" % VERSION
+
+
+def no_bus_message():
+    return ("No encuentro un bus de D-Bus donde conectarme.\n"
+            "  · Bus de SESIÓN (MPRIS y notificaciones): dentro de tu escritorio ya existe uno (variable DBUS_SESSION_BUS_ADDRESS).\n"
+            "  · Bus del SISTEMA (BlueZ y NetworkManager): /run/dbus/system_bus_socket o la variable DBUS_SYSTEM_BUS_ADDRESS.\n"
+            "  · En una terminal sin escritorio o en un proot:  nexo-dbus start --own-bus   (crea los buses que falten) y luego,\n"
+            "    en cada terminal:  eval \"$(nexo-dbus env)\"\n"
+            "  · O arráncalo dentro de un bus nuevo:  dbus-run-session -- nexo-dbus run\n")
+
+
+def parse_opts(args):
+    o = Opts()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-v", "--verbose"):
+            o.verbose = True
+            o.passthrough.append(a)
+        elif a == "--own-bus":
+            o.own_bus = True
+            o.passthrough.append(a)
+        elif a == "--always":
+            o.always = True
+            o.passthrough.append(a)
+        elif a in ("--no-mpris", "--no-bluez", "--no-nm", "--no-notify"):
+            if a == "--no-mpris":
+                o.mpris = False
+            elif a == "--no-notify":
+                o.notify = False
+            else:
+                setattr(o, a[5:], "off")
+            o.passthrough.append(a)
+        elif a in ("--log", "--bus", "--system-bus"):
+            if i + 1 >= len(args):
+                sys.stderr.write("%s necesita un valor\n" % a)
+                raise SystemExit(EXIT_USAGE)
+            if a == "--log":
+                o.log = args[i + 1]
+            elif a == "--bus":
+                o.bus = args[i + 1]
+            else:
+                o.system_bus = args[i + 1]
+            o.passthrough += [a, args[i + 1]]
+            i += 1
+        else:
+            sys.stderr.write("Opción desconocida: %s (mira: nexo-dbus help)\n" % a)
+            raise SystemExit(EXIT_USAGE)
+        i += 1
+    return o
+
+
+def cmd_run(args):
+    o = parse_opts(args)
+    if o.verbose:
+        Log.level = 2
+    if o.log:
+        try:
+            Log.stream = open(o.log, "a", buffering=1)
+        except OSError as e:
+            sys.stderr.write("No pude abrir %s: %s\n" % (o.log, e))
+            return 1
+    cfg = load_config()
+    if not cfg["NEXO_TOKEN"]:
+        sys.stderr.write("No hay token: enlaza primero con la app (nexo pair TOKEN, o copia el comando de instalación).\n")
+        return EXIT_NOTOKEN
+    if not re.match(r"^[0-9]+$", cfg["NEXO_PORT"]):
+        sys.stderr.write("Puerto inválido: %s\n" % cfg["NEXO_PORT"])
+        return EXIT_USAGE
+    other = read_pid()
+    if other and other != os.getpid():
+        log("nexo-dbus ya está en marcha (PID %d)" % other)
+        return 0
+    ensure_dir(os.path.dirname(pid_file()))
+    try:
+        with open(pid_file(), "w") as f:
+            f.write("%d\n" % os.getpid())
+    except OSError as e:
+        dbg("no pude escribir %s: %s" % (pid_file(), e))
+    log("nexo-dbus %s: app en %s:%s%s" % (VERSION, cfg["NEXO_HOST"], cfg["NEXO_PORT"],
+                                           " (config: %s)" % cfg["file"] if cfg.get("file") else ""))
+    try:
+        Daemon(o, cfg).run()
+    finally:
+        try:
+            if read_pid() in (None, os.getpid()):
+                os.remove(pid_file())
+        except OSError:
+            pass
+    return 0
+
+
+def cmd_start(args):
+    o = parse_opts(args)
+    pid = read_pid()
+    if pid:
+        print("nexo-dbus ya está en marcha (PID %d)" % pid)
+        return 0
+    cfg = load_config()
+    if not cfg["NEXO_TOKEN"]:
+        sys.stderr.write("No hay token: enlaza primero con la app (nexo pair TOKEN).\n")
+        return EXIT_NOTOKEN
+    if not any_bus_possible(o):
+        sys.stderr.write(no_bus_message())
+        return EXIT_NOBUS
+    logfile = o.log or os.path.join(ensure_dir(cache_dir()), "dbus.log")
+    try:
+        if os.path.getsize(logfile) > 512 * 1024:
+            os.remove(logfile)
+    except OSError:
+        pass
+    args2 = [a for a in o.passthrough]
+    if not o.log:
+        args2 += ["--log", logfile]
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "run"] + args2, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    for _ in range(30):
+        time.sleep(0.1)
+        if child.poll() is not None:
+            tail = ""
+            try:
+                with open(logfile, encoding="utf-8", errors="replace") as f:
+                    tail = "".join(f.readlines()[-5:])
+            except OSError:
+                pass
+            sys.stderr.write("nexo-dbus no arrancó (código %s)%s\n" % (child.returncode, ":\n" + tail if tail else ""))
+            return child.returncode if child.returncode in (EXIT_NOBUS, EXIT_NOTOKEN, EXIT_USAGE) else 1
+        if read_pid() == child.pid:
+            break
+    print("nexo-dbus en marcha (PID %d). Registro: %s" % (child.pid, logfile))
+    return 0
+
+
+def cmd_stop():
+    pid = read_pid()
+    if not pid:
+        print("nexo-dbus no estaba en marcha")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        sys.stderr.write("No pude parar el PID %d: %s\n" % (pid, e))
+        return 1
+    for _ in range(40):
+        time.sleep(0.1)
+        if read_pid() != pid:
+            break
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.remove(pid_file())
+    except OSError:
+        pass
+    print("nexo-dbus parado")
+    return 0
+
+
+def cmd_status():
+    pid = read_pid()
+    if pid:
+        print("nexo-dbus en marcha (PID %d)" % pid)
+        for name, _state, text in read_state(pid):
+            print("  %-15s %s" % (name, text))
+        return 0
+    print("nexo-dbus parado")
+    return 1
+
+
+def cmd_env():
+    sess = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or find_session_bus()
+    syst = own_system_bus_to_export()
+    if not sess and not syst:
+        sys.stderr.write(no_bus_message())
+        return EXIT_NOBUS
+    if sess:
+        print("export DBUS_SESSION_BUS_ADDRESS='%s'" % sess.replace("'", "'\\''"))
+    if syst:
+        print("export DBUS_SYSTEM_BUS_ADDRESS='%s'" % syst.replace("'", "'\\''"))
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        sys.stdout.write(HELP)
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd in ("-V", "--version", "version"):
+        print("nexo-dbus " + VERSION)
+        return 0
+    if cmd == "run":
+        return cmd_run(rest)
+    if cmd == "start":
+        return cmd_start(rest)
+    if cmd == "stop":
+        return cmd_stop()
+    if cmd == "restart":
+        cmd_stop()
+        return cmd_start(rest)
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "env":
+        return cmd_env()
+    sys.stderr.write("Comando desconocido: %s (mira: nexo-dbus help)\n" % cmd)
+    return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)

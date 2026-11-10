@@ -21,9 +21,27 @@ jobs:
       # Aviso, no bloquea: sirve para ver los hallazgos de shellcheck sin que una observación tumbe la compilación.
       - name: shellcheck (solo errores)
         continue-on-error: true
-        run: shellcheck -S error termux/bin/nexo termux/install.sh tests/run_tests.sh
+        run: shellcheck -S error termux/bin/nexo termux/install.sh tests/run_tests.sh tests/dbus_tests.sh tests/playerctl_check.sh
       - name: Pruebas contra la app simulada
+        # Las pruebas con un bus D-Bus real dependen más del entorno: van en el trabajo «dbus» (que no bloquea).
+        env:
+          NEXO_TESTS_DBUS: skip
         run: bash tests/run_tests.sh
+
+  dbus:
+    name: Probar nexo-dbus con un bus D-Bus real y con playerctl
+    runs-on: ubuntu-latest
+    # No bloquea: es una comprobación de compatibilidad con programas reales (busctl, gdbus, playerctl) que no se puede
+    # ensayar en local. Si se pone en rojo, mira el registro: dice qué programa no entendió a nexo-dbus.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar herramientas
+        run: sudo apt-get update && sudo apt-get install -y jq dbus libglib2.0-bin playerctl
+      - name: nexo-dbus contra un bus real (busctl y gdbus como clientes)
+        run: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh
+      - name: nexo-dbus con playerctl de verdad
+        run: bash tests/playerctl_check.sh
 
   apk:
     name: Compilar el APK
@@ -83,3 +101,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.apk
+          # una etiqueta como v0.4.0-beta1 (con guion) se publica como versión preliminar
+          prerelease: ${{ contains(github.ref_name, '-') }}

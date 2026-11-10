@@ -65,12 +65,29 @@ Sí. No depende del nombre del paquete de Termux ni de rutas fijas. El comando q
 
 ## ¿Y en mi distro de proot-distro?
 
-`nexo setup-guests` (en Termux) copia el cliente y el enlace a tus distros. Dentro, instala `bash` y `jq`. `nexo setup-guests --list` enseña cuáles ya lo tienen; `--uninstall` las limpia; `--private` deja el enlace solo para root.
+`nexo setup-guests` (en Termux) copia el cliente y el enlace a tus distros. Dentro, instala `bash` y `jq`. `nexo setup-guests --list` enseña cuáles ya lo tienen; `--uninstall` las limpia; `--private` deja el enlace solo para root;
+`--with-dbus` les copia también `nexo-dbus` (la música del móvil como reproductor para `playerctl`, Waybar, etc.; ver [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md)).
 
 ## ¿Puedo usar Nexo con `nmcli`, `bluetoothctl` o `playerctl`?
 
-Todavía no: hoy Nexo se integra por línea de comandos (formatos para Waybar, Polybar, i3bar, Quickshell, tmux, starship…). Los servicios D‑Bus que harían falta (MPRIS, BlueZ, NetworkManager)
-están planeados desde la v0.3; ver [ROADMAP](ROADMAP.md) y la sección «Integración universal» del README.
+- **`playerctl` y todo lo que lee MPRIS** (el módulo `mpris` de Waybar, Quickshell, GNOME, KDE…): **sí, desde la v0.3.** `nexo setup-dbus` activa `nexo-dbus`, que publica la música del móvil como un reproductor más
+  (`playerctl -p nexo play-pause`). Guía: [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md).
+- **`bluetoothctl` (BlueZ) y `nmcli` (NetworkManager): desde la 0.4.0‑beta1, en beta.** `nexo-dbus` finge ser `org.bluez` (con los dispositivos emparejados en Android) y `org.freedesktop.NetworkManager` (con el WiFi del móvil como `wlan0`),
+  en el bus del sistema; en proot, `nexo setup-dbus --own-bus`. Comprobado con `busctl` y `gdbus`, **todavía no con `bluetoothctl` ni `nmcli` reales**; y Android limita lo que se puede hacer
+  (no se pueden conectar dispositivos Bluetooth ni leer las claves WiFi). Guía y límites: [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md).
+- Mientras tanto, Nexo también se integra por línea de comandos (formatos para Waybar, Polybar, i3bar, Quickshell, tmux, starship…).
+
+## `bluetoothctl` o `nmcli` no ven nada
+
+`nexo dbus status` (o `nexo doctor`) dice qué servicio está activo y, si no, por qué: «pasivo» (ya hay un BlueZ/NetworkManager de verdad: es lo esperado), «el bus no deja a este usuario ocupar org.bluez»
+(hace falta `nexo setup-dbus --system-policy`), o sin bus del sistema (en proot, `nexo setup-dbus --own-bus` y `eval "$(nexo-dbus env)"` en la terminal). La tabla «Si no funciona» de
+[INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md) lo desarrolla.
+
+## `playerctl -l` no muestra «nexo»
+
+Casi siempre es una de tres cosas: no suena nada en el móvil (el reproductor solo existe mientras haya una sesión de medios), falta el acceso a notificaciones de la app,
+o `nexo-dbus` no está en el mismo bus de sesión que tu barra o tu `playerctl`. `nexo dbus status` y `nexo doctor` lo cuentan; la tabla «Si no funciona» de
+[INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md) lo desarrolla.
 
 ## ¿Por qué `targetSdk` 28? ¿No es viejo?
 
@@ -92,6 +109,7 @@ si el cliente es antiguo, copia otra vez el comando de instalación desde la app
 
 ## ¿Cómo desinstalo todo?
 
-- Cliente: `nexo unpair && rm "$(command -v nexo)"` (o `bash install.sh --uninstall`).
+- Cliente: `nexo unpair && rm "$(command -v nexo)"` (o `bash install.sh --uninstall`, que quita también `nexo-dbus` y su arranque automático).
+- Si activaste `nexo-dbus`: `nexo setup-dbus --uninstall` (lo para y quita el arranque automático; hazlo dentro de cada distro donde lo activaste).
 - Distros: `nexo setup-guests --uninstall` (antes de borrar el cliente).
 - App: desinstálala como cualquier otra.

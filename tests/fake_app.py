@@ -23,6 +23,7 @@ import collections
 import json
 import os
 import socketserver
+import sys
 import threading
 import time
 
@@ -34,6 +35,9 @@ LOGLINES = collections.deque(maxlen=200)
 CONN_COUNT = [0]
 
 STATE = {"wifi_on": True, "ssid": "MiCasa", "bt_on": True}
+NET = {"override": None}                                  # --ctl «net cellular|ethernet|none…» fuerza el tipo de red
+NOTIF = {"access": True, "forwarding": True}              # permiso de acceso a notificaciones y el interruptor de la app
+NOTIFS = []                                               # las notificaciones activas del «móvil»
 AUDIO = {"level": 9, "min": 0, "max": 15, "muted": False, "ringer": "normal"}
 
 NETWORKS = [
@@ -52,6 +56,7 @@ PAIRED = [
     {"name": None, "address": "AA:BB:CC:DD:EE:02", "connected": False, "profiles": [], "type": "le", "class": "unknown"},
 ]
 ALIASES = {}
+BATTERY = {}   # dirección → % (las pruebas lo cambian con --ctl)
 OUTPUTS = [
     {"id": 2, "type": "speaker", "name": "Altavoz del teléfono", "address": "", "active": False},
     {"id": 7, "type": "bluetooth_a2dp", "name": "Auriculares ñandú", "address": "AA:BB:CC:DD:EE:01", "active": True},
@@ -66,6 +71,13 @@ MEDIA = {"idx": 0, "state": "playing", "pos0": 30000, "t0": time.monotonic(), "s
 TINY_JPEG = ("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
              "wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=")
 
+V13_COMMANDS = {"net.status", "notif.status", "notif.list", "notif.dismiss"}     # protocolo 1.3 (--minor3; la app real los tendrá en la beta 2)
+V13_OPENS = {"nexo_app", "notification_access"}                                 # paneles (`opens`) que solo existen desde el 1.3
+
+
+def v13():
+    """¿Habla el protocolo 1.3 (net.status, notif.*, temas net y notif)? Por defecto no: como la app real de la 0.4.0-beta1."""
+    return bool(getattr(ARGS, "minor3", False))
 NEW_COMMANDS = {"wifi.saved", "wifi.forget", "wifi.reconnect", "bt.forget", "bt.rename", "bt.info", "audio.status", "audio.volume",
                 "audio.outputs", "audio.switch", "media.status", "media.play", "media.pause", "media.playpause", "media.stop",
                 "media.next", "media.prev", "media.seek", "media.art", "logs"}
@@ -142,8 +154,26 @@ def media_status():
             "can_play": True, "can_pause": True, "can_next": True, "can_prev": True, "can_seek": True, "can_stop": True}
 
 
+def net_status():
+    t = NET["override"]
+    if t is None:
+        t = "wifi" if (STATE["wifi_on"] and STATE["ssid"] is not None) else "none"
+    if t == "none":
+        return {"available": True, "type": "none", "internet": False, "validated": False, "metered": False}
+    return {"available": True, "type": t, "internet": True, "validated": True, "metered": t == "cellular"}
+
+
+def notif_view(n):
+    return {k: n.get(k) for k in ("key", "package", "app", "title", "text", "time", "category", "ongoing", "clearable")}
+
+
+def notif_status():
+    return {"access": NOTIF["access"], "forwarding": NOTIF["forwarding"], "active": len(NOTIFS)}
+
+
 def status_for(topic):
-    return {"wifi": wifi_status, "bt": bt_status, "audio": audio_status, "media": media_status}[topic]()
+    return {"wifi": wifi_status, "bt": bt_status, "audio": audio_status, "media": media_status,
+            "net": net_status}[topic]()
 
 
 class Err(Exception):
@@ -152,8 +182,13 @@ class Err(Exception):
         self.code, self.message, self.extra = code, message, extra or {}
 
 
-def broadcast(topic):
-    line = (dumps({"event": topic, "data": status_for(topic)}) + "\n").encode()
+def wifi_changed():
+    broadcast("wifi")
+    broadcast("net")
+
+
+def broadcast(topic, data=None):
+    line = (dumps({"event": topic, "data": status_for(topic) if data is None else data}) + "\n").encode()
     for h, topics in list(SUBS):
         if topic in topics:
             try:
@@ -232,14 +267,14 @@ def audio_volume(req):
 
 def dispatch(cmd, req):
     old = ARGS.old
-    if old and cmd not in OLD_COMMANDS:
+    if (old and cmd not in OLD_COMMANDS) or (cmd in V13_COMMANDS and not v13()):
         raise Err("unknown_command", "Comando desconocido: " + cmd)
 
     if cmd == "wifi.status":
         return wifi_status()
     if cmd in ("wifi.enable", "wifi.disable"):
         STATE["wifi_on"] = cmd == "wifi.enable"
-        broadcast("wifi")
+        wifi_changed()
         return wifi_status()
     if cmd == "wifi.scan":
         if not STATE["wifi_on"]:
@@ -250,13 +285,24 @@ def dispatch(cmd, req):
             with open(ARGS.record, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ssid": req.get("ssid"), "password": req.get("password")}, ensure_ascii=False) + "\n")
         ok = req.get("ssid") != "Mala"
+        if not STATE["wifi_on"]:
+            raise Err("wifi_disabled", "El WiFi está apagado")
+        if req.get("ssid") == "SoloWpa3":
+            raise needs_user("Esta red solo usa WPA3: Android no deja a una app crearla; hazlo en los ajustes de WiFi", "wifi_panel")
         if ok:
             STATE["ssid"] = req["ssid"]
             if not any(n["ssid"] == req["ssid"] for n in SAVED):
-                SAVED.append({"network_id": 3, "ssid": req["ssid"], "security": "WPA2", "hidden": bool(req.get("hidden"))})
-            broadcast("wifi")
-        return {"requested": True, "network_id": 3, "ssid": req.get("ssid"), "connected": ok}
+                SAVED.append({"network_id": 3, "ssid": req["ssid"], "security": "WPA2" if req.get("password") else "OPEN",
+                              "hidden": bool(req.get("hidden"))})
+            wifi_changed()
+        data = {"requested": True, "network_id": 3, "ssid": req.get("ssid"), "connected": ok}
+        if not ok:
+            data["hint"] = "Android no confirmó la conexión: ¿la clave es correcta?"
+        return data
     if cmd == "wifi.disconnect":
+        if STATE["ssid"] is not None:
+            STATE["ssid"] = None
+            wifi_changed()
         return {"requested": True}
     if cmd == "wifi.saved":
         return {"networks": [dict(n, current=(n["ssid"] == STATE["ssid"] and STATE["wifi_on"])) for n in SAVED]}
@@ -270,8 +316,25 @@ def dispatch(cmd, req):
             SAVED.remove(n)
             if n["ssid"] == STATE["ssid"]:
                 STATE["ssid"] = None
-        broadcast("wifi")
+        wifi_changed()
         return {"removed": len(gone)}
+    if cmd == "net.status":
+        return net_status()
+    if cmd == "notif.status":
+        return notif_status()
+    if cmd in ("notif.list", "notif.dismiss"):
+        if not NOTIF["access"]:
+            raise needs_user("Da a Nexo el acceso a las notificaciones en los ajustes de Android", "notification_access")
+        if not NOTIF["forwarding"]:
+            raise needs_user("Activa «Reenviar notificaciones a Linux» en la app Nexo", "nexo_app")
+        if cmd == "notif.list":
+            return {"notifications": [notif_view(n) for n in NOTIFS]}
+        gone = [n for n in NOTIFS if n["key"] == req.get("key")]
+        if not gone:
+            raise Err("not_found", "No hay ninguna notificación con esa clave")
+        NOTIFS.remove(gone[0])
+        broadcast("notif", {"op": "removed", "key": gone[0]["key"], "reason": "dismissed"})
+        return {"dismissed": True}
     if cmd == "wifi.reconnect":
         if not STATE["wifi_on"]:
             raise Err("wifi_disabled", "El WiFi está apagado")
@@ -307,7 +370,7 @@ def dispatch(cmd, req):
         return {"address": dev["address"], "name": dev["name"], "alias": ALIASES.get(dev["address"], dev["name"]),
                 "type": dev["type"], "class": dev["class"], "bond_state": "bonded", "connected": dev["connected"],
                 "profiles": dev["profiles"], "uuids": ["0000110b-0000-1000-8000-00805f9b34fb"],
-                "battery": 80 if dev["connected"] else None}
+                "battery": BATTERY.get(dev["address"], 80 if dev["connected"] else None)}
 
     if cmd == "audio.status":
         return audio_status()
@@ -363,13 +426,105 @@ def dispatch(cmd, req):
     raise Err("unknown_command", "Comando desconocido: " + cmd)
 
 
+def ctl_apply(line):
+    """Órdenes de prueba (--ctl ARCHIVO): cambian el estado del «móvil» y avisan a los suscritos, como haría Android.
+       bt connect|disconnect|remove DIRECCIÓN · bt add NOMBRE DIRECCIÓN [clase] [tipo] · bt battery DIRECCIÓN N|none
+       wifi on|off · wifi connect NOMBRE · wifi disconnect · wifi add NOMBRE BSSID DBM [SEGURIDAD [MHZ]] · wifi remove NOMBRE
+       net wifi|cellular|ethernet|none|auto
+       notif post CLAVE APP TÍTULO|TEXTO · notif remove CLAVE · notif forwarding on|off · notif access on|off"""
+    w = line.split()
+    if not w:
+        return
+    if w[0] == "wifi" and len(w) >= 2:
+        if w[1] in ("on", "off"):
+            STATE["wifi_on"] = w[1] == "on"
+        elif w[1] == "connect" and len(w) >= 3:
+            STATE["ssid"] = line.split(None, 2)[2]
+        elif w[1] == "disconnect":
+            STATE["ssid"] = None
+        elif w[1] == "add" and len(w) >= 5:
+            freq = int(w[6]) if len(w) > 6 else 2437
+            sec = w[5].upper() if len(w) > 5 else "WPA2"
+            NETWORKS.append({"ssid": w[2], "bssid": w[3].lower(), "rssi": int(w[4]), "level": 2, "frequency": freq,
+                             "band": "5GHz" if freq > 3000 else "2.4GHz", "security": sec, "secured": sec != "OPEN"})
+            return
+        elif w[1] == "remove" and len(w) >= 3:
+            NETWORKS[:] = [n for n in NETWORKS if n["ssid"] != w[2]]
+            return
+        else:
+            return
+        wifi_changed()
+        return
+    if w[0] == "net" and len(w) >= 2:
+        NET["override"] = None if w[1] == "auto" else w[1]
+        broadcast("net")
+        return
+    if w[0] == "notif" and len(w) >= 2:
+        if w[1] == "post" and len(w) >= 5:
+            title, _, text = line.split(None, 4)[4].partition("|")
+            n = {"key": w[2], "package": "org.fake." + w[3].lower(), "app": w[3], "title": title, "text": text,
+                 "time": int(time.time() * 1000), "category": "msg", "ongoing": False, "clearable": True}
+            NOTIFS[:] = [x for x in NOTIFS if x["key"] != n["key"]] + [n]
+            if NOTIF["forwarding"] and NOTIF["access"]:
+                broadcast("notif", dict(notif_view(n), op="posted"))
+        elif w[1] == "remove" and len(w) >= 3:
+            gone = [x for x in NOTIFS if x["key"] == w[2]]
+            NOTIFS[:] = [x for x in NOTIFS if x["key"] != w[2]]
+            if gone and NOTIF["forwarding"] and NOTIF["access"]:
+                broadcast("notif", {"op": "removed", "key": w[2], "reason": "cancelled"})
+        elif w[1] in ("forwarding", "access") and len(w) >= 3:
+            NOTIF[w[1]] = w[2] == "on"
+        return
+    if w[0] == "bt" and len(w) >= 3:
+        addr = w[2].upper() if w[1] != "add" else (w[3].upper() if len(w) > 3 else "")
+        dev = next((d for d in PAIRED if d["address"] == addr), None)
+        if w[1] in ("connect", "disconnect") and dev:
+            dev["connected"] = w[1] == "connect"
+            if dev["connected"] and not dev["profiles"]:
+                dev["profiles"] = ["a2dp"]
+        elif w[1] == "remove" and dev:
+            PAIRED.remove(dev)
+        elif w[1] == "add" and addr and not dev:
+            PAIRED.append({"name": w[2] if w[2] != "-" else None, "address": addr, "connected": False, "profiles": [],
+                           "type": w[5] if len(w) > 5 else "classic", "class": w[4] if len(w) > 4 else "unknown"})
+        elif w[1] == "battery" and dev:
+            if w[3].lower() == "none":
+                BATTERY[addr] = None
+            else:
+                BATTERY[addr] = int(w[3])
+            addr = None
+        else:
+            return
+        broadcast("bt")
+        return
+    sys.stderr.write("ctl: orden desconocida: %s\n" % line)
+
+
+def ctl_watch(path):
+    pos = 0
+    while True:
+        time.sleep(0.1)
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                data = f.read()
+                pos += len(data)
+        except OSError:
+            continue
+        for ln in data.decode("utf-8", "replace").splitlines():
+            try:
+                ctl_apply(ln.strip())
+            except Exception as e:
+                sys.stderr.write("ctl: %r en %r\n" % (e, ln))
+
+
 def hello_data():
     if ARGS.old:
         return {"app": "nexo", "version": "0.1.0", "proto": 1, "android_sdk": 35, "target_sdk": 28, "device": "Fake Phone",
                 "wifi": True, "bluetooth": True}
-    return {"app": "nexo", "version": "0.2.0", "proto": 1, "minor": 2, "android_sdk": 35, "target_sdk": 28,
+    return {"app": "nexo", "version": "0.4.0-beta1", "proto": 1, "minor": 3 if v13() else 2, "android_sdk": 35, "target_sdk": 28,
             "device": "Fake Phone", "wifi": True, "bluetooth": True, "listener": ARGS.listener, "uptime_s": uptime(),
-            "commands": sorted((OLD_COMMANDS | NEW_COMMANDS))}
+            "commands": sorted((OLD_COMMANDS | NEW_COMMANDS) | (V13_COMMANDS if v13() else set()))}
 
 
 def bundle():
@@ -377,8 +532,9 @@ def bundle():
     def rd(*p):
         with open(os.path.join(ARGS.termux_dir, *p), encoding="utf-8", newline="") as f:
             return f.read().replace("\r\n", "\n")
-    b64 = base64.b64encode(rd("bin", "nexo").encode()).decode("ascii")
-    head = "#!/usr/bin/env bash\nNEXO_CLIENT_B64='%s'\n" % b64
+    client64 = base64.b64encode(rd("bin", "nexo").encode()).decode("ascii")
+    dbus64 = base64.b64encode(rd("bin", "nexo-dbus").encode()).decode("ascii")
+    head = "#!/usr/bin/env bash\nNEXO_CLIENT_B64='%s'\nNEXO_DBUS_B64='%s'\n" % (client64, dbus64)
     return (head + rd("install.sh")).encode()
 
 
@@ -450,12 +606,13 @@ class Handler(socketserver.StreamRequestHandler):
                         SUBS[:] = [s for s in SUBS if s[0] is not self]
                     self.send({"id": rid, "ok": True})
                 elif cmd == "subscribe":
-                    allowed = {"wifi", "bt"} if ARGS.old else {"wifi", "bt", "audio", "media"}
-                    topics = {t for t in (req.get("topics") or sorted(allowed)) if t in allowed}
+                    default = {"wifi", "bt"} if ARGS.old else {"wifi", "bt", "audio", "media"}
+                    allowed = default | {"net", "notif"} if v13() and not ARGS.old else default
+                    topics = {t for t in (req.get("topics") or sorted(default)) if t in allowed}
                     with LOCK:
                         SUBS.append((self, topics))
                     self.send({"id": rid, "ok": True, "data": {"topics": sorted(topics)}})
-                    for t in sorted(topics):
+                    for t in sorted(topics - {"notif"}):         # «notif» no tiene estado inicial: solo avisa de lo que pasa
                         self.send({"event": t, "data": status_for(t)})
                 else:
                     self.note("> " + cmd)
@@ -487,6 +644,7 @@ def main():
     ap.add_argument("--reqlog")
     ap.add_argument("--evil", action="store_true")
     ap.add_argument("--old", action="store_true")
+    ap.add_argument("--minor3", action="store_true", help="protocolo 1.3: net.status, notif.* y los temas net y notif (por defecto, 1.2 como la app real)")
     ap.add_argument("--freeze", action="store_true")
     ap.add_argument("--drop-first", type=int, default=0)
     ap.add_argument("--drop-after-hello", type=int, default=0)
@@ -495,12 +653,15 @@ def main():
     ap.add_argument("--no-listener", dest="listener", action="store_false")
     ap.add_argument("--no-session", action="store_true")
     ap.add_argument("--print-bundle-sha", action="store_true")
+    ap.add_argument("--ctl", help="archivo del que se leen órdenes de prueba (ver ctl_apply)")
     ARGS = ap.parse_args()
     if ARGS.print_bundle_sha:
         import hashlib
         print(hashlib.sha256(bundle()).hexdigest())
         return
     srv = Server(("127.0.0.1", ARGS.port), Handler)
+    if ARGS.ctl:
+        threading.Thread(target=ctl_watch, args=(ARGS.ctl,), daemon=True).start()
     if ARGS.portfile:
         with open(ARGS.portfile, "w") as f:
             f.write(str(srv.server_address[1]))

@@ -19,7 +19,7 @@ Leyenda: ✅ funciona · 🟡 funciona con un toque tuyo o con condiciones · �
 | Volumen y silencio de la música | ✅ | `audio volume` | [Audio](#audio) |
 | Cambiar la salida de audio del sistema | 🟡 | Notificación que abre el panel de volumen | [Audio](#audio) |
 | Controlar la música (play, pausa, siguiente, saltar) y ver qué suena | 🟡 | `media …`; necesita el «acceso a notificaciones» | [Música](#música-media) |
-| Que Linux vea un adaptador WiFi/Bluetooth «de verdad» | ❌ | Lo emula por D‑Bus (desde v0.3; ver [ROADMAP](ROADMAP.md)) | [Emulación](#emulación-no-hardware) |
+| Que Linux vea un adaptador WiFi/Bluetooth «de verdad» | ❌ | Lo emula por D‑Bus: la música (MPRIS) desde la v0.3; BlueZ y NetworkManager después (ver [ROADMAP](ROADMAP.md)) | [Emulación](#emulación-no-hardware) |
 | Mantener la app viva siempre | 🟡 | Servicio en primer plano + ajustes de batería + auto-recuperación | [La app se congela](#la-app-se-congela-código-12) |
 
 ---
@@ -76,7 +76,7 @@ El hotspot de siempre (compartir internet) pertenece al sistema. Nexo **no** lo 
 
 ## Música (media)
 
-- Ver qué suena y controlarlo exige el **acceso a notificaciones**. Nexo lo usa **solo** para las sesiones de medios; no lee ni guarda notificaciones (eso llegará, opcional y aparte, en la v0.6).
+- Ver qué suena y controlarlo exige el **acceso a notificaciones**. Nexo lo usa **solo** para las sesiones de medios; no lee ni guarda notificaciones (el reenvío de notificaciones al escritorio llegará en la 0.4.0‑beta2, opcional y aparte).
 - En **Android 13 o más**, si instalaste el APK a mano, el interruptor del acceso a notificaciones sale en gris hasta que pulsas Ajustes › Aplicaciones › Nexo › ⋮ › **Permitir ajustes restringidos**.
 - Solo aparece la música de apps que publican una *sesión de medios* (casi todas las de música y vídeo; algunas la crean al darle a play). Los controles dependen de lo que la app permita: `can_next`, `can_seek`… lo dicen.
 - La **posición** no se transmite en los eventos (cambiaría cada segundo): se calcula al preguntar. `media seek` funciona si la app lo admite.
@@ -85,8 +85,29 @@ El hotspot de siempre (compartir internet) pertenece al sistema. Nexo **no** lo 
 ## Emulación, no hardware
 
 Nexo **controla** el WiFi y el Bluetooth de Android; no se los **entrega** a Linux. Dentro de proot no hay controladores de kernel, `rfkill` ni `hci0`: herramientas como `iw`, `hcitool` o `iwlist` no van a ver nada, ni siquiera con `nexo-dbus`.
-Lo que sí es posible (v0.3–v0.5) es que programas que hablan D‑Bus (`playerctl`, `bluetoothctl`, `nmcli`, applets de escritorio) lean el estado del móvil porque `nexo-dbus` finge ser MPRIS, BlueZ y NetworkManager.
+Lo que sí es posible (desde la v0.3 y la 0.4.0‑beta1) es que programas que hablan D‑Bus (`playerctl`, `bluetoothctl`, `nmcli`, applets de escritorio) lean el estado del móvil porque `nexo-dbus` finge ser MPRIS, BlueZ y NetworkManager.
 Esa emulación es **fiel solo en lo que Android permite**: estado, listas, eventos y las acciones que Nexo sí puede hacer.
+
+**Lo que hay hoy (v0.3): MPRIS.** `nexo-dbus` publica la sesión de medios activa de Android como `org.mpris.MediaPlayer2.nexo` (guía: [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md)). Sus límites:
+
+- Solo existe **mientras haya música en Android** y la app tenga el acceso a notificaciones. Sin eso no hay reproductor (a propósito: un «Nexo» muerto confunde a los widgets).
+- Es **un** reproductor: la sesión de medios que Android considera activa. Si suenan dos apps a la vez, no ves las dos.
+- No se publican `LoopStatus`, `Shuffle`, `TrackList` ni `Playlists` (son opcionales en MPRIS y el protocolo de Nexo todavía no transporta esos datos); `OpenUri` responde «no soportado»; `Rate` es de solo lectura.
+- La carátula llega solo si la app que suena la incluye en su sesión (Nexo no usa internet).
+- Cada distro de proot tiene **su** bus de sesión: `nexo-dbus` tiene que estar en el mismo que tu barra o tu escritorio. Un escritorio de otra distro, o el de Termux, no ve el reproductor de esta.
+- Necesita **python3** en la distro (un solo archivo, sin librerías).
+
+**Lo que hay desde la 0.4.0‑beta1: BlueZ y NetworkManager** (en el bus del **sistema**; guía: [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md)). Sus límites:
+
+- **Bluetooth.** Salen los dispositivos **ya emparejados en Android**: Nexo no busca dispositivos nuevos (`bluetoothctl scan on` solo enciende el Bluetooth) ni empareja (`Pair` responde «no soportado»).
+  **Conectar y desconectar un dispositivo no se puede sin root**: `connect`/`disconnect` devuelven `org.nexo.Error.NeedsUserAction` y la app deja una notificación que abre los ajustes de Bluetooth del móvil.
+  La dirección del adaptador es inventada (Android no da la del móvil) y `Discoverable`, `Blocked` y el nombre del adaptador no se pueden cambiar desde aquí.
+- **WiFi.** `nmcli` ve **un** dispositivo (`wlan0`) y las redes que ve el móvil. Conectar, desconectar, escanear y olvidar redes funcionan; **las claves guardadas no se pueden leer** (`GetSecrets` va vacío),
+  no se pueden crear ni editar perfiles (`nmcli connection add/modify` → «no soportado») y no hay VPN, Ethernet, hotspot ni IP estática. La MAC de `wlan0` es inventada. Encender o apagar el WiFi y algunas conexiones piden a veces un toque en el móvil.
+  Hasta la beta 2, el estado global de la conexión (`State`, `Connectivity`) mira solo el WiFi: con datos móviles puede decir «desconectado» (`NEXO_DBUS_NM_ASSUME_ONLINE=1` lo evita).
+- Un bus del sistema de verdad **exige una política** para que un usuario normal ocupe `org.bluez` o `org.freedesktop.NetworkManager` (`nexo setup-dbus --system-policy`, con root); en proot no hay bus del sistema y se crea uno propio con `--own-bus`.
+- Si ya hay un BlueZ o un NetworkManager de verdad (o systemd los gestiona), `nexo-dbus` **no los pisa** (modo pasivo).
+- Los programas basados en `libnm` (`nmcli`, `nm-applet`, los paneles de GNOME y KDE) comprueban muchas propiedades: la emulación puede resultarles incompleta. **Está probada con `busctl` y `gdbus`, no con ellos.**
 
 ## La app se congela (código 12)
 

@@ -8,8 +8,9 @@ import java.security.MessageDigest
  * Instalar el cliente en Termux sin internet y sin importar qué Termux uses
  * (F-Droid, GitHub, Monet o cualquier fork).
  *
- * El APK lleva dentro el cliente (`bin/nexo`) y el instalador (`install.sh`). El servidor,
- * ante {"cmd":"bootstrap"}, devuelve un único script con los dos. La app también genera un
+ * El APK lleva dentro el cliente (`bin/nexo`), el reproductor MPRIS para escritorios (`bin/nexo-dbus`)
+ * y el instalador (`install.sh`). El servidor, ante {"cmd":"bootstrap"}, devuelve un único script con
+ * los tres. La app también genera un
  * comando de una línea (oneliner.tpl) que lo descarga por 127.0.0.1, COMPRUEBA su SHA-256 y
  * solo entonces lo ejecuta. Esa comprobación impide que otra app que se haya adelantado a
  * ocupar el puerto te cuele un script distinto.
@@ -34,12 +35,16 @@ object Bootstrap {
             .toString(Charsets.UTF_8)
             .replace("\r\n", "\n")
 
+    private fun b64(text: String): String =
+        Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+
     private fun build(ctx: Context): ByteArray {
-        val client = readAsset(ctx, "bin/nexo")
+        val client64 = b64(readAsset(ctx, "bin/nexo"))
+        val dbus64 = b64(readAsset(ctx, "bin/nexo-dbus"))
         val installer = readAsset(ctx, "install.sh")
-        val b64 = Base64.encodeToString(client.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         // Sin `export`: una variable de entorno no puede pasar de 128 KiB y el cliente crecerá.
-        val head = "#!/usr/bin/env bash\nNEXO_CLIENT_B64='$b64'\n"
+        // nexo-dbus (el reproductor MPRIS para escritorios) viaja igual y solo se usa si lo pides.
+        val head = "#!/usr/bin/env bash\nNEXO_CLIENT_B64='$client64'\nNEXO_DBUS_B64='$dbus64'\n"
         return (head + installer).toByteArray(Charsets.UTF_8)
     }
 

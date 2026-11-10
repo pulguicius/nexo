@@ -15,10 +15,12 @@ mkdir -p "$T/bin"
 cp "$ROOT/termux/bin/nexo" "$T/bin/nexo"
 chmod +x "$T/bin/nexo"
 NEXO=$T/bin/nexo
+CLIENT_VERSION=$(sed -n 's/^NEXO_VERSION="\(.*\)"/\1/p' "$ROOT/termux/bin/nexo")
 
 cleanup() {
-    local p
+    local p f
     for p in "${APP_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    for f in "$T"/*.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
     pkill -f "$T/bin/nexo" 2>/dev/null
     rm -rf "$T"
 }
@@ -41,6 +43,7 @@ start_app() {
     shift
     python3 "$ROOT/tests/fake_app.py" --token "$TOKEN" --portfile "$T/$name.port" "$@" >/dev/null 2>&1 &
     APP_PIDS+=($!)
+    echo $! > "$T/$name.pid"     # (start_app suele llamarse dentro de $(…): el array no sale de ahí, el archivo sí)
     for i in $(seq 50); do [ -s "$T/$name.port" ] && break; sleep 0.1; done
     cat "$T/$name.port" 2>/dev/null
 }
@@ -50,24 +53,27 @@ for need in python3 jq; do
 done
 
 echo "== Sintaxis"
-for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh"; do
+for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh"; do
     if bash -n "$f" 2>"$T/err"; then ok "bash -n $(basename "$f")"; else bad "bash -n $(basename "$f")" "$(cat "$T/err")"; fi
 done
-for f in "$ROOT"/tests/*.py; do
-    if python3 -m py_compile "$f" 2>"$T/err"; then ok "py_compile $(basename "$f")"; else bad "py_compile $(basename "$f")" "$(cat "$T/err")"; fi
+for f in "$ROOT"/tests/*.py "$ROOT/termux/bin/nexo-dbus"; do
+    if python3 -B -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$f" 2>"$T/err"; then ok "python3 compila $(basename "$f")"; else bad "python3 compila $(basename "$f")" "$(cat "$T/err")"; fi
 done
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S error "$ROOT/termux/bin/nexo" "$ROOT/termux/install.sh" >"$T/sc" 2>&1; then ok "shellcheck (solo errores)"; else bad "shellcheck" "$(head -20 "$T/sc")"; fi
 fi
 
 echo "== Contrato: la app Android, la app falsa y docs/PROTOCOLO.md dicen lo mismo"
+python3 -I "$ROOT/tests/check_contract.py" "$ROOT" >"$T/contract.out" 2>&1; CONTRACT_RC=$?
 while IFS= read -r line; do
     case $line in
         "OK "*) ok "${line#OK }" ;;
         "FALLA "*) bad "${line#FALLA }" ;;
         *) printf '        %s\n' "$line" ;;
     esac
-done < <(python3 -I "$ROOT/tests/check_contract.py" "$ROOT" 2>&1)
+done < "$T/contract.out"
+# si el comprobador se cae (no solo si una comprobación falla), eso también es un fallo
+if [ "$CONTRACT_RC" -ne 0 ] && ! grep -q '^FALLA ' "$T/contract.out"; then bad "check_contract.py terminó con código $CONTRACT_RC sin llegar al final"; fi
 
 # ---------------------------------------------------------------- app falsa
 TOKEN=$(printf 'a1b2c3d4%.0s' 1 2 3 4 5 6)
@@ -80,6 +86,15 @@ unset XDG_CONFIG_HOME XDG_CACHE_HOME PREFIX NEXO_TOKEN NEXO_CONFIG NEXO_TRANSPOR
 export NEXO_PORT=$PORT
 export NEXO_CACHE_TTL=0     # sin caché salvo en las pruebas que la quieren
 
+# Para iterar rápido: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh  (solo las pruebas de nexo-dbus)
+if [ "${NEXO_TESTS_ONLY:-}" = dbus ]; then
+    . "$ROOT/tests/dbus_tests.sh"
+    echo
+    echo "Resultado: $PASS bien, $FAIL con fallos"
+    [ "$FAIL" -eq 0 ]
+    exit
+fi
+
 echo "== Enlace y token"
 run "$NEXO" wifi status;                 rc_is "sin token falla con código 11" 11
 has "…y explica cómo enlazar" "nexo pair"
@@ -90,7 +105,7 @@ has "…y confirma que la app responde" "todo listo"
 [ "$(stat -c %a "$HOME/.config/nexo/config")" = 600 ] && ok "la configuración queda con modo 600" || bad "modo de la configuración"
 run "$NEXO" doctor;                      rc_is "doctor" 0
 has "doctor ve el enlace" "enlace     OK"
-has "doctor muestra la versión de la app" "app        0.2.0 · protocolo 1.2"
+has "doctor muestra la versión de la app" "app        0.4.0-beta1 · protocolo 1.2"
 has "doctor avisa del acceso a notificaciones" "acceso a notificaciones: sí"
 hasnt "doctor no enseña el token" "$TOKEN"
 run "$NEXO" unpair;                      rc_is "unpair" 0
@@ -391,13 +406,13 @@ NEXO_PORT=$OLD run "$NEXO" wifi status --short; eq "los comandos viejos siguen f
 NEXO_PORT=$OLD run "$NEXO" status --json; jqok "status --json con app vieja solo trae wifi y bt" 'keys == ["bt","wifi"]'
 
 echo "== Versión, configuración, registro y raw"
-run "$NEXO" version;                     eq "version" "nexo 0.2.0"
-run "$NEXO" --version;                   eq "--version" "nexo 0.2.0"
+run "$NEXO" version;                     eq "version" "nexo 0.4.0-beta1"
+run "$NEXO" --version;                   eq "--version" "nexo 0.4.0-beta1"
 run "$NEXO" version --check;             rc_is "version --check con la app nueva" 0
 has "…compatibles" "compatibles"
-has "…y enseña las dos versiones" "cliente    nexo 0.2.0"
+has "…y enseña las dos versiones" "cliente    nexo 0.4.0-beta1"
 run "$NEXO" logs;                        rc_is "logs" 0
-has "logs: lo que anotó la app" "Cliente conectado: nexo-cli/0.2.0"
+has "logs: lo que anotó la app" "Cliente conectado: nexo-cli/0.4.0-beta1"
 run "$NEXO" logs 3 --json;               jqok "logs N --json" '.count <= 3 and (.lines | type == "array")'
 run "$NEXO" logs abc;                    rc_is "logs con basura → uso (2)" 2
 LK=$(start_app leak --leak-token)
@@ -538,6 +553,9 @@ FP=$(mkfork a)
 run fenv a bash -c "$(mk_one "$PORT" "$SHA" "$TOKEN")"
 has "instala el cliente" "Cliente instalado en $FP/bin/nexo"
 has "enlaza con la app" "La app responde"
+has "…y avisa de que instaló nexo-dbus (el reproductor MPRIS)" "nexo-dbus instalado en $FP/bin/nexo-dbus"
+[ -x "$FP/bin/nexo-dbus" ] && ok "nexo-dbus queda ejecutable en \$PREFIX/bin" || bad "nexo-dbus ejecutable"
+cmp -s "$FP/bin/nexo-dbus" "$ROOT/termux/bin/nexo-dbus" && ok "…e idéntico al del repositorio" || bad "nexo-dbus instalado distinto"
 [ -x "$FP/bin/nexo" ] && ok "el cliente queda ejecutable en \$PREFIX/bin" || bad "cliente ejecutable"
 [ "$(stat -c %a "$T/a/home/.config/nexo/config")" = 600 ] && ok "config con modo 600 en \$HOME/.config/nexo" || bad "config de la instalación"
 run fenv a "$FP/bin/nexo" wifi status --short; eq "el cliente instalado funciona sin variables de entorno" "MiCasa"
@@ -548,6 +566,7 @@ if [ -s "$T/bundle.sh" ] && ! sed -n '1,3p' "$T/bundle.sh" | grep -q '^export'; 
 else
     bad "el bundle exporta NEXO_CLIENT_B64"
 fi
+[ "$(sed -n 2p "$T/bundle.sh" | cut -c1-17)" = "NEXO_CLIENT_B64='" ] && [ "$(sed -n 3p "$T/bundle.sh" | cut -c1-15)" = "NEXO_DBUS_B64='" ] && ok "…y lleva el cliente y nexo-dbus en las líneas 2 y 3" || bad "formato del bundle"
 
 FP2=$(mkfork b)
 run fenv b bash -c "$(mk_one "$PORT" "$(printf '0%.0s' $(seq 64))" "$TOKEN")"
@@ -597,9 +616,62 @@ rc_is "rekey en Termux actualiza también las distros" 0
 has "…lo cuenta" "Actualizando tus distros"
 has "…y las copia" "✔ debian"
 
+echo "== setup-guests --with-dbus (nexo-dbus dentro de las distros)"
+: > "$G/debian/usr/bin/python3"; chmod +x "$G/debian/usr/bin/python3"     # debian tiene python3; alpine no
+[ ! -e "$G/debian/usr/local/bin/nexo-dbus" ] && ok "(antes) sin --with-dbus no hay nexo-dbus en las distros" || bad "nexo-dbus apareció solo"
+run fenv a bash "$FP/bin/nexo" setup-guests --with-dbus
+rc_is "--with-dbus copia nexo-dbus a las distros" 0
+has "a debian (que tiene python3) le dice qué hacer" "Dentro de debian:  nexo setup-dbus"
+has "a alpine (sin python3) le avisa" "a alpine le falta python3"
+has "al final explica para qué sirve" "reproductor"
+[ -x "$G/debian/usr/local/bin/nexo-dbus" ] && ok "nexo-dbus queda ejecutable en usr/local/bin de la distro" || bad "nexo-dbus en la distro"
+[ "$(head -n 1 "$G/debian/usr/local/bin/nexo-dbus")" = '#!/usr/bin/env python3' ] && ok "…con el shebang normal de python3" || bad "shebang de nexo-dbus en la distro"
+cmp -s <(tail -n +2 "$G/debian/usr/local/bin/nexo-dbus") <(tail -n +2 "$ROOT/termux/bin/nexo-dbus") && ok "…y el mismo contenido que el del repositorio" || bad "contenido de nexo-dbus en la distro"
+run fenv a bash "$FP/bin/nexo" setup-guests --list
+has "--list dice qué distros llevan nexo-dbus" "✔ debian  (nexo instalado) · con nexo-dbus"
+run env -i PATH="$PATH" HOME="$T/d/home" "$G/debian/usr/local/bin/nexo-dbus" version
+eq "el nexo-dbus copiado funciona dentro de la distro" "nexo-dbus $CLIENT_VERSION"
+echo "# versión vieja" >> "$G/debian/usr/local/bin/nexo-dbus"
+run fenv a bash "$FP/bin/nexo" setup-guests debian
+cmp -s <(tail -n +2 "$G/debian/usr/local/bin/nexo-dbus") <(tail -n +2 "$ROOT/termux/bin/nexo-dbus") && ok "sin --with-dbus, una distro que ya lo tenía recibe la versión nueva" || bad "no se actualizó nexo-dbus"
+mkdir -p "$G/fedora/usr/bin"
+run fenv a bash "$FP/bin/nexo" setup-guests fedora
+[ -x "$G/fedora/usr/local/bin/nexo" ] && [ ! -e "$G/fedora/usr/local/bin/nexo-dbus" ] && ok "sin --with-dbus, una distro nueva no recibe nexo-dbus" || bad "nexo-dbus en una distro que no lo pidió"
+mkdir -p "$T/solo/bin"
+cp "$ROOT/termux/bin/nexo" "$T/solo/bin/nexo"
+run fenv a bash "$T/solo/bin/nexo" setup-guests --with-dbus
+rc_is "--with-dbus sin nexo-dbus a mano → error (1)" 1
+has "…y dice cómo conseguirlo" "No encuentro nexo-dbus en Termux"
+mkdir -p "$G/debian/root/.config/autostart" "$G/debian/home/ana/.config/systemd/user" "$G/debian/home/ana/.config/nexo"
+: > "$G/debian/root/.config/autostart/nexo-dbus.desktop"
+: > "$G/debian/home/ana/.config/systemd/user/nexo-dbus.service"
+: > "$G/debian/home/ana/.config/autostart-otro.desktop"
+run fenv a bash "$FP/bin/nexo" setup-guests --uninstall debian
+[ ! -e "$G/debian/usr/local/bin/nexo-dbus" ] && [ ! -e "$G/debian/usr/local/bin/nexo" ] && ok "--uninstall quita nexo y nexo-dbus de la distro" || bad "--uninstall dejó archivos"
+[ ! -e "$G/debian/root/.config/autostart/nexo-dbus.desktop" ] && [ ! -e "$G/debian/home/ana/.config/systemd/user/nexo-dbus.service" ] && ok "…y el arranque automático que dejó setup-dbus (root y usuarios)" || bad "--uninstall dejó el arranque automático"
+[ -e "$G/debian/home/ana/.config/autostart-otro.desktop" ] && ok "…sin tocar otros archivos de los usuarios" || bad "--uninstall borró un archivo ajeno"
+
 echo "== Desinstalar"
 run fenv a bash "$ROOT/termux/install.sh" --uninstall
 [ ! -e "$FP/bin/nexo" ] && [ ! -e "$T/a/home/.config/nexo/config" ] && ok "--uninstall quita cliente y enlace" || bad "--uninstall"
+[ ! -e "$FP/bin/nexo-dbus" ] && ok "…y nexo-dbus" || bad "--uninstall no quitó nexo-dbus"
+
+echo "== Instalador desde el repositorio (bash termux/install.sh)"
+mkdir -p "$T/ri/home"
+run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri/bin" NEXO_NO_DEPS=1 bash "$ROOT/termux/install.sh"
+rc_is "instala desde el repositorio" 0
+[ -x "$T/ri/bin/nexo" ] && [ -x "$T/ri/bin/nexo-dbus" ] && ok "…y deja nexo y nexo-dbus ejecutables" || bad "instalación desde el repositorio"
+cmp -s "$T/ri/bin/nexo-dbus" "$ROOT/termux/bin/nexo-dbus" && ok "…con el nexo-dbus del repositorio" || bad "nexo-dbus distinto"
+has "…y sugiere nexo setup-dbus" "nexo setup-dbus"
+run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri/bin" NEXO_NO_DEPS=1 bash "$ROOT/termux/install.sh" --uninstall
+[ ! -e "$T/ri/bin/nexo" ] && [ ! -e "$T/ri/bin/nexo-dbus" ] && ok "--uninstall desde el repositorio quita los dos" || bad "--uninstall desde el repositorio"
+mkdir -p "$T/ri2/src/bin"
+cp "$ROOT/termux/install.sh" "$T/ri2/src/install.sh"; cp "$ROOT/termux/bin/nexo" "$T/ri2/src/bin/nexo"
+run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri2/bin" NEXO_NO_DEPS=1 bash "$T/ri2/src/install.sh"
+[ -x "$T/ri2/bin/nexo" ] && [ ! -e "$T/ri2/bin/nexo-dbus" ] && ok "sin nexo-dbus en el origen, instala solo el cliente (y no se queja)" || bad "instalación sin nexo-dbus"
+
+# nexo-dbus (necesita dbus-daemon, busctl y gdbus; si faltan, esas pruebas se omiten con un aviso)
+. "$ROOT/tests/dbus_tests.sh"
 
 echo
 echo "Resultado: $PASS bien, $FAIL con fallos"

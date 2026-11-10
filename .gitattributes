@@ -2,6 +2,7 @@
 * text=auto eol=lf
 *.sh text eol=lf
 termux/bin/nexo text eol=lf
+termux/bin/nexo-dbus text eol=lf
 termux/oneliner.tpl text eol=lf
 *.bat text eol=crlf
 *.jar binary
