@@ -1,0 +1,2348 @@
+#!/usr/bin/env bash
+# nexo — cliente del puente Nexo (la app Android) para Termux y para distros de proot-distro.
+# Habla con la app por TCP en 127.0.0.1. Solo hace falta bash (o python3); jq es opcional
+# y da la salida con formato. No depende de qué Termux uses (F-Droid, GitHub, Monet, forks...).
+# Licencia: GPL-3.0-or-later
+
+NEXO_VERSION="0.4.0-beta2"
+CLIENT_MINOR=2          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
+export LC_ALL=C
+
+NEXO_HOST=${NEXO_HOST:-127.0.0.1}
+NEXO_PORT=${NEXO_PORT:-}
+NEXO_TOKEN=${NEXO_TOKEN:-}
+NEXO_TIMEOUT=${NEXO_TIMEOUT:-}
+NEXO_ICONS=${NEXO_ICONS:-}
+NEXO_CACHE_TTL=${NEXO_CACHE_TTL:-}
+TRANSPORT=${NEXO_TRANSPORT:-auto}   # auto | bash | python
+FMT=text
+PRETTY=0
+PASS_ARG=""
+PASS_STDIN=0
+TOKEN_STDIN=0
+CACHE_ARG=""
+CONFIG_FILE=""
+RESP=""
+ERR_CODE=1
+NEXO_RT=""
+NO_RETRY=0
+HINTED=0
+NOW=0
+SELF=""
+
+# ------------------------------------------------------------------ utilidades
+
+die() { local code=$1; shift; printf 'nexo: %s\n' "$*" >&2; exit "$code"; }
+warn() { printf 'nexo: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+have_jq() { [ "${NEXO_NO_JQ:-0}" != 1 ] && have jq; }   # NEXO_NO_JQ=1 fuerza la salida en JSON crudo
+now() { printf -v NOW '%(%s)T' -1 2>/dev/null || NOW=$(date +%s); }
+
+usage() {
+cat <<'EOF'
+nexo — controla el WiFi, el Bluetooth, el audio y la música de Android desde Termux o una distro de proot
+
+Uso: nexo [opciones] <comando> [argumentos]
+
+Estado
+  status                        Resumen de WiFi, Bluetooth, audio y música
+  wifi|bt|audio|media status    Estado de cada parte
+WiFi
+  wifi on | off | toggle        Enciende, apaga o alterna el WiFi
+  wifi scan [--rescan|--cached] Lista las redes cercanas (--cached: sin pedir un escaneo nuevo)
+  wifi connect NOMBRE [CLAVE]   Se conecta a una red (CLAVE también con --pass o --pass-stdin; --hidden si está oculta)
+  wifi disconnect | reconnect   Se desconecta de la red actual, o se vuelve a conectar
+  wifi saved                    Redes guardadas en el móvil
+  wifi forget NOMBRE            Olvida una red guardada (o: wifi forget --id N)
+Bluetooth
+  bt on | off | toggle          Enciende, apaga o alterna el Bluetooth
+  bt paired                     Dispositivos emparejados y cuáles están conectados
+  bt connect|disconnect DIR     Android lo reserva al sistema: Nexo deja una notificación para hacerlo
+  bt forget DIR                 Desempareja un dispositivo
+  bt rename DIR NOMBRE          Le pone un alias (Android 12 o más; sin NOMBRE lo quita)
+  bt info DIR                   Detalles: perfiles, tipo, batería si el dispositivo la da
+Audio (volumen de música)
+  audio volume [30|30%|+5|-5|mute|unmute|toggle]   Sin argumento muestra el volumen
+  audio outputs                 Altavoz, auriculares, USB, HDMI…
+  audio switch SALIDA           Android pide confirmarlo con un toque (SALIDA: id, tipo o parte del nombre)
+Música (hace falta darle a Nexo «acceso a notificaciones» en Android)
+  media status                  Qué suena: app, título, artista, álbum, estado
+  media play|pause|playpause|stop|next|prev
+  media seek +10s|-10s|90s|1:30 Adelanta, atrasa o va a un punto
+  media art [ARCHIVO]           Guarda la carátula y muestra dónde quedó
+Eventos
+  watch [wifi|bt|audio|media]   Cambios en vivo, un JSON por línea (--pretty para leerlos; --event para eventos sueltos)
+Escritorio (el móvil como MPRIS, BlueZ y NetworkManager: playerctl, bluetoothctl, nmcli, Waybar, Quickshell, GNOME, KDE…)
+  setup-dbus [--uninstall]      Deja nexo-dbus funcionando y con arranque automático (hace falta python3)
+                                (--no-start no lo arranca ahora, --own-bus crea los buses de D-Bus que falten,
+                                 --launcher ARCHIVO añade el arranque a un script tuyo,
+                                 --system-policy [--policy-user NOMBRE]… deja que Linux permita a ese usuario
+                                 ocupar org.bluez y NetworkManager en el bus del sistema; pide root)
+  dbus COMANDO                  Atajo a nexo-dbus: start, stop, restart, status (qué hace cada servicio), env, run…
+Archivos entre móviles (nexo-tools: no hace falta el puente; solo la misma red WiFi)
+  tools [COMANDO…]              Abre nexo-tools. Lo más usado (todo lo que sigue a «tools» es de nexo-tools):
+                                  tools send ARCHIVO…        envía SOLO eso y da un código para el otro móvil
+                                  tools fetch IP CÓDIGO      recibe lo que otro envía con «send»
+                                  tools server [--rw]        comparte una carpeta; otros móviles te encuentran
+                                  tools discover             busca móviles con Nexo en la red
+                                  tools connect IP --code C  se empareja con uno (guarda su huella)
+                                  tools browse|ls|get|put|web  explora, baja y sube; web = gestor en el navegador
+                                  tools help                 todo lo demás
+Enlace e instalación
+  pair [TOKEN] [PUERTO]         Guarda el token de la app (--token-stdin lo lee de la entrada: no queda en el historial)
+  rekey [TOKEN]                 Cambia el token tras «Token nuevo» en la app (y actualiza tus distros)
+  unpair                        Borra el enlace guardado
+  update [RUTA|ARCHIVO.zip]     Pone al día nexo, nexo-dbus y nexo-tools desde la carpeta del repositorio (o un .zip) y después
+                                tus distros; sin RUTA busca la carpeta sola (--check solo mira, --no-guests no toca las distros)
+  setup-guests [NOMBRE|RUTA...] (Termux) copia el cliente y el enlace a tus distros de proot-distro (las de
+                                containers/NOMBRE/rootfs y las de installed-rootfs); si ya había copias de nexo, las
+                                actualiza TODAS y comprueba cuál ejecuta de verdad cada distro
+                                (--list las muestra, --uninstall las limpia, --private deja el enlace solo para root,
+                                 --with-dbus y --with-tools les copian también nexo-dbus y nexo-tools, --no-verify no
+                                 ejecuta las distros para comprobarlo)
+  start                         (Termux) abre la app Nexo para despertar el puente
+  doctor [--fix]                Diagnóstico de todo el enlace (--fix intenta repararlo)
+  version [--check]             Versión del cliente (--check la compara con la app)
+  logs [N]                      Lo último que anotó la app
+  config [get|set|path|list]    Ajustes del cliente (NEXO_PORT, NEXO_TIMEOUT, NEXO_ICONS, NEXO_CACHE_TTL)
+  ping                          Comprueba que la app responde
+  raw 'JSON'                    Petición cruda (hace falta NEXO_ALLOW_RAW=1)
+
+Formatos de salida
+  --json      El campo data, en JSON
+  --short     Una línea corta
+  --env       Variables de shell:  eval "$(nexo wifi status --env)"
+  --waybar    JSON para un módulo "custom" de Waybar
+  --polybar   Texto con colores y clics para un módulo script de Polybar
+  --i3status  Un bloque JSON del protocolo i3bar (i3blocks, swaybar…)
+  --qml       JSON plano para Quickshell o cualquier QML
+  --dunst     Texto con icono para notify-send, dunst, mako, swaync
+  --tmux      Texto corto para status-right de tmux
+  --starship  Texto para un módulo custom de starship (vacío si no hay nada que mostrar)
+  --csv       CSV (en listas: wifi scan, wifi saved, bt paired, audio outputs)
+  Las barras (waybar, polybar, i3status, qml, tmux, starship) nunca fallan: si la app no responde muestran «offline».
+  Iconos Nerd Font por omisión; NEXO_ICONS=none los quita.
+
+Otras opciones
+  --host H  --port P  --timeout S  --cache S   Dónde está la app (por omisión 127.0.0.1:8765), espera máxima y vigencia de la caché
+
+Códigos de salida: 0 bien · 1 error · 2 uso · 3 hace falta un toque en el móvil
+                   10 sin conexión con la app · 11 token · 12 sin respuesta a tiempo
+EOF
+}
+
+# ------------------------------------------------------------------ configuración
+
+unquote() {
+    local s=$1
+    s=${s%$'\r'}
+    s=${s#\"}; s=${s%\"}
+    s=${s#\'}; s=${s%\'}
+    printf '%s' "$s"
+}
+
+config_dir() { printf '%s' "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/nexo"; }
+cache_dir() { printf '%s' "${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/nexo"; }
+
+config_candidates() {
+    [ -n "${NEXO_CONFIG:-}" ] && printf '%s\n' "$NEXO_CONFIG"
+    printf '%s\n' "$(config_dir)/config" "/etc/nexo/config"
+    [ -n "${PREFIX:-}" ] && printf '%s\n' "$PREFIX/etc/nexo/config"
+    return 0
+}
+
+# Lee el primer archivo de configuración que exista. Las variables de entorno mandan.
+load_config() {
+    local f k v
+    while IFS= read -r f; do
+        [ -r "$f" ] || continue
+        while IFS='=' read -r k v; do
+            case $k in
+                NEXO_PORT)      [ -n "$NEXO_PORT" ]      || NEXO_PORT=$(unquote "$v") ;;
+                NEXO_TOKEN)     [ -n "$NEXO_TOKEN" ]     || NEXO_TOKEN=$(unquote "$v") ;;
+                NEXO_TIMEOUT)   [ -n "$NEXO_TIMEOUT" ]   || NEXO_TIMEOUT=$(unquote "$v") ;;
+                NEXO_ICONS)     [ -n "$NEXO_ICONS" ]     || NEXO_ICONS=$(unquote "$v") ;;
+                NEXO_CACHE_TTL) [ -n "$NEXO_CACHE_TTL" ] || NEXO_CACHE_TTL=$(unquote "$v") ;;
+            esac
+        done < "$f"
+        CONFIG_FILE=$f
+        break
+    done < <(config_candidates)
+    [ -n "$NEXO_PORT" ] || NEXO_PORT=8765
+    case $NEXO_TIMEOUT in *[!0-9.]*) NEXO_TIMEOUT="" ;; esac
+    case $NEXO_CACHE_TTL in *[!0-9]*) NEXO_CACHE_TTL="" ;; esac
+    return 0
+}
+
+# write_config TOKEN PUERTO RUTA MODO
+write_config() {
+    local token=$1 port=$2 path=$3 mode=$4 dir tmp
+    dir=$(dirname "$path")
+    mkdir -p "$dir" 2>/dev/null || return 1
+    tmp="$path.tmp.$$"
+    ( umask 077
+      {
+        printf '# Enlace con la app Nexo. No compartas este archivo: contiene el token.\n'
+        printf 'NEXO_PORT=%s\n' "$port"
+        printf 'NEXO_TOKEN=%s\n' "$token"
+      } > "$tmp" ) || return 1
+    chmod "$mode" "$tmp" 2>/dev/null
+    mv -f "$tmp" "$path"
+}
+
+# config_put CLAVE VALOR ARCHIVO → cambia (o añade) una línea sin tocar el resto ni el modo del archivo
+config_put() {
+    local key=$1 val=$2 path=$3 tmp mode line done=0
+    mkdir -p "$(dirname "$path")" 2>/dev/null || return 1
+    tmp="$path.tmp.$$"
+    mode=$(stat -c %a "$path" 2>/dev/null || echo 600)
+    ( umask 077
+      {
+        if [ -f "$path" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                case $line in
+                    "$key="*) printf '%s=%s\n' "$key" "$val"; done=1 ;;
+                    *) printf '%s\n' "$line" ;;
+                esac
+            done < "$path"
+        fi
+        [ "$done" = 1 ] || printf '%s=%s\n' "$key" "$val"
+      } > "$tmp" ) || return 1
+    chmod "$mode" "$tmp" 2>/dev/null
+    mv -f "$tmp" "$path"
+}
+
+# ------------------------------------------------------------------ JSON
+
+jesc() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    s=${s//[$'\001'-$'\010'$'\013'$'\014'$'\016'-$'\037']/}
+    printf '%s' "$s"
+}
+
+# build CMD [clave=texto] [clave:=JSON_crudo] ...
+build() {
+    local cmd=$1 out kv k v
+    shift
+    out="{\"id\":\"$$\",\"cmd\":\"$(jesc "$cmd")\""
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        if [[ $k == *: ]]; then
+            out+=",\"$(jesc "${k%:}")\":$v"
+        else
+            out+=",\"$(jesc "$k")\":\"$(jesc "$v")\""
+        fi
+    done
+    printf '%s}' "$out"
+}
+
+resp_ok() { case $RESP in *'"ok":true'*) return 0 ;; esac; return 1; }
+
+# pad TEXTO ANCHO → TEXTO rellenado con espacios hasta ANCHO columnas.
+# Con LC_ALL=C printf cuenta bytes y las tildes/ñ descuadrarían las tablas; aquí se cuentan letras.
+pad() {
+    local s=$1 w=$2 t
+    t=${s//[$'\200'-$'\277']/}   # sin los bytes de continuación de UTF-8 queda 1 byte por letra
+    printf '%s' "$s"
+    [ "${#t}" -ge "$w" ] || printf '%*s' $((w - ${#t})) ''
+}
+
+# ------------------------------------------------------------------ transporte
+
+# ¿Este bash sabe abrir /dev/tcp? (el puerto 1 casi siempre está cerrado: si el error es
+# "Connection refused" el bash sí lo soporta; si es "No such file", no)
+devtcp_ok() {
+    local err
+    err=$( { exec 3<>/dev/tcp/127.0.0.1/1; } 2>&1 )
+    case $err in *"No such file"*|*"not supported"*|*"Invalid"*) return 1 ;; esac
+    return 0
+}
+
+hello_line() { build hello "token=$NEXO_TOKEN" "client=nexo-cli/$NEXO_VERSION"; }
+
+# rpc_bash HELLO PETICION... → imprime una respuesta por petición, en orden.
+# Salida: 10 sin conexión · 11 no se pudo escribir · 12 el hello no se contestó · 13 token malo · 15 falta una respuesta
+rpc_bash() {
+    local hello=$1
+    shift
+    (
+        { exec 3<>"/dev/tcp/$NEXO_HOST/$NEXO_PORT"; } 2>/dev/null || exit 10
+        printf '%s\n' "$hello" >&3 2>/dev/null || exit 11
+        IFS= read -r -t "$NEXO_TIMEOUT" h <&3 || exit 12
+        case $h in *'"ok":true'*) ;; *) printf '%s\n' "$h"; exit 13 ;; esac
+        for r in "$@"; do printf '%s\n' "$r" >&3 2>/dev/null || exit 11; done
+        n=$#
+        while [ "$n" -gt 0 ]; do
+            IFS= read -r -t "${NEXO_RT:-$NEXO_TIMEOUT}" resp <&3 || exit 15
+            printf '%s\n' "$resp"
+            n=$((n - 1))
+        done
+    )
+}
+
+rpc_python() {
+    python3 - "$NEXO_HOST" "$NEXO_PORT" "$NEXO_TIMEOUT" "${NEXO_RT:-$NEXO_TIMEOUT}" "$@" <<'PY'
+import socket, sys
+host, port, t1, t2, hello = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+reqs = sys.argv[6:]
+
+buf = b""
+
+def readline(s, timeout, code):
+    # Con búfer: varias respuestas pueden llegar juntas en un mismo paquete.
+    global buf
+    s.settimeout(timeout)
+    while b"\n" not in buf:
+        try:
+            chunk = s.recv(4096)
+        except OSError:
+            sys.exit(code)
+        if not chunk:
+            sys.exit(code)
+        buf += chunk
+    line, buf = buf.split(b"\n", 1)
+    return line.decode("utf-8", "replace").rstrip("\r")
+
+try:
+    s = socket.create_connection((host, port), timeout=t1)
+except OSError:
+    sys.exit(10)
+try:
+    s.sendall((hello + "\n").encode())
+    h = readline(s, t1, 12)
+    if '"ok":true' not in h:
+        print(h)
+        sys.exit(13)
+    for r in reqs:
+        s.sendall((r + "\n").encode())
+    for _ in reqs:
+        print(readline(s, t2, 15), flush=True)
+except OSError:
+    sys.exit(11)
+PY
+}
+
+# rpc_try PETICION... → RESP. Una vuelta; elige el transporte (si el bash no trae /dev/tcp usa python3).
+rpc_try() {
+    local hello rc
+    hello=$(hello_line)
+    RESP=""
+    if [ "$TRANSPORT" != python ]; then
+        RESP=$(rpc_bash "$hello" "$@"); rc=$?
+        if [ "$rc" -eq 10 ] && [ "$TRANSPORT" = auto ] && ! devtcp_ok && have python3; then
+            TRANSPORT=python
+        else
+            return "$rc"
+        fi
+    fi
+    have python3 || die 10 "Este bash no sabe abrir /dev/tcp y no hay python3. Instala uno de los dos."
+    RESP=$(rpc_python "$hello" "$@"); rc=$?
+    return "$rc"
+}
+
+# rpc PETICION... → RESP (una línea por petición). Si la app no contesta, reintenta UNA vez tras 0,5 s:
+#  · si ni el hello se contestó, nada se ejecutó y siempre es seguro repetir;
+#  · si se perdió la respuesta de un comando, solo se repite cuando es idempotente (NO_RETRY=1 lo impide).
+rpc() {
+    local rc tries=0
+    while :; do
+        rpc_try "$@"; rc=$?
+        case $rc in
+            12|11) ;;
+            15) [ "$NO_RETRY" = 1 ] && return "$rc" ;;
+            *) return "$rc" ;;
+        esac
+        tries=$((tries + 1))
+        { [ "$tries" -ge 2 ] || [ "${NEXO_RETRY:-1}" != 1 ]; } && return "$rc"
+        sleep 0.5 2>/dev/null || sleep 1
+    done
+}
+
+need_token() {
+    [ -n "$NEXO_TOKEN" ] || die 11 "No hay token. Pega en Termux el comando de instalación que copia la app Nexo, o usa: nexo pair TOKEN"
+    case $NEXO_PORT in ''|*[!0-9]*) die 2 "Puerto inválido: $NEXO_PORT" ;; esac
+}
+
+err_code() {
+    if have_jq; then printf '%s' "$RESP" | jq -r '.error // "error"' 2>/dev/null
+    else printf '%s' "$RESP" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p'; fi
+}
+
+show_error() {
+    local code msg
+    code=$(err_code)
+    if have_jq; then msg=$(printf '%s' "$RESP" | jq -r '.message // ""' 2>/dev/null)
+    else msg=$(printf '%s' "$RESP" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p'); fi
+    case $code in
+        unknown_command) msg="La app Nexo del móvil es más antigua que este cliente y no conoce ese comando. Actualiza el APK (mira: nexo version --check)." ;;
+    esac
+    printf 'nexo: %s\n' "${msg:-$code}" >&2
+    case $code in
+        needs_user_action) ERR_CODE=3 ;;
+        unauthorized)      ERR_CODE=11 ;;
+        *)                 ERR_CODE=1 ;;
+    esac
+}
+
+hint_frozen() {
+    [ "$HINTED" = 1 ] && return 0
+    HINTED=1
+    warn "Si es un Xiaomi/HyperOS (o similar), Android congela la app en segundo plano: pon la batería de Nexo en «Sin restricciones»,"
+    warn "activa su inicio automático y bloquéala en recientes. Para despertarla ahora: nexo start   (o: nexo doctor --fix)"
+}
+
+# call_try CMD [k=v ...] → RESP. Devuelve 0 si la app contestó ok:true, 1 si dijo que no,
+# y 10 / 11 / 12 si falló la conexión, el token o la respuesta. No termina el programa.
+call_try() {
+    local r rc
+    r=$(build "$@")
+    rpc "$r"; rc=$?
+    case $rc in
+        0) resp_ok; return $? ;;
+        10) return 10 ;;
+        13) return 11 ;;
+        *) return 12 ;;
+    esac
+}
+
+# call CMD [k=v ...] → RESP. Devuelve 0 si la app contestó ok:true. Los fallos de conexión terminan el programa.
+call() {
+    local rc
+    need_token
+    call_try "$@"; rc=$?
+    case $rc in
+        0|1) return "$rc" ;;
+        10) die 10 "No se puede conectar con Nexo en $NEXO_HOST:$NEXO_PORT. ¿Está encendido el puente en la app? (mira: nexo doctor)" ;;
+        11) die 11 "Nexo rechazó el token. Vuelve a copiar el comando de instalación desde la app (o usa: nexo rekey TOKEN)." ;;
+        *)  hint_frozen; die 12 "La conexión con Nexo se cortó o no respondió a tiempo." ;;
+    esac
+}
+
+# need CMD ... → como call, pero si la app dice que no, termina con el código adecuado
+need() { call "$@" || { show_error; exit "$ERR_CODE"; }; }
+
+# ------------------------------------------------------------------ caché del último estado (para barras)
+
+cache_file() { printf '%s/last.json' "$(cache_dir)"; }
+
+# cache_put TEMA  (guarda RESP)
+cache_put() {
+    have_jq || return 0
+    local f t d
+    f=$(cache_file)
+    mkdir -p "$(dirname "$f")" 2>/dev/null && chmod 700 "$(dirname "$f")" 2>/dev/null || return 0
+    d=$(printf '%s' "$RESP" | jq -c '.data' 2>/dev/null) || return 0
+    [ -n "$d" ] && [ "$d" != null ] || return 0
+    now
+    t=$f.tmp.$$
+    (
+        umask 077
+        if [ -s "$f" ] && jq -c --arg t "$1" --argjson d "$d" --argjson n "$NOW" \
+            '(if type == "object" then . else {} end) | .[$t] = {t: $n, data: $d} | del(._fail)' "$f" > "$t" 2>/dev/null; then :
+        else jq -nc --arg t "$1" --argjson d "$d" --argjson n "$NOW" '{($t): {t: $n, data: $d}}' > "$t" 2>/dev/null; fi
+    ) && mv -f "$t" "$f" 2>/dev/null || rm -f "$t"
+    return 0
+}
+
+# cache_get TEMA SEGUNDOS [stale] → RESP con el dato guardado, si tiene menos de SEGUNDOS
+cache_get() {
+    have_jq || return 1
+    local f out stale=false
+    f=$(cache_file)
+    [ -s "$f" ] || return 1
+    [ "${3:-}" = stale ] && stale=true
+    now
+    out=$(jq -c --arg t "$1" --argjson n "$NOW" --argjson ttl "${2:-0}" --argjson st "$stale" \
+        '.[$t] | select(. != null and $ttl > 0 and ($n - .t) <= $ttl) | {ok: true, data: (.data + (if $st then {stale: true} else {} end))}' "$f" 2>/dev/null) || return 1
+    [ -n "$out" ] || return 1
+    RESP=$out
+}
+
+cache_mark_fail() {
+    have_jq || return 0
+    local f t
+    f=$(cache_file)
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+    now
+    t=$f.tmp.$$
+    (
+        umask 077
+        if [ -s "$f" ] && jq -c --argjson n "$NOW" '(if type == "object" then . else {} end) | ._fail = $n' "$f" > "$t" 2>/dev/null; then :
+        else jq -nc --argjson n "$NOW" '{_fail: $n}' > "$t" 2>/dev/null; fi
+    ) && mv -f "$t" "$f" 2>/dev/null || rm -f "$t"
+    return 0
+}
+
+# ¿falló la app hace menos de 5 s? Las barras no insisten mientras tanto (si está congelada, cada intento cuesta segundos).
+cache_failing() {
+    have_jq || return 1
+    local f
+    f=$(cache_file)
+    [ -s "$f" ] || return 1
+    now
+    jq -e --argjson n "$NOW" '(._fail // 0) as $f | $f > 0 and ($n - $f) <= 5' "$f" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ salida con formato
+
+set_icons() {
+    case ${NEXO_ICONS:-nerd} in
+        none|off|0|no)
+            G_WIFI=""; G_BT=""; G_VOL=""; G_VOLLOW=""; G_MUTE=""; G_MUSIC=""; G_PLAY=""; G_PAUSE=""; G_STOP="" ;;
+        *)
+            # Font Awesome dentro de Nerd Fonts (existen en las versiones 2 y 3). Bytes UTF-8 en octal, porque LC_ALL=C.
+            G_WIFI=$'\357\207\253'; G_BT=$'\357\212\223'; G_VOL=$'\357\200\250'; G_VOLLOW=$'\357\200\247'
+            G_MUTE=$'\357\200\246'; G_MUSIC=$'\357\200\201'; G_PLAY=$'\357\201\213'; G_PAUSE=$'\357\201\214'; G_STOP=$'\357\201\215' ;;
+    esac
+}
+
+# Biblioteca de jq (compatible con jq 1.6): cada tema se convierte en un «modelo de vista» común
+# (state, short, long, tip, pct, icon, glyph, color, active) y de ahí salen todos los formatos.
+JQ_LIB='
+def dim: "#9A9FA8"; def good: "#7BD88F"; def warn: "#F4B860"; def bad: "#F28B82";
+def base($t; $g): {topic: $t, glyph: $g, pct: 0, active: false, color: dim};
+def off_vm($t; $g; $d): base($t; $g) + {state: "offline", short: "offline", wtext: "offline", long: "Nexo: sin conexión con la app",
+    tip: ($d.reason // "sin conexión con la app Nexo"), icon: "dialog-warning-symbolic", color: bad};
+def stale($d): if $d.stale == true then (.color = dim | .tip = "(último dato conocido) " + .tip) else . end;
+def with_out($d): if $d.output != null then " · " + ($d.output.name // $d.output.type) else "" end;
+
+def vm_wifi:
+  (.data // {}) as $d
+  | (if $d.offline == true then off_vm("wifi"; $gw; $d)
+     elif $d.available == false then base("wifi"; $gw) + {state: "unavailable", short: "n/d", wtext: "n/d", long: "WiFi: no disponible en este móvil", tip: "WiFi: no disponible", icon: "network-wireless-offline-symbolic"}
+     elif ($d.enabled | not) then base("wifi"; $gw) + {state: "off", short: "apagado", wtext: "off", long: "WiFi: apagado", tip: "WiFi: sin conexión", icon: "network-wireless-disabled-symbolic"}
+     elif $d.connected == true then
+       base("wifi"; $gw) + {state: "connected", short: ($d.ssid // "?"), wtext: ($d.ssid // "wifi"),
+         long: ("WiFi: conectado a " + ($d.ssid // "(red oculta: falta permiso de ubicación)")
+                + (if $d.rssi != null then " · \($d.rssi) dBm" else "" end)
+                + (if $d.band != null then " · \($d.band)" else "" end)
+                + (if $d.ip != null then " · \($d.ip)" else "" end)),
+         tip: ("WiFi: \($d.ssid // "?") · \($d.rssi // "?") dBm"),
+         pct: (if $d.level != null then $d.level * 25 else 0 end), active: true, color: good,
+         icon: ("network-wireless-signal-" + (["none", "weak", "ok", "good", "excellent"][$d.level // 0]) + "-symbolic")}
+     else base("wifi"; $gw) + {state: "disconnected", short: "sin red", wtext: "sin red", long: "WiFi: encendido, sin conexión", tip: "WiFi: sin conexión", color: warn, icon: "network-wireless-offline-symbolic"}
+     end)
+  | stale($d);
+
+def vm_bt:
+  (.data // {}) as $d
+  | (if $d.offline == true then off_vm("bt"; $gb; $d)
+     elif $d.available == false then base("bt"; $gb) + {state: "unavailable", short: "n/d", wtext: "n/d", long: "Bluetooth: no disponible en este móvil", tip: "Bluetooth: no disponible", icon: "bluetooth-disabled-symbolic"}
+     elif ($d.enabled | not) then base("bt"; $gb) + {state: "off", short: "apagado", wtext: "off", long: "Bluetooth: apagado", tip: "Bluetooth: apagado", icon: "bluetooth-disabled-symbolic"}
+     else
+       ("Bluetooth: encendido" + (if $d.connected == true then " · con dispositivos conectados" else " · sin conexiones" end)
+        + (if $d.bonded_count != null then " · \($d.bonded_count) emparejados" else "" end)) as $long
+       | if $d.connected == true then
+           base("bt"; $gb) + {state: "connected", short: "conectado", wtext: "connected", long: $long, tip: "Bluetooth: con dispositivos conectados", icon: "bluetooth-active-symbolic", color: good, active: true}
+         else
+           base("bt"; $gb) + {state: "on", short: "encendido", wtext: "on", long: $long, tip: "Bluetooth: encendido", icon: "bluetooth-symbolic"}
+         end
+     end)
+  | stale($d);
+
+def vm_audio:
+  (.data // {}) as $d
+  | (if $d.offline == true then off_vm("audio"; $gv; $d)
+     elif $d.available == false then base("audio"; $gv) + {state: "unavailable", short: "n/d", wtext: "n/d", long: "Audio: no disponible", tip: "Audio: no disponible", icon: "audio-volume-muted-symbolic"}
+     else
+       ($d.volume // 0) as $v
+       | (($d.muted == true) or $v == 0) as $mut
+       | base("audio"; (if $mut then $gm elif $v < 34 then $gl else $gv end))
+         + {state: (if $mut then "muted" else "on" end),
+            short: (if $d.muted == true then "mute" else "\($v)%" end),
+            wtext: (if $d.muted == true then "mute" else "\($v)%" end),
+            long: ((if $d.muted == true then "Volumen: silenciado (\($v)%)"
+                    else "Volumen: \($v)%" + (if $d.level != null then " (\($d.level)/\($d.max))" else "" end) end) + with_out($d)),
+            tip: ("Volumen \($v)%" + with_out($d)),
+            pct: $v, active: ($mut | not), color: (if $mut then dim else good end),
+            icon: (if $mut then "audio-volume-muted-symbolic" elif $v < 34 then "audio-volume-low-symbolic" elif $v < 67 then "audio-volume-medium-symbolic" else "audio-volume-high-symbolic" end)}
+     end)
+  | stale($d);
+
+def mlabel($d): ($d.title // "?") + (if ($d.artist // "") != "" then " — " + $d.artist else "" end);
+def vm_media:
+  (.data // {}) as $d
+  | (if $d.offline == true then off_vm("media"; $gmu; $d)
+     elif $d.listener == false then base("media"; $gmu) + {state: "nolistener", short: "sin acceso", wtext: "sin acceso", long: "Media: falta el acceso a notificaciones (abre Nexo y concédelo)", tip: "Concede a Nexo el acceso a notificaciones para ver y controlar la música", color: warn, icon: "dialog-information-symbolic"}
+     elif ($d.available != true) or $d.state == "none" then base("media"; $gmu) + {state: "none", short: "", wtext: "", long: "Media: nada en reproducción", tip: "Nada en reproducción", icon: "media-playback-stop-symbolic"}
+     else
+       mlabel($d) as $l
+       | ($d.state // "stopped") as $st
+       | base("media"; (if $st == "playing" then $gp elif $st == "paused" then $gpa elif $st == "stopped" then $gs else $gmu end))
+         + {state: $st, short: $l, wtext: $l,
+            long: (({"playing": "Reproduciendo", "paused": "En pausa", "stopped": "Detenido", "buffering": "Cargando", "error": "Error"}[$st] // $st) + ": " + $l
+                   + (if ($d.album // "") != "" then " (" + $d.album + ")" else "" end)
+                   + (if ($d.app // "") != "" then " · " + $d.app else "" end)),
+            tip: ($l + (if ($d.app // "") != "" then " · " + $d.app else "" end)),
+            pct: (if ($d.duration_ms // 0) > 0 then ((($d.position_ms // 0) * 100 / $d.duration_ms) | floor) else 0 end),
+            active: ($st == "playing"), color: (if $st == "playing" then good elif $st == "paused" then warn else dim end),
+            icon: (if $st == "playing" then "media-playback-start-symbolic" elif $st == "paused" then "media-playback-pause-symbolic" else "media-playback-stop-symbolic" end)}
+     end)
+  | stale($d);
+
+def acts($t):
+  if $t == "wifi" then [[1, "wifi reconnect"]]
+  elif $t == "bt" then [[1, "bt toggle"]]
+  elif $t == "audio" then [[1, "audio volume toggle"], [4, "audio volume +5"], [5, "audio volume -5"]]
+  elif $t == "media" then [[1, "media playpause"], [2, "media prev"], [3, "media next"]]
+  else [] end;
+def gl_: if .glyph == "" then "" else .glyph + " " end;
+def polybar:
+  .topic as $t
+  | (.short | split("%") | join("%%")) as $txt
+  | (reduce acts($t)[] as $a (""; . + "%{A\($a[0]):\($bin) \($a[1]):}")) as $open
+  | ([acts($t)[] | "%{A}"] | join("")) as $close
+  | "%{F\(.color)}" + $open + gl_ + $txt + $close + "%{F-}";
+def interesting: .state as $s | any(["connected", "on", "playing", "paused", "muted"][]; . == $s);
+
+def out($p):
+  if $p == "text" then .long
+  elif $p == "short" then .short
+  elif $p == "waybar" then ({text: .wtext, alt: .state, class: .state, percentage: .pct, tooltip: .tip} | tojson)
+  elif $p == "polybar" then (if .short == "" then "" else polybar end)
+  elif $p == "i3status" then ({name: .topic, full_text: (if .short == "" then "" else gl_ + .short end), short_text: .short, color: .color} | tojson)
+  elif $p == "qml" then ({topic: .topic, text: .short, icon: .icon, glyph: .glyph, active: .active, tooltip: .tip, state: .state, percentage: .pct} | tojson)
+  elif $p == "dunst" then (gl_ + .long)
+  elif $p == "tmux" then (if .short == "" then "" else gl_ + .short end)
+  elif $p == "starship" then (if interesting and .short != "" then gl_ + .short else "" end)
+  else .long end;
+
+def csvrow($t):
+  .data as $d
+  | if $t == "wifi" then "connected,ssid,signal,band,ip", ([$d.connected, $d.ssid, $d.rssi, $d.band, $d.ip] | @csv)
+    elif $t == "bt" then "enabled,connected,bonded", ([$d.enabled, $d.connected, $d.bonded_count] | @csv)
+    elif $t == "audio" then "volume,muted,output", ([$d.volume, $d.muted, ($d.output.name // null)] | @csv)
+    else "state,title,artist,album,app", ([$d.state, $d.title, $d.artist, $d.album, $d.app] | @csv) end;
+'
+
+JQ_ENV='.data | to_entries[] |
+  "NEXO_\($p)_\(.key | ascii_upcase)=" +
+  (.value | if type == "boolean" then (if . then "1" else "0" end)
+            elif . == null then "\"\""
+            elif type == "object" or type == "array" then (tojson | @sh)
+            else @sh end)'
+
+JQ_EVENT='if .event == "wifi" then
+    "wifi  → " + (.data | if (.enabled | not) then "apagado" elif .connected then "conectado a \(.ssid // "?")" else "sin conexión" end)
+  elif .event == "bt" then
+    "bt    → " + (.data | if (.enabled | not) then "apagado" elif .connected then "con dispositivos conectados" else "encendido" end)
+  elif .event == "audio" then
+    "audio → " + (.data | if .muted then "silenciado" else "volumen \(.volume)%" end)
+  elif .event == "media" then
+    "media → " + (.data | if .listener == false then "sin acceso a notificaciones" elif .available != true then "nada en reproducción"
+                          else "\(.state): \(.title // "?")" + (if (.artist // "") != "" then " — " + .artist else "" end) end)
+  else tostring end'
+
+# Eventos sueltos (nexo watch --event): se comparan estados sucesivos y se emite solo lo que cambió.
+JQ_SEMANTIC='
+def evs($t; $p; $c):
+  def mk($ev; $x): ({type: $t, event: $ev} + $x + (if $p == null then {initial: true} else {} end));
+  if $t == "wifi" then
+    if $c.available == false then [mk("unavailable"; {})]
+    else
+      (if $p == null or $p.enabled != $c.enabled then [mk(if $c.enabled then "enabled" else "disabled" end; {})] else [] end)
+      + (if ($c.enabled | not) then []
+         elif $p == null or $p.connected != $c.connected or ($c.connected and $p.ssid != $c.ssid) then
+           [(if $c.connected then mk("connected"; {ssid: $c.ssid, ip: $c.ip, rssi: $c.rssi, band: $c.band}) else mk("disconnected"; {ssid: ($p.ssid // null)}) end)]
+         else [] end)
+    end
+  elif $t == "bt" then
+    if $c.available == false then [mk("unavailable"; {})]
+    else
+      (if $p == null or $p.enabled != $c.enabled then [mk(if $c.enabled then "enabled" else "disabled" end; {})] else [] end)
+      + (if ($c.enabled | not) then []
+         elif $p == null or $p.connected != $c.connected then [mk(if $c.connected then "connected" else "disconnected" end; {})]
+         else [] end)
+      + (if $p != null and $c.enabled and $p.bonded_count != $c.bonded_count then [mk("bonded_changed"; {bonded: $c.bonded_count})] else [] end)
+    end
+  elif $t == "audio" then
+    (if $p == null or $p.volume != $c.volume then [mk("volume"; {volume: $c.volume, muted: $c.muted})] else [] end)
+    + (if $p == null or $p.muted != $c.muted then [mk(if $c.muted then "muted" else "unmuted" end; {})] else [] end)
+    + (if $p != null and ($p.output.id // null) != ($c.output.id // null) then [mk("output_changed"; {output: ($c.output.name // null), kind: ($c.output.type // null)})] else [] end)
+  elif $t == "media" then
+    (if $p == null or $p.listener != $c.listener then [mk(if $c.listener then "listener_on" else "listener_off" end; {})] else [] end)
+    + (if $c.available != true then
+         (if $p != null and $p.available == true then [mk("stopped"; {})] else [] end)
+       else
+         (if $p == null or $p.track_id != $c.track_id or $p.title != $c.title then [mk("track"; {title: $c.title, artist: $c.artist, album: $c.album, app: $c.app})] else [] end)
+         + (if $p == null or $p.state != $c.state then [mk("state"; {state: $c.state})] else [] end)
+       end)
+  else [mk("changed"; {data: $c})] end;
+foreach (inputs | select(.event != null)) as $e ({prev: {}, out: []};
+  .prev as $pv | ($e.event) as $t | ($pv[$t]) as $p | ($e.data) as $c
+  | {prev: ($pv + {($t): $c}), out: evs($t; $p; $c)};
+  .out[])'
+
+is_bar() { case $FMT in waybar|polybar|i3status|qml|tmux|starship) return 0 ;; esac; return 1; }
+
+topic_cmd() {
+    case $1 in
+        wifi) echo wifi.status ;;
+        bt) echo bt.status ;;
+        audio) echo audio.status ;;
+        media) echo media.status ;;
+    esac
+}
+
+# render TEMA → imprime RESP (una respuesta ok:true) con el formato elegido
+render() {
+    local topic=$1
+    if ! have_jq; then
+        printf '%s\n' "$RESP"
+        [ "${NEXO_NOHINT:-0}" = 1 ] || warn "(instala jq para ver esto con formato: pkg install jq / apt install jq)"
+        NEXO_NOHINT=1
+        return 0
+    fi
+    case $FMT in
+        json) printf '%s' "$RESP" | jq -c '.data' ;;
+        env)  printf '%s' "$RESP" | jq -r --arg p "$(printf '%s' "$topic" | tr 'a-z' 'A-Z')" "$JQ_ENV" ;;
+        csv)  printf '%s' "$RESP" | jq -r "${JQA[@]}" --arg t "$topic" "$JQ_LIB"' csvrow($t)' ;;
+        *)    printf '%s' "$RESP" | jq -r "${JQA[@]}" --arg p "$FMT" "$JQ_LIB"" vm_$topic | out(\$p)" ;;
+    esac
+}
+
+# offline TEXTO → RESP sintética para que las barras muestren «offline» en vez de fallar
+offline() { RESP='{"ok":true,"data":{"offline":true,"reason":"'$(jesc "$1")'"}}'; }
+
+# bar_topic TEMA → imprime el estado de una barra. Usa la caché, no insiste si la app está caída y nunca falla.
+bar_topic() {
+    local topic=$1 cmd ttl rc
+    ttl=${CACHE_ARG:-${NEXO_CACHE_TTL:-2}}
+    cmd=$(topic_cmd "$topic")
+    if [ -z "$NEXO_TOKEN" ]; then offline "sin token: ejecuta nexo pair"; render "$topic"; return 0; fi
+    if cache_get "$topic" "$ttl"; then render "$topic"; return 0; fi
+    if ! cache_failing; then
+        call_try "$cmd"; rc=$?
+        if [ "$rc" -eq 0 ]; then cache_put "$topic"; render "$topic"; return 0; fi
+        if [ "$rc" -eq 1 ]; then
+            if [ "$(err_code)" = unknown_command ]; then RESP='{"ok":true,"data":{"available":false}}'; render "$topic"; return 0; fi
+        else
+            cache_mark_fail
+        fi
+    fi
+    if cache_get "$topic" 900 stale; then render "$topic"; return 0; fi
+    offline "la app no responde (apagada o congelada)"
+    render "$topic"
+    return 0
+}
+
+# topic_show TEMA → estado de una parte (con barra o sin ella)
+topic_show() {
+    if is_bar; then bar_topic "$1"; return 0; fi
+    need "$(topic_cmd "$1")"
+    cache_put "$1"
+    render "$1"
+}
+
+# ------------------------------------------------------------------ comandos
+
+STATUS_TOPICS=(wifi bt audio media)
+
+cmd_status() {
+    local t i reqs=() R=() oks=() okr=() code
+    if is_bar; then
+        local parts=() line sep=$'\n' out="" p
+        case $FMT in tmux|starship|polybar) sep=' ' ;; esac
+        for t in "${STATUS_TOPICS[@]}"; do
+            line=$(bar_topic "$t")
+            [ -n "$line" ] && parts+=("$line")
+        done
+        for p in "${parts[@]}"; do out+="${out:+$sep}$p"; done
+        printf '%s\n' "$out"
+        return 0
+    fi
+    need_token
+    for t in "${STATUS_TOPICS[@]}"; do reqs+=("$(build "$(topic_cmd "$t")")"); done
+    local rc=0
+    rpc "${reqs[@]}" || rc=$?
+    case $rc in
+        0) ;;
+        10) die 10 "No se puede conectar con Nexo en $NEXO_HOST:$NEXO_PORT. ¿Está encendido el puente en la app? (mira: nexo doctor)" ;;
+        13) die 11 "Nexo rechazó el token. Vuelve a copiar el comando de instalación desde la app (o usa: nexo rekey TOKEN)." ;;
+        *)  hint_frozen; die 12 "La conexión con Nexo se cortó o no respondió a tiempo." ;;
+    esac
+    mapfile -t R <<<"$RESP"
+    for i in "${!STATUS_TOPICS[@]}"; do
+        t=${STATUS_TOPICS[$i]}
+        RESP=${R[$i]:-}
+        if resp_ok; then
+            cache_put "$t"
+            oks+=("$t"); okr+=("$RESP")
+        else
+            code=$(err_code)
+            [ "$code" = unknown_command ] && continue    # una app antigua no tiene audio ni media
+            show_error
+            exit "$ERR_CODE"
+        fi
+    done
+    if ! have_jq; then
+        printf '%s\n' "${okr[@]}"
+        warn "(instala jq para ver esto con formato: pkg install jq / apt install jq)"
+        return 0
+    fi
+    case $FMT in
+        json)
+            local out="{" sep=""
+            for i in "${!oks[@]}"; do out+="$sep\"${oks[$i]}\":$(printf '%s' "${okr[$i]}" | jq -c .data)"; sep=","; done
+            printf '%s\n' "$out}"
+            ;;
+        short)
+            local parts=() line out="" p
+            for i in "${!oks[@]}"; do
+                [ "${oks[$i]}" = media ] && continue
+                RESP=${okr[$i]}; line=$(render "${oks[$i]}")
+                [ -n "$line" ] && parts+=("$line")
+            done
+            for p in "${parts[@]}"; do out+="${out:+ · }$p"; done
+            printf '%s\n' "$out"
+            ;;
+        *)
+            for i in "${!oks[@]}"; do RESP=${okr[$i]}; render "${oks[$i]}"; done
+            ;;
+    esac
+}
+
+wifi_table() {   # imprime la tabla de redes de RESP (scan)
+    printf '%s %s  %-6s %s\n' "$(pad RED 34)" "    SEÑAL" "SEGUR." "BANDA"
+    printf '%s' "$RESP" | jq -r '.data.networks[] | [.ssid, (.rssi|tostring), .security, (.band // "")] | @tsv' |
+        while IFS=$'\t' read -r ssid rssi sec band; do
+            printf '%s %5s dBm  %-6s %s\n' "$(pad "$ssid" 34)" "$rssi" "$sec" "$band"
+        done
+}
+
+cmd_wifi() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status) topic_show wifi ;;
+        on|enable)   need wifi.enable;  cache_put wifi; render wifi ;;
+        off|disable) need wifi.disable; cache_put wifi; render wifi ;;
+        toggle)
+            need wifi.status
+            case $RESP in *'"enabled":true'*) need wifi.disable ;; *) need wifi.enable ;; esac
+            cache_put wifi; render wifi
+            ;;
+        disconnect)  need wifi.disconnect; [ "$FMT" = json ] || echo "WiFi: desconectado" ;;
+        reconnect)
+            NEXO_RT=20
+            need wifi.reconnect
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            case $RESP in
+                *'"connected":true'*) echo "WiFi: reconectado" ;;
+                *) warn "Se pidió reconectar, pero no se confirmó la conexión."; exit 3 ;;
+            esac
+            ;;
+        scan)
+            local fresh=true a
+            for a in "$@"; do
+                case $a in
+                    --cached) fresh=false ;;
+                    --rescan) fresh=true ;;
+                    *) die 2 "wifi scan: opción desconocida «$a» (--rescan, --cached)" ;;
+                esac
+            done
+            NEXO_RT=25
+            need wifi.scan "fresh:=$fresh"
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            if [ "$FMT" = csv ]; then
+                printf '%s' "$RESP" | jq -r '"ssid,signal,secure,band", (.data.networks[] | [.ssid, .rssi, .secured, .band] | @csv)'
+                return 0
+            fi
+            wifi_table
+            case $RESP in *'"fresh":false'*) [ "$fresh" = true ] && warn "Android limitó el escaneo (unos 4 cada 2 minutos): es la lista anterior." ;; esac
+            printf '%s' "$RESP" | jq -r '.data.hint // empty' | sed 's/^/nexo: /' >&2
+            ;;
+        saved)
+            need wifi.saved
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            if [ "$FMT" = csv ]; then
+                printf '%s' "$RESP" | jq -r '"ssid,security,hidden,current", (.data.networks[] | [.ssid, .security, .hidden, .current] | @csv)'
+                return 0
+            fi
+            printf '%s %-9s %s %s\n' "$(pad RED 34)" "SEGUR." "$(pad OCULTA 7)" "ACTUAL"
+            printf '%s' "$RESP" | jq -r '.data.networks[] | [.ssid, .security, (if .hidden then "sí" else "-" end), (if .current then "◀ conectada" else "" end)] | @tsv' |
+                while IFS=$'\t' read -r ssid sec hid cur; do
+                    printf '%s %-9s %s %s\n' "$(pad "$ssid" 34)" "$sec" "$(pad "$hid" 7)" "$cur"
+                done
+            ;;
+        forget)
+            local name
+            if [ "${1:-}" = --id ]; then
+                case ${2:-} in ''|*[!0-9]*) die 2 "Uso: nexo wifi forget --id NÚMERO" ;; esac
+                need wifi.forget "network_id:=$2"; name="#$2"
+            else
+                [ -n "${1:-}" ] || die 2 "Uso: nexo wifi forget NOMBRE   (o: nexo wifi forget --id N; mira los números con: nexo wifi saved --json)"
+                need wifi.forget "ssid=$1"; name="«$1»"
+            fi
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; else echo "WiFi: red $name olvidada"; fi
+            ;;
+        connect)
+            local ssid="" pass="" hidden=false
+            while [ $# -gt 0 ]; do
+                case $1 in
+                    --hidden) hidden=true ;;
+                    *) if [ -z "$ssid" ]; then ssid=$1; elif [ -z "$pass" ]; then pass=$1; fi ;;
+                esac
+                shift
+            done
+            [ -n "$ssid" ] || die 2 "Uso: nexo wifi connect NOMBRE [CLAVE] [--hidden]"
+            if [ -n "$pass" ]; then :
+            elif [ -n "$PASS_ARG" ]; then pass=$PASS_ARG
+            elif [ "$PASS_STDIN" = 1 ]; then IFS= read -r pass
+            elif [ -n "${NEXO_WIFI_PASSWORD:-}" ]; then pass=$NEXO_WIFI_PASSWORD; fi
+            NEXO_RT=40
+            local extra=()
+            [ "$hidden" = true ] && extra+=("hidden:=true")
+            if [ -n "$pass" ]; then need wifi.connect "ssid=$ssid" "password=$pass" "${extra[@]}"; else need wifi.connect "ssid=$ssid" "${extra[@]}"; fi
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; fi
+            case $RESP in
+                *'"connected":true'*) [ "$FMT" = json ] || echo "WiFi: conectado a $ssid" ;;
+                *) warn "Se pidió la conexión a «$ssid», pero no se confirmó: revisa la clave o la cobertura."; exit 3 ;;
+            esac
+            ;;
+        hotspot) die 1 "El punto de acceso no está disponible: Android solo deja a una app normal crear un hotspot local sin internet (mira docs/LIMITACIONES.md)." ;;
+        *) die 2 "wifi: subcomando desconocido «$sub» (status, on, off, toggle, scan, connect, disconnect, reconnect, saved, forget)" ;;
+    esac
+}
+
+norm_addr() {
+    local a
+    a=$(printf '%s' "${1:-}" | tr 'a-f' 'A-F')
+    [[ $a =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || die 2 "Dirección Bluetooth inválida «${1:-}» (formato AA:BB:CC:DD:EE:FF; mira: nexo bt paired)"
+    printf '%s' "$a"
+}
+
+cmd_bt() {
+    local sub=${1:-status} a
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status) topic_show bt ;;
+        on|enable)   need bt.enable;  cache_put bt; render bt ;;
+        off|disable) need bt.disable; cache_put bt; render bt ;;
+        toggle)
+            need bt.status
+            case $RESP in *'"enabled":true'*) need bt.disable ;; *) need bt.enable ;; esac
+            cache_put bt; render bt
+            ;;
+        paired|list)
+            need bt.paired
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            if [ "$FMT" = csv ]; then
+                printf '%s' "$RESP" | jq -r '"name,address,connected,profiles", (.data.devices[] | [.name, .address, .connected, (.profiles | join(";"))] | @csv)'
+                return 0
+            fi
+            printf '%s %s %-10s %s\n' "$(pad NOMBRE 26)" "$(pad DIRECCIÓN 18)" "ESTADO" "PERFILES"
+            printf '%s' "$RESP" | jq -r '.data.devices[] | [(.name // "(sin nombre)"), .address, (if .connected then "conectado" else "-" end), (.profiles | join(","))] | @tsv' |
+                while IFS=$'\t' read -r name addr st prof; do
+                    printf '%s %-18s %-10s %s\n' "$(pad "$name" 26)" "$addr" "$st" "$prof"
+                done
+            ;;
+        connect|disconnect)
+            [ -n "${1:-}" ] || die 2 "Uso: nexo bt $sub DIRECCIÓN   (por ejemplo AA:BB:CC:DD:EE:FF)"
+            need "bt.$sub" "address=$1"
+            ;;
+        forget)
+            a=$(norm_addr "${1:-}") || exit 2
+            need bt.forget "address=$a"
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; else echo "Bluetooth: $a desemparejado"; fi
+            ;;
+        rename)
+            a=$(norm_addr "${1:-}") || exit 2; shift
+            need bt.rename "address=$a" "name=$*"
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'
+            elif [ -n "$*" ]; then echo "Bluetooth: $a ahora se llama «$*»"
+            else echo "Bluetooth: $a ya no tiene alias"; fi
+            ;;
+        info)
+            a=$(norm_addr "${1:-}") || exit 2
+            need bt.info "address=$a"
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            printf '%s' "$RESP" | jq -r '.data |
+                "\(.alias // .name // "(sin nombre)")  (\(.address))",
+                (if .alias != null and .alias != .name then "  nombre     \(.name // "-")" else empty end),
+                "  tipo       \(.type) · clase \(.class)",
+                "  estado     \(.bond_state)\(if .connected then " · conectado" else "" end)",
+                "  perfiles   \(if (.profiles | length) > 0 then (.profiles | join(", ")) else "-" end)",
+                "  batería    \(if .battery != null then "\(.battery) %" else "no informada" end)",
+                "  servicios  \(.uuids | length)"'
+            ;;
+        *) die 2 "bt: subcomando desconocido «$sub» (status, on, off, toggle, paired, connect, disconnect, forget, rename, info)" ;;
+    esac
+}
+
+# Mueve el volumen. Argumento: 30, 30%, +5, -5, mute, unmute, toggle
+cmd_audio() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status) topic_show audio ;;
+        mute|unmute|toggle) cmd_audio volume "$sub" ;;
+        volume|vol)
+            if [ $# -eq 0 ]; then topic_show audio; return 0; fi
+            local arg=$1 n kv=() ui=()
+            [ "${2:-}" = --ui ] && ui=("show_ui:=true")
+            case $arg in
+                mute) kv=("mute:=true") ;;
+                unmute) kv=("mute:=false") ;;
+                toggle|togglemute) kv=('mute:="toggle"'); NO_RETRY=1 ;;
+                [+-][0-9]*) n=${arg%\%}; n=${n#+}
+                    case $n in *[!0-9-]*|-) die 2 "Volumen inválido «$arg» (ejemplos: 30, 30%, +5, -5, mute)" ;; esac
+                    kv=("delta:=$n"); NO_RETRY=1 ;;
+                [0-9]*) n=${arg%\%}
+                    case $n in *[!0-9]*) die 2 "Volumen inválido «$arg» (ejemplos: 30, 30%, +5, -5, mute)" ;; esac
+                    [ "$n" -le 100 ] || die 2 "El volumen va de 0 a 100"
+                    kv=("percent:=$n") ;;
+                *) die 2 "Volumen inválido «$arg» (ejemplos: 30, 30%, +5, -5, mute, unmute, toggle)" ;;
+            esac
+            need audio.volume "${kv[@]}" "${ui[@]}"
+            cache_put audio
+            render audio
+            ;;
+        outputs|list)
+            need audio.outputs
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            if [ "$FMT" = csv ]; then
+                printf '%s' "$RESP" | jq -r '"id,type,name,address,active", (.data.outputs[] | [.id, .type, .name, .address, .active] | @csv)'
+                return 0
+            fi
+            printf '%-4s %-16s %s %s\n' "ID" "TIPO" "$(pad NOMBRE 28)" "ACTIVA"
+            printf '%s' "$RESP" | jq -r '.data.outputs[] | [(.id|tostring), .type, (.name // "-"), (if .active then "◀ suena aquí" else "" end)] | @tsv' |
+                while IFS=$'\t' read -r id typ name act; do
+                    printf '%-4s %-16s %s %s\n' "$id" "$typ" "$(pad "$name" 28)" "$act"
+                done
+            ;;
+        switch)
+            local spec=${1:-} sel
+            [ -n "$spec" ] || die 2 "Uso: nexo audio switch SALIDA   (id, tipo —speaker, bluetooth, usb, wired, hdmi…— o parte del nombre; mira: nexo audio outputs)"
+            case $spec in
+                *[!0-9]*)
+                    case $spec in
+                        bt|bluetooth) spec=bluetooth_a2dp ;;
+                        usb) spec=usb_headset ;;
+                        wired|jack) spec=wired_headset ;;
+                    esac
+                    case $spec in
+                        speaker|earpiece|wired_headset|wired_headphones|usb_headset|usb_device|bluetooth_a2dp|bluetooth_sco|ble_headset|ble_speaker|hearing_aid|hdmi|line|dock|other)
+                            sel=("type=$spec") ;;
+                        *)
+                            have_jq || die 1 "Para elegir por nombre hace falta jq; usa el id (nexo audio outputs)"
+                            need audio.outputs
+                            local ids
+                            ids=$(printf '%s' "$RESP" | jq -r --arg q "$spec" '.data.outputs[] | select((.name // "") | ascii_downcase | contains($q | ascii_downcase)) | .id')
+                            case $(printf '%s' "$ids" | grep -c .) in
+                                0) die 1 "Ninguna salida se llama como «$spec» (mira: nexo audio outputs)" ;;
+                                1) sel=("id:=$ids") ;;
+                                *) die 2 "«$spec» coincide con varias salidas; usa el id (nexo audio outputs)" ;;
+                            esac ;;
+                    esac ;;
+                *) sel=("id:=$spec") ;;
+            esac
+            need audio.switch "${sel[@]}"
+            ;;
+        *) die 2 "audio: subcomando desconocido «$sub» (status, volume, mute, unmute, toggle, outputs, switch)" ;;
+    esac
+}
+
+# seconds_ms TEXTO → milisegundos. Acepta 90, 90s, 1500ms, 1:30
+to_ms() {
+    local t=$1 m s
+    case $t in
+        *ms) t=${t%ms}; case $t in ''|*[!0-9]*) return 1 ;; esac; printf '%s' "$t" ;;
+        *:*) m=${t%%:*}; s=${t#*:}
+            case $m$s in ''|*[!0-9]*) return 1 ;; esac
+            [ -n "$m" ] && [ -n "$s" ] || return 1
+            printf '%s' $(((10#$m * 60 + 10#$s) * 1000)) ;;
+        *) t=${t%s}; case $t in ''|*[!0-9]*) return 1 ;; esac; printf '%s' $((10#$t * 1000)) ;;
+    esac
+}
+
+cmd_media() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status) topic_show media ;;
+        play|pause|stop|playpause|toggle|next|prev|previous)
+            local c=$sub
+            case $sub in toggle) c=playpause ;; previous) c=prev ;; esac
+            case $c in playpause|next|prev) NO_RETRY=1 ;; esac
+            need "media.$c"
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'; return 0; fi
+            if have_jq; then
+                printf '%s' "$RESP" | jq -r '.data.state as $s | "Media: " + ({"playing": "reproduciendo", "paused": "en pausa", "stopped": "detenido", "buffering": "cargando"}[$s] // $s)'
+            else
+                printf '%s\n' "$RESP"
+            fi
+            ;;
+        seek)
+            local arg=${1:-} ms
+            [ -n "$arg" ] || die 2 "Uso: nexo media seek +10s | -10s | 90s | 1:30"
+            case $arg in
+                [+-]*)
+                    ms=$(to_ms "${arg#[+-]}") || die 2 "Tiempo inválido «$arg» (ejemplos: +10s, -10s, 90s, 1:30)"
+                    [ "${arg:0:1}" = - ] && ms=-$ms
+                    NO_RETRY=1
+                    need media.seek "delta_ms:=$ms" ;;
+                *)
+                    ms=$(to_ms "$arg") || die 2 "Tiempo inválido «$arg» (ejemplos: +10s, -10s, 90s, 1:30)"
+                    need media.seek "position_ms:=$ms" ;;
+            esac
+            if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'
+            elif have_jq; then printf '%s' "$RESP" | jq -r '"Media: posición \(.data.position_ms / 1000 | floor) s"'
+            else printf '%s\n' "$RESP"; fi
+            ;;
+        art)
+            have_jq || die 1 "media art necesita jq"
+            have base64 || die 1 "media art necesita base64"
+            need media.art
+            local hash path
+            hash=$(printf '%s' "$RESP" | jq -r '.data.hash' | tr -c 'A-Za-z0-9._-' '_')
+            path=${1:-$(cache_dir)/art-$hash.jpg}
+            mkdir -p "$(dirname "$path")" 2>/dev/null
+            printf '%s' "$RESP" | jq -r '.data.data' | base64 -d > "$path" 2>/dev/null || die 1 "No pude guardar la carátula en $path"
+            printf '%s\n' "$path"
+            ;;
+        *) die 2 "media: subcomando desconocido «$sub» (status, play, pause, playpause, stop, next, prev, seek, art)" ;;
+    esac
+}
+
+watch_once() {
+    local hello sub
+    hello=$(hello_line)
+    sub=$(build subscribe "topics:=$1")
+    (
+        { exec 3<>"/dev/tcp/$NEXO_HOST/$NEXO_PORT"; } 2>/dev/null || exit 10
+        printf '%s\n' "$hello" >&3 || exit 11
+        IFS= read -r -t "$NEXO_TIMEOUT" line <&3 || exit 12
+        case $line in *'"ok":true'*) ;; *) printf '%s\n' "$line" >&2; exit 13 ;; esac
+        printf '%s\n' "$sub" >&3 || exit 11
+        IFS= read -r -t "$NEXO_TIMEOUT" line <&3 || exit 12
+        case $line in
+            *'"ok":true'*) ;;
+            *) printf '%s\n' "$line" >&2; exit 14 ;;
+        esac
+        # ¿Se quedó algún tema fuera? (una app antigua solo conoce wifi y bt)
+        for t in wifi bt audio media; do
+            case $1 in *"\"$t\""*) case $line in *"\"$t\""*) ;; *) printf 'nexo: esta app no ofrece eventos de «%s» (¿APK antiguo? mira: nexo version --check)\n' "$t" >&2 ;; esac ;; esac
+        done
+        while :; do
+            if IFS= read -r -t 30 line <&3; then
+                case $line in *'"id":"ka"'*) continue ;; esac
+                printf '%s\n' "$line"
+            else
+                rc=$?
+                if [ "$rc" -gt 128 ]; then
+                    printf '%s\n' '{"id":"ka","cmd":"ping"}' >&3 || exit 11
+                else
+                    exit 12
+                fi
+            fi
+        done
+    )
+}
+
+# Reconecta solo, con espera creciente (1, 2, 4, 8, 16 y 30 s). Si la conexión duró bastante, vuelve a empezar desde 1 s.
+watch_loop() {
+    local topics=$1 rc wait=1 t0
+    while :; do
+        t0=$SECONDS
+        watch_once "$topics"; rc=$?
+        [ "$rc" -eq 13 ] && die 11 "Nexo rechazó el token."
+        [ "$rc" -eq 14 ] && die 1 "La app no aceptó la suscripción."
+        [ $((SECONDS - t0)) -ge 20 ] && wait=1
+        warn "Sin conexión con Nexo (código $rc); reintento en $wait s…"
+        sleep "$wait"
+        wait=$((wait * 2))
+        [ "$wait" -le 30 ] || wait=30
+    done
+}
+
+cmd_watch() {
+    local topics=() ev=0 a list="" sep=""
+    for a in "$@"; do
+        case $a in
+            wifi|bt|audio|media) topics+=("$a") ;;
+            --event|--events) ev=1 ;;
+            *) die 2 "watch: argumento desconocido «$a» (wifi, bt, audio, media, --event, --pretty)" ;;
+        esac
+    done
+    [ "${#topics[@]}" -gt 0 ] || topics=(wifi bt audio media)
+    for a in "${topics[@]}"; do list+="$sep\"$a\""; sep=","; done
+    need_token
+    [ "$TRANSPORT" = python ] && die 2 "watch necesita un bash con /dev/tcp"
+    if [ "$ev" = 1 ]; then
+        have_jq || die 1 "watch --event necesita jq"
+        watch_loop "[$list]" | jq --unbuffered -c -n "$JQ_SEMANTIC"
+    elif [ "$PRETTY" = 1 ] && have_jq; then
+        watch_loop "[$list]" | jq --unbuffered -r "$JQ_EVENT"
+    else
+        watch_loop "[$list]"
+    fi
+}
+
+cmd_ping() {
+    need ping
+    [ "$FMT" = json ] && have_jq && { printf '%s' "$RESP" | jq -c .data; return 0; }
+    echo "Nexo responde en $NEXO_HOST:$NEXO_PORT"
+}
+
+cmd_raw() {
+    [ "${NEXO_ALLOW_RAW:-0}" = 1 ] || die 2 "raw está desactivado a propósito (puede mandar cualquier comando, incluso claves de WiFi). Para usarlo: NEXO_ALLOW_RAW=1 nexo raw '{\"cmd\":\"wifi.status\"}'"
+    [ -n "${1:-}" ] || die 2 "Uso: NEXO_ALLOW_RAW=1 nexo raw '{\"cmd\":\"wifi.status\"}'"
+    need_token
+    NO_RETRY=1
+    rpc "$1"; local rc=$?
+    [ "$rc" -eq 0 ] || die 12 "Sin respuesta de Nexo (código $rc)."
+    printf '%s\n' "$RESP"
+}
+
+# Se quita todo lo que parezca un token antes de enseñar algo que venga de la app (por si acaso).
+scrub() {
+    local s
+    s=$(sed -E 's/[0-9a-fA-F]{40,}/<token>/g')
+    [ -n "$NEXO_TOKEN" ] && s=${s//"$NEXO_TOKEN"/<token>}
+    printf '%s\n' "$s"
+}
+
+cmd_logs() {
+    local n=${1:-50}
+    case $n in ''|*[!0-9]*) die 2 "Uso: nexo logs [N]" ;; esac
+    need logs "n:=$n"
+    if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data' | scrub; return 0; fi
+    if have_jq; then
+        printf '%s' "$RESP" | jq -r '.data.lines[]' | scrub
+    else
+        printf '%s\n' "$RESP" | scrub
+    fi
+}
+
+cmd_pair() {
+    local token="" port="" rc a args=()
+    for a in "$@"; do args+=("$a"); done
+    if [ "$TOKEN_STDIN" = 1 ]; then
+        IFS= read -r token || true
+        token=${token%$'\r'}
+        port=${args[0]:-}
+    else
+        token=${args[0]:-}
+        port=${args[1]:-}
+    fi
+    [ -n "$port" ] || port=$NEXO_PORT
+    if [ -z "$token" ] && [ -t 0 ] && [ "$TOKEN_STDIN" = 0 ]; then
+        printf 'Token de la app (no se verá al escribirlo): ' >&2
+        IFS= read -rs token; echo >&2
+    fi
+    [ -n "$token" ] || die 2 "Uso: nexo pair TOKEN [PUERTO]    (o: printf '%s' TOKEN | nexo pair --token-stdin)"
+    case $token in *[!0-9a-fA-F]*) die 2 "El token solo lleva dígitos y letras a-f: cópialo tal cual desde la app." ;; esac
+    case $port in ''|*[!0-9]*) die 2 "Puerto inválido: $port" ;; esac
+    NEXO_TOKEN=$token; NEXO_PORT=$port
+    rpc "$(build ping)"; rc=$?
+    case $rc in
+        0) ;;
+        13) die 11 "La app rechazó ese token. Cópialo de nuevo desde la app Nexo." ;;
+        10) warn "No hay nadie escuchando en $NEXO_HOST:$port (¿puente apagado?). Guardo el enlace igualmente." ;;
+        *)  warn "La app no respondió bien (código $rc). Guardo el enlace igualmente." ;;
+    esac
+    write_config "$token" "$port" "$(config_dir)/config" 600 || die 1 "No pude escribir $(config_dir)/config"
+    echo "Enlace guardado en $(config_dir)/config"
+    [ "$rc" -eq 0 ] && echo "Nexo responde: todo listo."
+    return 0
+}
+
+cmd_unpair() {
+    rm -f "$(config_dir)/config" && echo "Enlace borrado de $(config_dir)"
+}
+
+# rekey: tras «Token nuevo» en la app. Guarda el token nuevo (solo si la app lo acepta) y actualiza las distros de proot.
+cmd_rekey() {
+    cmd_pair "$@" || return $?
+    if [ -n "${PREFIX:-}" ] && [ -n "$(guests_find)" ]; then
+        echo "Actualizando tus distros de proot…"
+        ( cmd_setup_guests --no-verify ) || true
+    fi
+}
+
+# ------------------------------------------------------------------ distros de proot-distro
+# proot-distro 4.x guarda cada distro en  $PREFIX/var/lib/proot-distro/installed-rootfs/NOMBRE
+# proot-distro 5.x la guarda en           $PREFIX/var/lib/proot-distro/containers/NOMBRE/rootfs
+# (y mueve sola la carpeta vieja la primera vez que haces «login»). Se reconocen las dos.
+# NEXO_GUESTS_DIR (una carpeta con una distro por subcarpeta) y NEXO_GUESTS_BASE (la que contiene «containers» e
+# «installed-rootfs») sirven para instalaciones raras y para las pruebas.
+
+guests_base() { printf '%s' "${NEXO_GUESTS_BASE:-${PREFIX:-}/var/lib/proot-distro}"; }
+
+# Una línea «NOMBRE<TAB>RUTA» por distro; RUTA es la raíz del sistema de archivos de la distro.
+guests_find() {
+    local base d n seen=$'\n'
+    if [ -n "${NEXO_GUESTS_DIR:-}" ]; then
+        for d in "$NEXO_GUESTS_DIR"/*/; do [ -d "$d" ] && printf '%s\t%s\n' "$(basename "$d")" "${d%/}"; done
+        return 0
+    fi
+    base=$(guests_base)
+    for d in "$base"/containers/*/; do
+        [ -d "${d}rootfs" ] || continue
+        n=$(basename "$d"); seen+="$n"$'\n'
+        printf '%s\t%s\n' "$n" "${d}rootfs"
+    done
+    for d in "$base"/installed-rootfs/*/; do
+        [ -d "$d" ] || continue
+        n=$(basename "$d")
+        case $seen in *$'\n'"$n"$'\n'*) continue ;; esac      # si hay una igual en containers/, esa es la que usa «proot-distro login»
+        printf '%s\t%s\n' "$n" "${d%/}"
+    done
+    return 0
+}
+
+# «ubuntu» (el nombre), la raíz de una distro o su carpeta de containers/ → «NOMBRE<TAB>RUTA». Falla si no existe.
+guest_resolve() {
+    local a=${1%/} name path
+    while IFS=$'\t' read -r name path; do
+        if [ "$name" = "$a" ]; then printf '%s\t%s\n' "$name" "$path"; return 0; fi
+    done < <(guests_find)
+    case $a in
+        */*)
+            [ -d "$a" ] || return 1
+            if [ ! -d "$a/usr" ] && [ -d "$a/rootfs/usr" ]; then a=$a/rootfs; fi
+            name=$(basename "$a")
+            [ "$name" = rootfs ] && name=$(basename "$(dirname "$a")")
+            printf '%s\t%s\n' "$name" "$a"
+            return 0 ;;
+    esac
+    return 1
+}
+
+# ¿hay un programa en esa distro? (sirve tanto con enlaces relativos como absolutos)
+guest_has() { [ -e "$1/usr/bin/$2" ] || [ -L "$1/usr/bin/$2" ] || [ -e "$1/bin/$2" ] || [ -L "$1/bin/$2" ]; }
+
+# Dónde está nexo-dbus / nexo-tools: en el PATH o junto a este cliente.
+find_sibling_bin() {
+    local p d
+    p=$(command -v "$1" 2>/dev/null) && [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+    d=$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")
+    [ -f "$d/$1" ] && { printf '%s' "$d/$1"; return 0; }
+    return 1
+}
+find_dbus_bin() { find_sibling_bin nexo-dbus; }
+find_tools_bin() { find_sibling_bin nexo-tools; }
+
+# Cómo reconocer cada programa de Nexo, de qué lenguaje es y cuál es su «versión»
+prog_marker()  { case $1 in nexo) printf '^NEXO_VERSION=' ;; nexo-dbus) printf '^VERSION = ' ;; nexo-tools) printf '^NEXO_TOOLS_VERSION=' ;; esac; }
+prog_kind()    { case $1 in nexo) printf nexo ;; nexo-dbus) printf dbus ;; nexo-tools) printf tools ;; esac; }
+prog_shebang() { case $1 in nexo-dbus) printf '#!/usr/bin/env python3' ;; *) printf '#!/usr/bin/env bash' ;; esac; }
+
+# La versión que declara un archivo de Nexo (kind: nexo, dbus o tools); vacío si no la encuentra.
+copy_version() {
+    case $2 in
+        nexo)  sed -n 's/^NEXO_VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
+        dbus)  sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
+        tools) sed -n 's/^NEXO_TOOLS_VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
+    esac
+}
+
+# Si F es un enlace simbólico, el archivo real al que lleva DENTRO de la distro R (un enlace absoluto apunta a la raíz de
+# la distro, no a la de Termux). Si no es un enlace, F. No imprime nada si el enlace está roto.
+guest_real() {
+    local r=$1 f=$2 t i=0
+    while [ -L "$f" ] && [ "$i" -lt 8 ]; do
+        t=$(readlink "$f") || return 1
+        case $t in /*) f=$r$t ;; *) f=$(dirname "$f")/$t ;; esac
+        i=$((i + 1))
+    done
+    [ -f "$f" ] && printf '%s' "$f"
+}
+
+# Las copias de un programa de Nexo que hay en la distro R, sin repetir (una ruta real por línea). Mira donde puede
+# ganar el PATH de la distro: /usr/local/bin, /usr/bin, /bin y el ~/.local/bin de root y de cada usuario. Lo que no es
+# de Nexo (no lleva su marca) se ignora: no se toca. Un enlace roto con ese nombre sí se cuenta: estorba.
+guest_copies() {
+    local r=$1 prog=$2 marker d f real seen=$'\n'
+    marker=$(prog_marker "$prog")
+    for d in "$r/usr/local/bin" "$r/usr/bin" "$r/bin" "$r/root/.local/bin" "$r"/home/*/.local/bin; do
+        [ "$d" = "$r/bin" ] && [ -L "$r/bin" ] && continue      # /bin → usr/bin: es la misma carpeta
+        f=$d/$prog
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        if ! real=$(guest_real "$r" "$f"); then printf '%s\n' "$f"; continue; fi
+        case $seen in *$'\n'"$real"$'\n'*) continue ;; esac
+        seen+="$real"$'\n'
+        if grep -q -m1 "$marker" "$real" 2>/dev/null; then printf '%s\n' "$real"; fi
+    done
+    return 0
+}
+
+# guest_put ORIGEN DESTINO SHEBANG → copia ORIGEN a DESTINO (atómico) cambiando su primera línea por SHEBANG
+guest_put() {
+    local src=$1 dst=$2 sb=$3 tmp
+    tmp=$dst.tmp.$$
+    { printf '%s\n' "$sb"; tail -n +2 "$src"; } > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+}
+
+# ¿Qué «nexo» ejecuta de verdad la distro? Se lo pregunta a ella (con su PATH): es la única forma de estar seguro.
+guest_verify() {
+    local name=$1 out rc p v t=""
+    if ! have proot-distro; then VERIFY_SKIPPED=1; return 0; fi
+    have timeout && t="timeout 120"
+    out=$($t proot-distro login "$name" -- sh -lc 'p=$(command -v nexo) || exit 3; printf "%s\n" "$p"; "$p" version' 2>/dev/null); rc=$?
+    p=$(printf '%s\n' "$out" | tail -n 2 | head -n 1)
+    v=$(printf '%s\n' "$out" | tail -n 1)
+    case $rc in
+        0) ;;
+        3) echo "   ⚠ dentro de $name el comando «nexo» no se encuentra en su PATH: úsalo como /usr/local/bin/nexo"; return 0 ;;
+        *) echo "   • no pude comprobar qué copia ejecuta $name («proot-distro login» falló, código $rc)"; return 0 ;;
+    esac
+    if [ "$v" = "nexo $NEXO_VERSION" ]; then
+        echo "   ✔ comprobado: dentro de $name, «nexo» es $p ($v)"
+    else
+        echo "   ⚠ dentro de $name se ejecuta $p y dice «$v», no «nexo $NEXO_VERSION»: otra copia gana en su PATH."
+        echo "     Búscala con:  proot-distro login $name -- sh -lc 'type -a nexo'"
+    fi
+}
+
+# Pone en la distro el cliente (y nexo-dbus / nexo-tools si los pediste o ya estaban) y el enlace con la app.
+# Si ya hay copias de «nexo» (en /usr/local/bin, /usr/bin, ~/.local/bin…) actualiza TODAS: la que ejecuta la distro
+# depende de su PATH y, si solo se actualizara una, otra podría seguir ganando con la versión vieja.
+# Si no hay ninguna, lo instala en /usr/local/bin.
+install_in_guest() {
+    local name=$1 r=${2%/} spec prog src want copies f old new h cf
+    if [ ! -d "$r/usr" ] && [ ! -d "$r/bin" ]; then warn "$name: $r no parece la raíz de una distro"; return 1; fi
+    mkdir -p "$r/usr/local/bin" "$r/etc/nexo" 2>/dev/null || { warn "$name: no pude escribir en $r"; return 1; }
+    echo "✔ $name"
+    for spec in "nexo|$SELF|1" "nexo-dbus|${DBUS_SRC:-}|$WITH_DBUS" "nexo-tools|${TOOLS_SRC:-}|$WITH_TOOLS"; do
+        IFS='|' read -r prog src want <<<"$spec"
+        [ -n "$src" ] || continue
+        copies=()
+        while IFS= read -r f; do [ -n "$f" ] && copies+=("$f"); done < <(guest_copies "$r" "$prog")
+        if [ "${#copies[@]}" -eq 0 ]; then
+            [ "$want" = 1 ] || continue                     # nexo-dbus y nexo-tools solo si los pides (o si esa distro ya los tenía)
+            copies=("$r/usr/local/bin/$prog")
+        fi
+        for f in "${copies[@]}"; do
+            old=$(copy_version "$f" "$(prog_kind "$prog")")
+            guest_put "$src" "$f" "$(prog_shebang "$prog")" || { warn "$name: no pude copiar $prog a ${f#"$r"}"; return 1; }
+            new=$(copy_version "$f" "$(prog_kind "$prog")")
+            if [ -n "$old" ] && [ "$old" != "$new" ]; then echo "   ↳ ${f#"$r"}: $old → $new"; fi
+        done
+        if [ "${#copies[@]}" -gt 1 ]; then
+            echo "   ↳ había ${#copies[@]} copias de $prog (${copies[*]/#"$r"/}): las actualicé todas"
+        fi
+        case $prog in
+            nexo-dbus)
+                ANY_DBUS=1
+                if guest_has "$r" python3; then
+                    echo "   ↳ nexo-dbus copiado. Dentro de $name:  nexo setup-dbus"
+                else
+                    echo "   ↳ nexo-dbus copiado, pero a $name le falta python3 (nexo setup-dbus lo instala si puede)"
+                fi ;;
+            nexo-tools)
+                if guest_has "$r" python3 && guest_has "$r" openssl; then
+                    echo "   ↳ nexo-tools copiado. Dentro de $name:  nexo tools"
+                else
+                    echo "   ↳ nexo-tools copiado, pero a $name le falta python3 u openssl (en Debian/Ubuntu: apt install python3 openssl)"
+                fi ;;
+        esac
+    done
+    write_config "$NEXO_TOKEN" "$NEXO_PORT" "$r/etc/nexo/config" "$GUEST_MODE" || { warn "$name: no pude escribir la configuración"; return 1; }
+    # Un «nexo pair» hecho DENTRO de la distro deja su propio enlace en ~/.config/nexo, y ese gana al de /etc/nexo:
+    # si se quedó con el token viejo, el cliente de esa distro seguiría fallando (código 11) después de un «rekey».
+    for h in "$r/root" "$r"/home/*; do
+        cf=$h/.config/nexo/config
+        [ -f "$cf" ] && grep -q '^NEXO_TOKEN=' "$cf" 2>/dev/null || continue
+        grep -q "^NEXO_TOKEN=$NEXO_TOKEN\$" "$cf" && continue
+        config_put NEXO_TOKEN "$NEXO_TOKEN" "$cf" && echo "   ↳ también puse el token nuevo en el enlace propio de ${h#"$r"} (~/.config/nexo/config)"
+    done
+    if [ ! -e "$r/usr/bin/bash" ] && [ ! -L "$r/usr/bin/bash" ] && [ ! -e "$r/bin/bash" ] && [ ! -L "$r/bin/bash" ]; then
+        echo "   ↳ a $name le falta bash (en Alpine: apk add bash)"
+    fi
+    if [ ! -e "$r/usr/bin/jq" ] && [ ! -L "$r/usr/bin/jq" ] && [ ! -e "$r/bin/jq" ]; then
+        echo "   ↳ opcional: instala jq dentro de $name para ver la salida con formato"
+    fi
+    [ "$VERIFY" = 1 ] && guest_verify "$name"
+    return 0
+}
+
+uninstall_in_guest() {
+    local name=$1 r=${2%/} h f prog
+    for prog in nexo nexo-dbus nexo-tools; do
+        while IFS= read -r f; do [ -n "$f" ] && rm -f "$f"; done < <(guest_copies "$r" "$prog")
+    done
+    rm -f "$r/etc/nexo/config"
+    rmdir "$r/etc/nexo" 2>/dev/null
+    for h in "$r/root" "$r"/home/*; do
+        [ -d "$h" ] || continue
+        # el enlace propio que dejó un «nexo pair» hecho dentro de la distro (lleva el token)
+        [ -f "$h/.config/nexo/config" ] && grep -q '^NEXO_TOKEN=' "$h/.config/nexo/config" 2>/dev/null && rm -f "$h/.config/nexo/config"
+        # el arranque automático de nexo-dbus que dejó «nexo setup-dbus» (root y usuarios de esa distro)
+        rm -f "$h/.config/autostart/nexo-dbus.desktop" "$h/.config/systemd/user/nexo-dbus.service" \
+              "$h/.config/systemd/user/default.target.wants/nexo-dbus.service"
+    done
+    echo "✔ $name limpio"
+}
+
+cmd_setup_guests() {
+    [ -n "${PREFIX:-}" ] || die 2 "setup-guests se ejecuta desde Termux, no dentro de una distro."
+    local op=install entries=() list=() a e name path f v extra copies mark stale
+    GUEST_MODE=644; WITH_DBUS=0; WITH_TOOLS=0; VERIFY=1; VERIFY_SKIPPED=0; ANY_DBUS=0
+    DBUS_SRC=""; TOOLS_SRC=""
+    for a in "$@"; do
+        case $a in
+            --list) op=list ;;
+            --uninstall) op=uninstall ;;
+            --private) GUEST_MODE=600 ;;
+            --with-dbus) WITH_DBUS=1 ;;
+            --with-tools) WITH_TOOLS=1 ;;
+            --no-verify) VERIFY=0 ;;
+            -*) die 2 "setup-guests: opción desconocida «$a» (--list, --uninstall, --private, --with-dbus, --with-tools, --no-verify)" ;;
+            *) list+=("$a") ;;
+        esac
+    done
+    if [ "${#list[@]}" -gt 0 ]; then
+        for a in "${list[@]}"; do
+            e=$(guest_resolve "$a") || die 1 "No encuentro la distro «$a». Las que hay:  nexo setup-guests --list"
+            entries+=("$e")
+        done
+    else
+        while IFS= read -r e; do [ -n "$e" ] && entries+=("$e"); done < <(guests_find)
+    fi
+    [ "${#entries[@]}" -gt 0 ] || die 1 "No encontré distros de proot-distro en $(guests_base) (¿hay alguna instalada? «proot-distro list»)"
+
+    if [ "$op" = list ]; then
+        for e in "${entries[@]}"; do
+            name=${e%%$'\t'*}; path=${e#*$'\t'}
+            copies=()
+            while IFS= read -r f; do [ -n "$f" ] && copies+=("$f"); done < <(guest_copies "$path" nexo)
+            if [ "${#copies[@]}" -eq 0 ]; then echo "- $name  (sin nexo)"; continue; fi
+            extra=""
+            [ -n "$(guest_copies "$path" nexo-dbus)" ] && extra+=" · con nexo-dbus"
+            [ -n "$(guest_copies "$path" nexo-tools)" ] && extra+=" · con nexo-tools"
+            echo "✔ $name  (nexo instalado)$extra"
+            stale=0
+            for f in "${copies[@]}"; do
+                v=$(copy_version "$f" nexo); mark=""
+                if [ "$v" != "$NEXO_VERSION" ]; then mark="   ⚠ el de Termux es el $NEXO_VERSION"; stale=1; fi
+                printf '     %s  %s%s\n' "${f#"$path"}" "${v:-?}" "$mark"
+            done
+            if [ "${#copies[@]}" -gt 1 ] && [ "$stale" = 1 ]; then
+                echo "     ⚠ hay ${#copies[@]} copias de nexo y no son iguales: «nexo setup-guests» las deja todas iguales"
+            fi
+        done
+        return 0
+    fi
+    if [ "$op" = uninstall ]; then
+        for e in "${entries[@]}"; do uninstall_in_guest "${e%%$'\t'*}" "${e#*$'\t'}"; done
+        return 0
+    fi
+    [ -n "$NEXO_TOKEN" ] || die 11 "Primero enlaza Termux con la app (pega el comando de instalación)."
+    SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    DBUS_SRC=$(find_dbus_bin) || DBUS_SRC=""
+    TOOLS_SRC=$(find_tools_bin) || TOOLS_SRC=""
+    if [ "$WITH_DBUS" = 1 ] && [ -z "$DBUS_SRC" ]; then
+        die 1 "No encuentro nexo-dbus en Termux. Vuelve a instalar el cliente con el comando de la app (trae los tres archivos) y repite."
+    fi
+    if [ "$WITH_TOOLS" = 1 ] && [ -z "$TOOLS_SRC" ]; then
+        die 1 "No encuentro nexo-tools en Termux. Vuelve a instalar el cliente con el comando de la app (trae los tres archivos) y repite."
+    fi
+    for e in "${entries[@]}"; do install_in_guest "${e%%$'\t'*}" "${e#*$'\t'}"; done
+    echo "Dentro de cada distro, el comando es: nexo status"
+    if [ "$WITH_DBUS" = 1 ]; then
+        echo "Para ver la música del móvil como reproductor (playerctl, Waybar, Quickshell…), dentro de la distro:  nexo setup-dbus"
+    fi
+    if [ "$ANY_DBUS" = 1 ]; then
+        echo "Si nexo-dbus ya estaba en marcha dentro de una distro, reinícialo allí para que use la versión nueva:  nexo dbus restart"
+    fi
+    if [ "$VERIFY" = 1 ] && [ "$VERIFY_SKIPPED" = 1 ]; then
+        echo "• No comprobé qué copia de nexo ejecuta cada distro: no encuentro proot-distro en el PATH."
+    fi
+    [ "$GUEST_MODE" = 600 ] && echo "El enlace quedó en modo 600: solo root dentro de la distro puede leerlo."
+    return 0
+}
+
+# ------------------------------------------------------------------ nexo update
+# Dónde hay, en este equipo, copias de un programa de Nexo: en el PATH y junto a este cliente (rutas reales, sin repetir).
+local_copies() {
+    local prog=$1 marker d f real seen=$'\n' dirs=()
+    marker=$(prog_marker "$prog")
+    IFS=: read -ra dirs <<<"${PATH:-}"
+    dirs+=("$(dirname "$SELF")")
+    for d in "${dirs[@]}"; do
+        [ -n "$d" ] || continue
+        f=$d/$prog
+        [ -f "$f" ] || continue
+        real=$(readlink -f "$f" 2>/dev/null) || real=$f
+        case $seen in *$'\n'"$real"$'\n'*) continue ;; esac
+        seen+="$real"$'\n'
+        if grep -q -m1 "$marker" "$real" 2>/dev/null; then printf '%s\n' "$real"; fi
+    done
+    return 0
+}
+
+# La carpeta que tiene «nexo» (la del repositorio, la de termux/ o la de termux/bin), o nada.
+update_find_src() {
+    local c=${1%/} p
+    [ -n "$c" ] || return 1
+    for p in "$c/termux/bin" "$c/bin" "$c"; do
+        if [ -f "$p/nexo" ] && grep -q '^NEXO_VERSION=' "$p/nexo" 2>/dev/null; then printf '%s' "$p"; return 0; fi
+    done
+    return 1
+}
+
+# update [RUTA|ARCHIVO.zip] [--check] [--no-guests] [--with-dbus] [--with-tools] [--private] [--no-verify]
+# Pone al día nexo, nexo-dbus y nexo-tools desde una carpeta del repositorio o un .zip (lo que antes era copiar a mano),
+# y después las distros de proot-distro. No descarga nada de internet ni de la app: solo copia archivos que ya tienes.
+cmd_update() {
+    local src="" check=0 guests=1 gfl=() a tmp="" rc=0
+    for a in "$@"; do
+        case $a in
+            --check) check=1 ;;
+            --no-guests) guests=0 ;;
+            --with-dbus|--with-tools|--private|--no-verify) gfl+=("$a") ;;
+            -*) die 2 "update: opción desconocida «$a» (--check, --no-guests, --with-dbus, --with-tools, --private, --no-verify)" ;;
+            *) [ -z "$src" ] || die 2 "update: indica una sola ruta"; src=$a ;;
+        esac
+    done
+    SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    if [ -n "$src" ]; then
+        case $src in
+            *.zip|*.ZIP)
+                [ -f "$src" ] || die 1 "No existe $src"
+                tmp=$(mktemp -d "${TMPDIR:-/tmp}/nexo-update.XXXXXX") || die 1 "No pude crear una carpeta temporal"
+                if have unzip; then unzip -q -o "$src" -d "$tmp" >/dev/null 2>&1 || rc=1
+                elif have python3; then python3 -m zipfile -e "$src" "$tmp" >/dev/null 2>&1 || rc=1
+                else rm -rf "$tmp"; die 1 "Para abrir un .zip hace falta unzip o python3 (pkg install unzip)."; fi
+                [ "$rc" = 0 ] || { rm -rf "$tmp"; die 1 "No pude abrir $src"; }
+                for a in "$tmp" "$tmp"/*/; do
+                    [ -d "$a" ] || continue
+                    update_find_src "$a" >/dev/null && { src=$(update_find_src "$a"); break; }
+                done
+                case $src in "$tmp"*) ;; *) rm -rf "$tmp"; die 1 "En ese .zip no hay ningún nexo (busco termux/bin/nexo)." ;; esac ;;
+            *)
+                if [ -f "$src" ]; then src=$(dirname "$src"); fi
+                [ -d "$src" ] || die 1 "No existe $src"
+                src=$(update_find_src "$src") || die 1 "En $src no encuentro nexo (busco termux/bin/nexo, bin/nexo o nexo)." ;;
+        esac
+    elif [ -n "${NEXO_REPO:-}" ]; then
+        src=$(update_find_src "$NEXO_REPO") || die 1 "NEXO_REPO apunta a $NEXO_REPO y ahí no encuentro nexo (busco termux/bin/nexo). Indica otra carpeta:  nexo update RUTA"
+    else
+        # sin RUTA: la carpeta donde estás y, si no, los sitios donde se suele dejar el repositorio en el móvil
+        for a in "$PWD" /storage/emulated/0/claude/nexo /storage/emulated/0/nexo "${HOME:-}/storage/shared/nexo" "${HOME:-}/nexo"; do
+            if src=$(update_find_src "$a"); then break; fi
+            src=""
+        done
+        [ -n "$src" ] || die 1 "No encuentro una carpeta de Nexo para actualizar. Indícala:  nexo update RUTA   (la carpeta del repositorio, la que tiene termux/bin, o un .zip)"
+    fi
+    ( update_run "$src" "$check" "$guests" "${gfl[@]}" ); rc=$?
+    [ -n "$tmp" ] && rm -rf "$tmp"
+    return "$rc"
+}
+
+update_run() {
+    local src=$1 check=$2 guests=$3 prog kind newv oldv copies f bindir changed=0 dbus_changed=0 first="" tgt
+    shift 3
+    local gfl=("$@") want
+    for prog in nexo nexo-dbus nexo-tools; do
+        [ -f "$src/$prog" ] || continue
+        case $prog in
+            nexo-dbus) if have python3; then python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$src/$prog" 2>/dev/null || die 1 "$src/$prog no es un programa de Python válido: no toco nada."; fi ;;
+            *) bash -n "$src/$prog" 2>/dev/null || die 1 "$src/$prog no es un script válido (bash -n lo rechaza): no toco nada." ;;
+        esac
+    done
+    echo "Origen: $src  (nexo $(copy_version "$src/nexo" nexo))"
+    if [ -n "${NEXO_BIN_DIR:-}" ]; then bindir=$NEXO_BIN_DIR
+    elif [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then bindir=$PREFIX/bin
+    elif [ "$(id -u 2>/dev/null || echo 1)" = 0 ]; then bindir=/usr/local/bin
+    else bindir=${HOME:-/tmp}/.local/bin; fi
+    # Lo que no esté todavía se instala junto al nexo que ya hay (o, si no hay ninguno, en $PREFIX/bin, /usr/local/bin o ~/.local/bin).
+    first=$(local_copies nexo | head -n 1)
+    [ -n "$first" ] && bindir=$(dirname "$first")
+    first=""
+    for prog in nexo nexo-dbus nexo-tools; do
+        [ -f "$src/$prog" ] || continue
+        kind=$(prog_kind "$prog")
+        newv=$(copy_version "$src/$prog" "$kind")
+        copies=()
+        while IFS= read -r f; do [ -n "$f" ] && copies+=("$f"); done < <(local_copies "$prog")
+        if [ "${#copies[@]}" -eq 0 ]; then
+            want=0
+            [ "$prog" = nexo ] && want=1
+            [ -n "${PREFIX:-}" ] && want=1                       # en Termux se instalan los tres, como con el comando de la app
+            case " ${gfl[*]} " in *" --with-dbus "*) [ "$prog" = nexo-dbus ] && want=1 ;; esac
+            case " ${gfl[*]} " in *" --with-tools "*) [ "$prog" = nexo-tools ] && want=1 ;; esac
+            [ "$want" = 1 ] || continue
+            copies=("$bindir/$prog")
+            oldv=""
+        fi
+        for f in "${copies[@]}"; do
+            oldv=$(copy_version "$f" "$kind")
+            if [ -f "$f" ] && cmp -s <(tail -n +2 "$f") <(tail -n +2 "$src/$prog"); then
+                printf '  %-11s al día (%s)  %s\n' "$prog" "${oldv:-?}" "$f"
+            elif [ "$check" = 1 ]; then
+                printf '  %-11s %s → %s  (con --check no se cambia)  %s\n' "$prog" "${oldv:-nuevo}" "${newv:-?}" "$f"
+            else
+                mkdir -p "$(dirname "$f")" 2>/dev/null
+                guest_put "$src/$prog" "$f" "$(prog_shebang "$prog")" || die 1 "No pude escribir $f"
+                if [ -n "${PREFIX:-}" ] && have termux-fix-shebang; then termux-fix-shebang "$f" 2>/dev/null; fi
+                printf '  %-11s %s → %s  %s\n' "$prog" "${oldv:-nuevo}" "${newv:-?}" "$f"
+                changed=1
+                [ "$prog" = nexo-dbus ] && dbus_changed=1
+            fi
+            if [ "$prog" = nexo ] && [ -z "$first" ]; then first=$f; fi
+        done
+    done
+    [ "$check" = 1 ] && return 0
+    if [ "$changed" = 0 ]; then echo "Todo estaba al día."; fi
+    if [ -n "${PREFIX:-}" ] && [ -n "$(guests_find)" ] && [ "$guests" = 1 ]; then
+        echo
+        echo "Distros de proot-distro:"
+        tgt=${first:-$SELF}
+        "$tgt" setup-guests "${gfl[@]}" || true
+    elif [ -n "${PREFIX:-}" ] && [ "$guests" = 0 ]; then
+        echo "(No toqué las distros: cuando quieras,  nexo setup-guests)"
+    fi
+    if [ "$dbus_changed" = 1 ] && have python3 && [ -x "$(dirname "${first:-$SELF}")/nexo-dbus" ]        && "$(dirname "${first:-$SELF}")/nexo-dbus" status >/dev/null 2>&1; then
+        echo "nexo-dbus está en marcha aquí con el código anterior: reinícialo con  nexo dbus restart"
+    fi
+    return 0
+}
+
+# nexo tools … → nexo-tools (archivos entre móviles). Todo lo que sigue es suyo, incluidas opciones como --port o --json.
+tools_device_name() {
+    # Dentro de una distro no hay getprop y el nombre de la máquina («localhost») no dice nada: se lo pregunta a la app.
+    [ -n "$NEXO_TOKEN" ] || return 1
+    local old_t=$NEXO_TIMEOUT old_r=${NEXO_RETRY:-} n
+    NEXO_TIMEOUT=2; NEXO_RETRY=0
+    call_try hello; local rc=$?
+    NEXO_TIMEOUT=$old_t; NEXO_RETRY=$old_r
+    [ "$rc" -eq 0 ] || return 1
+    if have_jq; then n=$(printf '%s' "$RESP" | jq -r '.data.device // empty' 2>/dev/null)
+    else n=$(printf '%s' "$RESP" | sed -n 's/.*"device":"\([^"]*\)".*/\1/p'); fi
+    n=$(printf '%s' "$n" | tr -cd '[:alnum:] ._-' | cut -c1-40)
+    [ -n "$n" ] && printf '%s' "$n"
+}
+
+cmd_tools() {
+    local bin n
+    bin=$(find_tools_bin) || die 1 "No encuentro nexo-tools. Reinstala el cliente con el comando de la app (trae los tres archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-tools"
+    have python3 || warn "nexo-tools necesita python3 y openssl para casi todo (en Termux: pkg install python openssl)"
+    if [ -z "${NEXO_TOOLS_DEVICE:-}" ] && ! have getprop; then
+        case ${1:-} in ''|server|send|pair|web)
+            if n=$(tools_device_name) && [ -n "$n" ]; then export NEXO_TOOLS_DEVICE=$n; fi ;;
+        esac
+    fi
+    exec "$bin" "$@"
+}
+
+# ------------------------------------------------------------------ nexo-dbus (la música del móvil como reproductor MPRIS)
+
+xdg_config_home() { printf '%s' "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"; }
+
+# El paquete de python3 se llama «python» en Termux y en Arch, y «python3» en casi todo lo demás.
+python_pkg() {
+    if [ -n "${PREFIX:-}" ] && have pkg; then echo python
+    elif have pacman; then echo python
+    else echo python3; fi
+}
+
+# Dónde deja «setup-dbus» sus cosas (se calculan una vez, las usan varias funciones)
+dbus_paths() {
+    D_UNIT=$(xdg_config_home)/systemd/user/nexo-dbus.service
+    D_DESKTOP=$(xdg_config_home)/autostart/nexo-dbus.desktop
+    D_RECORD=$(config_dir)/dbus-launchers          # archivos a los que se añadió el arranque con --launcher
+}
+
+# Quita de un archivo el bloque que añadió «setup-dbus --launcher» (si lo tiene).
+dbus_strip_block() {
+    local f=$1 tmp line skip=0
+    [ -f "$f" ] && grep -q '^# >>> nexo-dbus' "$f" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            '# >>> nexo-dbus'*) skip=1; continue ;;
+            '# <<< nexo-dbus'*) skip=0; continue ;;
+        esac
+        [ "$skip" = 1 ] || printf '%s\n' "$line"
+    done < "$f" > "$tmp"
+    cat "$tmp" > "$f"
+    rm -f "$tmp"
+}
+
+# Añade el bloque de arranque a un script: justo antes de su última línea «exec …» (si la tiene, porque lo que
+# viene después de un exec nunca se ejecuta), o al final si no hay ninguna. Imprime dónde quedó.
+dbus_add_block() {
+    local f=$1 exe=$2 xargs=$3 line n=0 last=0 tmp
+    if [ -s "$f" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            case $line in 'exec '*|exec) last=$n ;; esac
+        done < "$f"
+    fi
+    tmp=$(mktemp) || return 1
+    {
+        n=0
+        if [ -s "$f" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                n=$((n + 1))
+                if [ "$n" = "$last" ]; then dbus_block_text "$exe" "$xargs"; fi
+                printf '%s\n' "$line"
+            done < "$f"
+        fi
+        if [ "$last" = 0 ]; then dbus_block_text "$exe" "$xargs"; fi
+    } > "$tmp"
+    cat "$tmp" > "$f" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    if [ "$last" -gt 0 ]; then echo "antes de su línea «exec» (la $last)"; else echo "al final"; fi
+}
+dbus_block_text() {
+    printf '# >>> nexo-dbus (lo añadió «nexo setup-dbus --launcher»; se quita con «nexo setup-dbus --uninstall») >>>\n'
+    printf '%q start%s >/dev/null 2>&1\n' "$1" "$2"
+    printf '# <<< nexo-dbus <<<\n'
+}
+
+# systemd de usuario: ¿hay un gestor funcionando? (en proot casi nunca)
+systemd_user_ok() {
+    have systemctl || return 1
+    if have timeout; then timeout 5 systemctl --user show-environment >/dev/null 2>&1; else systemctl --user show-environment >/dev/null 2>&1; fi
+}
+
+# desktop_quote RUTA → la ruta lista para la línea Exec= de un .desktop
+desktop_quote() { case $1 in *[' ']*) printf '"%s"' "$1" ;; *) printf '%s' "$1" ;; esac; }
+
+# Quita lo que dejó antes «setup-dbus»: servicio de systemd, .desktop y bloques en tus archivos. (Así el arranque
+# automático es siempre uno solo y no dos a la vez.)  $1 = 1 → cuenta lo que quita.
+dbus_clear_autostart() {
+    local loud=${1:-0} a
+    dbus_paths
+    if [ -f "$D_UNIT" ]; then
+        if systemd_user_ok; then systemctl --user disable --now nexo-dbus.service >/dev/null 2>&1; fi
+        rm -f "$D_UNIT"
+        if systemd_user_ok; then systemctl --user daemon-reload >/dev/null 2>&1; fi
+        [ "$loud" = 1 ] && echo "✔ servicio de systemd quitado ($D_UNIT)"
+    fi
+    if [ -f "$D_DESKTOP" ]; then
+        rm -f "$D_DESKTOP"
+        [ "$loud" = 1 ] && echo "✔ arranque automático del escritorio quitado ($D_DESKTOP)"
+    fi
+    if [ -f "$D_RECORD" ]; then
+        while IFS= read -r a || [ -n "$a" ]; do
+            if [ -n "$a" ] && [ -f "$a" ] && grep -q '^# >>> nexo-dbus' "$a"; then
+                dbus_strip_block "$a"
+                [ "$loud" = 1 ] && echo "✔ quité el bloque de nexo-dbus de $a"
+            fi
+        done < "$D_RECORD"
+        rm -f "$D_RECORD"
+    fi
+    return 0
+}
+
+# ---- política del bus del sistema: en un Linux de verdad, el bus no deja a un usuario normal ocupar org.bluez ni
+# org.freedesktop.NetworkManager (ni a quien le escriba) hasta que un archivo de /etc/dbus-1/system.d lo permite.
+dbus_policy_file() { printf '%s/nexo.conf' "${NEXO_DBUS_POLICY_DIR:-/etc/dbus-1/system.d}"; }
+
+# run_priv ORDEN… → la ejecuta como root: directa si ya lo eres, con «sudo -n» si no pide clave, con sudo a secas si hay terminal.
+run_priv() {
+    if [ "$(id -u 2>/dev/null || echo 1)" = 0 ]; then "$@"; return; fi
+    have sudo || return 1
+    if sudo -n true >/dev/null 2>&1; then sudo -n "$@"; return; fi
+    if [ -t 0 ] && [ -t 2 ]; then sudo "$@"; return; fi
+    return 1
+}
+
+# dbus_policy_text USUARIO… → el contenido de nexo.conf
+dbus_policy_text() {
+    local u
+    printf '<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"\n'
+    printf ' "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">\n'
+    printf '<busconfig>\n'
+    printf '  <!-- nexo-dbus: política del bus del sistema. La escribió «nexo setup-dbus» con la opción de política: deja a\n'
+    printf '       estos usuarios ocupar org.bluez y org.freedesktop.NetworkManager (y hablarles). «nexo setup-dbus» con la\n'
+    printf '       opción de desinstalar la quita. (Un comentario XML no puede llevar dos guiones seguidos.) -->\n'
+    for u in "$@"; do
+        printf '  <policy user="%s">\n' "$u"
+        printf '    <allow own="org.bluez"/>\n    <allow send_destination="org.bluez"/>\n'
+        printf '    <allow own="org.freedesktop.NetworkManager"/>\n    <allow send_destination="org.freedesktop.NetworkManager"/>\n'
+        printf '  </policy>\n'
+    done
+    printf '</busconfig>\n'
+}
+
+# can_write_file ARCHIVO → 0 si puedes crearlo, cambiarlo o quitarlo sin privilegios (si existe, él y su carpeta son tuyos;
+# si no, lo es la primera carpeta que exista por encima). Con root siempre es cierto.
+can_write_file() {
+    local f=$1 d
+    if [ -e "$f" ]; then [ -w "$f" ] && [ -w "$(dirname "$f")" ]; return; fi
+    d=$(dirname "$f")
+    while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+    [ -w "$d" ]
+}
+
+# Pide al bus del sistema que relea sus políticas (dbus-daemon suele hacerlo solo al cambiar el archivo).
+# Primero como tú (vale en un bus que lo permite); si no, con privilegios.
+dbus_policy_reload() {
+    local d=org.freedesktop.DBus r
+    for r in command run_priv; do
+        if have busctl && $r busctl --system call $d /org/freedesktop/DBus $d ReloadConfig >/dev/null 2>&1; then return 0; fi
+        if have dbus-send && $r dbus-send --system --type=method_call --dest=$d /org/freedesktop/DBus $d.ReloadConfig >/dev/null 2>&1; then return 0; fi
+    done
+    return 1
+}
+
+# dbus_policy_install USUARIO… → 0 si quedó instalada; 1 si no se pudo (y dice cómo hacerlo a mano)
+dbus_policy_install() {
+    local f tmp as=run_priv
+    f=$(dbus_policy_file)
+    tmp=$(mktemp) || return 1
+    dbus_policy_text "$@" > "$tmp"
+    can_write_file "$f" && as=command   # la carpeta es tuya (o eres root): sin sudo
+    if $as mkdir -p "$(dirname "$f")" && $as cp "$tmp" "$f" && $as chmod 644 "$f"; then
+        rm -f "$tmp"
+        echo "✔ política del bus del sistema: $f (usuarios: $*)"
+        if dbus_policy_reload; then echo "✔ el bus del sistema ya la leyó"
+        else echo "• Si tu bus no la recoge solo:  sudo systemctl reload dbus   (o reinicia el equipo)"; fi
+        return 0
+    fi
+    warn "No pude escribir $f (hace falta ser root, o sudo)."
+    echo "  Hazlo a mano con:   sudo cp $tmp $f   y   sudo chmod 644 $f" >&2
+    echo "  (el archivo ya está preparado en $tmp)" >&2
+    return 1
+}
+
+# nexo dbus COMANDO → atajo a nexo-dbus
+cmd_dbus() {
+    local bin
+    bin=$(find_dbus_bin) || die 1 "No encuentro nexo-dbus (reinstala el cliente con el comando de la app)."
+    have python3 || die 1 "nexo-dbus necesita python3 (nexo setup-dbus lo instala)."
+    exec "$bin" "$@"
+}
+
+cmd_setup_dbus() {
+    local op=install start=1 launcher="" bin extra=() own=0 policy=0 pusers=() u
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --uninstall) op=uninstall ;;
+            --no-start) start=0 ;;
+            --own-bus) own=1; extra+=(--own-bus) ;;
+            --always) extra+=(--always) ;;
+            --system-policy) policy=1 ;;
+            --policy-user)
+                [ $# -ge 2 ] || die 2 "--policy-user necesita un nombre de usuario"
+                pusers+=("$2"); policy=1; shift ;;
+            --launcher)
+                [ $# -ge 2 ] || die 2 "--launcher necesita el archivo donde añadir el arranque"
+                launcher=$2; shift ;;
+            *) die 2 "setup-dbus: opción desconocida «$1» (--uninstall, --no-start, --own-bus, --always, --launcher ARCHIVO, --system-policy, --policy-user NOMBRE)" ;;
+        esac
+        shift
+    done
+    if [ "$policy" = 1 ]; then
+        [ "${#pusers[@]}" -gt 0 ] || pusers=("$(id -un 2>/dev/null || echo root)")
+        for u in "${pusers[@]}"; do   # el nombre va dentro de un archivo XML: solo caracteres de nombre de usuario
+            case $u in
+                ''|-*|*[!A-Za-z0-9_.-]*) die 2 "--policy-user: «$u» no parece un nombre de usuario" ;;
+            esac
+        done
+    fi
+    dbus_paths
+
+    if [ "$op" = uninstall ]; then
+        if bin=$(find_dbus_bin) && have python3; then "$bin" stop >/dev/null 2>&1; fi
+        dbus_clear_autostart 1
+        local pf
+        pf=$(dbus_policy_file)
+        if [ -f "$pf" ] && grep -q 'nexo-dbus: política del bus del sistema' "$pf" 2>/dev/null; then
+            local as=run_priv
+            can_write_file "$pf" && as=command
+            if $as rm -f "$pf"; then
+                echo "✔ política del bus del sistema quitada ($pf)"
+                dbus_policy_reload >/dev/null 2>&1
+            else
+                warn "No pude quitar $pf (hace falta root):  sudo rm $pf"
+            fi
+        fi
+        echo "nexo-dbus ya no se arrancará solo. (El programa sigue instalado; viene con el cliente y se quita con el instalador: --uninstall.)"
+        return 0
+    fi
+
+    bin=$(find_dbus_bin) || die 1 "No encuentro nexo-dbus. Reinstala el cliente con el comando de la app (trae los dos archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-dbus"
+    [ -n "$NEXO_TOKEN" ] || die 11 "Primero enlaza con la app (pega el comando de instalación, o: nexo pair TOKEN)."
+
+    # 1) python3
+    if ! have python3; then
+        echo "• Instalando python3 (lo necesita nexo-dbus)…"
+        install_pkg "$(python_pkg)" || true
+        have python3 || die 1 "No pude instalar python3. Instálalo con el gestor de paquetes de tu distro (paquete «$(python_pkg)») y repite."
+    fi
+    # 2) dbus-daemon, solo si se pidió un bus propio
+    if [ "$own" = 1 ] && ! have dbus-daemon; then
+        echo "• Instalando dbus (para el bus de sesión propio)…"
+        install_pkg dbus || true
+        have dbus-daemon || die 1 "No pude instalar dbus. Instala el paquete «dbus» y repite, o quita --own-bus si ya tienes un escritorio con bus de sesión."
+    fi
+    # 2b) política del bus del sistema (antes de arrancar: sin ella, un Linux de verdad no deja ocupar org.bluez)
+    if [ "$policy" = 1 ]; then dbus_policy_install "${pusers[@]}" || true; fi
+    local exe=$bin
+    case $bin in /*) ;; *) exe=$(command -v "$bin" 2>/dev/null || printf '%s' "$bin") ;; esac
+    local how="" xargs="" e
+    for e in "${extra[@]}"; do xargs+=" $e"; done
+
+    # 3) arranque automático (uno solo: lo que hubiera de antes se quita)
+    dbus_clear_autostart 0
+    if [ -n "$launcher" ]; then
+        local lf=$launcher where
+        case $lf in /*) ;; *) lf=$PWD/$lf ;; esac
+        mkdir -p "$(dirname "$lf")" 2>/dev/null
+        where=$(dbus_add_block "$lf" "$exe" "$xargs") || die 1 "No pude escribir en $lf"
+        mkdir -p "$(dirname "$D_RECORD")" 2>/dev/null
+        printf '%s\n' "$lf" >> "$D_RECORD"
+        how="tu archivo $lf ($where)"
+    elif systemd_user_ok; then
+        mkdir -p "$(dirname "$D_UNIT")" || die 1 "No pude crear $(dirname "$D_UNIT")"
+        cat > "$D_UNIT" <<UNIT
+[Unit]
+Description=Nexo: el móvil como MPRIS, BlueZ y NetworkManager
+
+[Service]
+Type=simple
+ExecStart=$exe run$xargs
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+        systemctl --user daemon-reload >/dev/null 2>&1
+        how="systemd (usuario): $D_UNIT"
+    else
+        mkdir -p "$(dirname "$D_DESKTOP")" || die 1 "No pude crear $(dirname "$D_DESKTOP")"
+        cat > "$D_DESKTOP" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Nexo (música del móvil)
+Comment=Muestra la música, el Bluetooth y el WiFi de Android a tus programas de Linux (D-Bus)
+Exec=$(desktop_quote "$exe") start$xargs
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+DESKTOP
+        how="arranque automático del escritorio: $D_DESKTOP"
+    fi
+    echo "✔ Arranque automático: $how"
+
+    # 4) arrancarlo ahora (si ya había uno, se reinicia: así recoge una versión nueva, y lo gestiona solo el método nuevo)
+    local rc=0
+    if [ "$start" = 1 ]; then
+        "$bin" stop >/dev/null 2>&1
+        if [ -f "$D_UNIT" ]; then
+            systemctl --user enable nexo-dbus.service >/dev/null 2>&1
+            systemctl --user restart nexo-dbus.service >/dev/null 2>&1 || rc=1
+            if [ "$rc" = 0 ]; then echo "✔ nexo-dbus en marcha (systemd)"; fi
+        else
+            "$bin" start "${extra[@]}"; rc=$?
+        fi
+        case $rc in
+            0) ;;
+            3) echo "• Ahora mismo no hay bus de sesión de D-Bus, así que no lo arranqué. Se arrancará solo cuando tu escritorio lo tenga;"
+               echo "  si no usas escritorio:  nexo setup-dbus --own-bus   y luego, en cada terminal:  eval \"\$(nexo-dbus env)\"" ;;
+            *) warn "nexo-dbus no arrancó (código $rc). Mira:  nexo dbus run -v" ;;
+        esac
+    fi
+    echo "Para probarlo:  nexo dbus status  (qué servicio está activo y, si no, por qué)"
+    echo "  · música:    pon algo en el móvil y  playerctl -l   (hace falta el «acceso a notificaciones» de la app: mira «nexo doctor»)"
+    echo "  · Bluetooth: bluetoothctl devices        · WiFi:  nmcli device wifi list"
+    return 0
+}
+
+# start: abre la app (una actividad sin pantalla que enciende el puente) para despertarla si Android la congeló
+cmd_start() {
+    local am_bin=""
+    if have am; then am_bin=am; elif [ -x /system/bin/am ]; then am_bin=/system/bin/am; fi
+    [ -n "$am_bin" ] || die 1 "No encuentro el comando «am»: desde una distro de proot no se puede abrir la app. Ábrela a mano en el móvil, o ejecuta «nexo start» desde Termux."
+    "$am_bin" start --user 0 -n org.nexo.bridge/.StartActivity >/dev/null 2>&1 ||
+        die 1 "No pude abrir la app Nexo (¿está instalada? ¿Termux está en primer plano?)."
+    [ -n "$NEXO_TOKEN" ] || { echo "Abrí la app Nexo."; return 0; }
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+        if NEXO_TIMEOUT=2 NEXO_RETRY=0 call_try ping; then echo "Nexo responde: el puente está encendido."; return 0; fi
+        sleep 1
+    done
+    warn "Abrí la app, pero todavía no responde. Mira el estado en la propia app (¿puerto ocupado? ¿batería restringida?)."
+    return 12
+}
+
+# config get|set|list|path
+cmd_config() {
+    local sub=${1:-list} f key val
+    [ $# -gt 0 ] && shift
+    f=${NEXO_CONFIG:-$(config_dir)/config}
+    case $sub in
+        path) printf '%s\n' "${CONFIG_FILE:-$f}" ;;
+        list)
+            printf '# archivo: %s\n' "${CONFIG_FILE:-(ninguno; mira «nexo pair»)}"
+            printf 'NEXO_PORT=%s\n' "$NEXO_PORT"
+            if [ -n "$NEXO_TOKEN" ]; then printf 'NEXO_TOKEN=******** (%s caracteres; «nexo config get NEXO_TOKEN --show» lo muestra)\n' "${#NEXO_TOKEN}"; else printf 'NEXO_TOKEN=\n'; fi
+            printf 'NEXO_TIMEOUT=%s\n' "${NEXO_TIMEOUT:-8}"
+            printf 'NEXO_ICONS=%s\n' "${NEXO_ICONS:-nerd}"
+            printf 'NEXO_CACHE_TTL=%s\n' "${NEXO_CACHE_TTL:-2}"
+            ;;
+        get)
+            key=${1:-}
+            case $key in
+                NEXO_PORT) printf '%s\n' "$NEXO_PORT" ;;
+                NEXO_TIMEOUT) printf '%s\n' "${NEXO_TIMEOUT:-8}" ;;
+                NEXO_ICONS) printf '%s\n' "${NEXO_ICONS:-nerd}" ;;
+                NEXO_CACHE_TTL) printf '%s\n' "${NEXO_CACHE_TTL:-2}" ;;
+                NEXO_TOKEN)
+                    if [ "${2:-}" = --show ]; then printf '%s\n' "$NEXO_TOKEN"; else echo "********"; fi ;;
+                *) die 2 "Uso: nexo config get NEXO_PORT|NEXO_TIMEOUT|NEXO_ICONS|NEXO_CACHE_TTL|NEXO_TOKEN" ;;
+            esac
+            ;;
+        set)
+            key=${1:-}; val=${2:-}
+            case $key in
+                NEXO_PORT) case $val in ''|*[!0-9]*) die 2 "NEXO_PORT debe ser un número" ;; esac ;;
+                NEXO_TIMEOUT) case $val in ''|*[!0-9.]*) die 2 "NEXO_TIMEOUT son segundos (por ejemplo 8)" ;; esac ;;
+                NEXO_CACHE_TTL) case $val in ''|*[!0-9]*) die 2 "NEXO_CACHE_TTL son segundos enteros (por ejemplo 2)" ;; esac ;;
+                NEXO_ICONS) case $val in nerd|none) ;; *) die 2 "NEXO_ICONS es «nerd» o «none»" ;; esac ;;
+                NEXO_TOKEN) die 2 "El token se guarda con «nexo pair» (o «nexo rekey»), que lo prueba antes." ;;
+                *) die 2 "Uso: nexo config set NEXO_PORT|NEXO_TIMEOUT|NEXO_ICONS|NEXO_CACHE_TTL VALOR" ;;
+            esac
+            [ -n "$CONFIG_FILE" ] && [ -w "$CONFIG_FILE" ] && f=$CONFIG_FILE
+            config_put "$key" "$val" "$f" || die 1 "No pude escribir $f"
+            echo "$key=$val  (en $f)"
+            ;;
+        *) die 2 "config: subcomando desconocido «$sub» (list, get, set, path)" ;;
+    esac
+}
+
+detect_env() {
+    case ${PREFIX:-} in
+        */files/usr) printf 'Termux (%s)' "$PREFIX"; return ;;
+    esac
+    local pretty=""
+    [ -r /etc/os-release ] && pretty=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')
+    printf 'Linux%s' "${pretty:+ — $pretty}"
+}
+
+install_pkg() {
+    local pkg=$1 sudo=""
+    if [ -n "${PREFIX:-}" ] && have pkg; then pkg install -y "$pkg" >/dev/null 2>&1; return; fi
+    if [ "$(id -u 2>/dev/null || echo 1)" != 0 ]; then have sudo || return 1; sudo=sudo; fi
+    if   have apt-get;      then $sudo apt-get update -qq >/dev/null 2>&1; $sudo apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    elif have pacman;       then $sudo pacman -S --needed --noconfirm "$pkg" >/dev/null 2>&1
+    elif have apk;          then $sudo apk add --no-cache "$pkg" >/dev/null 2>&1
+    elif have dnf;          then $sudo dnf install -y -q "$pkg" >/dev/null 2>&1
+    elif have zypper;       then $sudo zypper --non-interactive install "$pkg" >/dev/null 2>&1
+    elif have xbps-install; then $sudo xbps-install -y "$pkg" >/dev/null 2>&1
+    else return 1; fi
+}
+
+cmd_doctor() {
+    local fix=0 a rc=0 r h
+    for a in "$@"; do
+        case $a in
+            --fix) fix=1 ;;
+            *) die 2 "doctor: opción desconocida «$a» (--fix)" ;;
+        esac
+    done
+    printf 'nexo       %s\n' "$NEXO_VERSION"
+    printf 'entorno    %s\n' "$(detect_env)"
+    printf 'bash       %s\n' "${BASH_VERSION:-?}"
+    local mode=""
+    [ -n "$CONFIG_FILE" ] && mode=$(stat -c %a "$CONFIG_FILE" 2>/dev/null)
+    printf 'config     %s%s\n' "${CONFIG_FILE:-(no hay archivo; ver «nexo pair»)}" "${mode:+ (permisos $mode)}"
+    printf 'destino    %s:%s\n' "$NEXO_HOST" "$NEXO_PORT"
+    if [ -n "$NEXO_TOKEN" ]; then printf 'token      sí (%s caracteres)\n' "${#NEXO_TOKEN}"; else printf 'token      NO\n'; fi
+    printf 'jq         %s\n' "$(command -v jq || echo 'no instalado (opcional)')"
+    printf 'python3    %s\n' "$(command -v python3 || echo 'no instalado (opcional)')"
+    local dbin dver dstate
+    if dbin=$(find_dbus_bin); then
+        dver=$(grep -m1 '^VERSION = ' "$dbin" 2>/dev/null | sed 's/^VERSION = "\(.*\)".*/\1/')
+        if ! have python3; then dstate="sin python3: no puede arrancar"
+        elif "$dbin" status >/dev/null 2>&1; then dstate="en marcha"
+        else dstate="parado (nexo setup-dbus lo arranca)"; fi
+        printf 'nexo-dbus  %s %s — %s\n' "$dbin" "${dver:-?}" "$dstate"
+        if [ "$dstate" = "en marcha" ]; then      # qué hace cada servicio (MPRIS, BlueZ, NetworkManager) y, si no, por qué
+            "$dbin" status 2>/dev/null | sed -n 's/^  /           /p'
+        fi
+        if [ -n "$dver" ] && [ "$dver" != "$NEXO_VERSION" ]; then
+            echo "           ⚠ es de otra versión que el cliente ($NEXO_VERSION): reinstala con el comando de la app y haz «nexo dbus restart»"
+        fi
+    else
+        printf 'nexo-dbus  no instalado (opcional: MPRIS, BlueZ y NetworkManager para escritorios)\n'
+    fi
+    local tbin tver
+    if tbin=$(find_tools_bin); then
+        tver=$(copy_version "$tbin" tools)
+        printf 'nexo-tools %s %s\n' "$tbin" "${tver:-?}"
+        have python3 || echo "           ⚠ sin python3 no funciona (en Termux: pkg install python)"
+        have openssl || echo "           ⚠ sin openssl no puede crear su certificado (en Termux: pkg install openssl)"
+    else
+        printf 'nexo-tools no instalado (opcional: pasar y explorar archivos entre móviles; se instala con el comando de la app)\n'
+    fi
+    if devtcp_ok; then echo "/dev/tcp   sí"; else echo "/dev/tcp   no (se usará python3)"; fi
+
+    if [ "$fix" = 1 ]; then
+        if ! have jq; then
+            echo "arreglo    instalando jq…"
+            if install_pkg jq; then echo "arreglo    jq instalado"; else echo "arreglo    no pude instalar jq (es opcional)"; fi
+        fi
+        if [ -n "$CONFIG_FILE" ] && [ "$CONFIG_FILE" = "$(config_dir)/config" ] && [ "$mode" != 600 ]; then
+            chmod 600 "$CONFIG_FILE" 2>/dev/null && echo "arreglo    permisos de $CONFIG_FILE → 600"
+        fi
+        if [ -z "$CONFIG_FILE" ] && [ -n "$NEXO_TOKEN" ]; then
+            write_config "$NEXO_TOKEN" "$NEXO_PORT" "$(config_dir)/config" 600 && echo "arreglo    enlace guardado en $(config_dir)/config"
+        fi
+        if [ -z "${PREFIX:-}" ]; then
+            SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+            case $(head -n 1 "$SELF" 2>/dev/null) in
+                '#!/data/data/'*) if [ -w "$SELF" ]; then sed -i '1s|.*|#!/usr/bin/env bash|' "$SELF" && echo "arreglo    shebang de $SELF corregido"; fi ;;
+            esac
+        fi
+    fi
+
+    [ -n "$NEXO_TOKEN" ] || { echo "enlace     sin token: no se puede probar"; return 1; }
+    r=$(build ping)
+    rpc "$r"; rc=$?
+    if [ "$rc" -ne 0 ] && [ "$fix" = 1 ] && [ "$rc" -ne 13 ] && { have am || [ -x /system/bin/am ]; }; then
+        echo "arreglo    la app no responde: intento abrirla…"
+        if ( cmd_start ) >/dev/null 2>&1; then echo "arreglo    la app respondió tras abrirla"; fi
+        rpc "$r"; rc=$?
+    fi
+    case $rc in
+        0) echo "enlace     OK: la app responde" ;;
+        10) echo "enlace     FALLA: no hay nadie en $NEXO_HOST:$NEXO_PORT (¿puente apagado, o puerto distinto? Prueba: nexo start)"; return 10 ;;
+        13) echo "enlace     FALLA: la app rechazó el token (en la app: «Copiar comando» o «Copiar solo el token», y luego: nexo rekey TOKEN)"; return 11 ;;
+        *)  echo "enlace     FALLA: conexión abierta pero sin respuesta (código $rc): Android probablemente congeló la app (Xiaomi/HyperOS: batería «Sin restricciones», inicio automático, bloquear en recientes; o: nexo start)"; return 12 ;;
+    esac
+    if have_jq && call_try hello; then
+        h=$RESP
+        printf '%s' "$h" | jq -r '.data | "app        \(.version) · protocolo \(.proto).\(.minor // 1) · \(.device) · Android \(.android_sdk)"'
+        printf '%s' "$h" | jq -r '.data | if has("listener") then "medios     acceso a notificaciones: \(if .listener then "sí" else "NO (Nexo → Permisos → Acceso a notificaciones; hace falta para «nexo media»)" end)" else empty end'
+    fi
+    if have_jq && call_try wifi.status; then
+        printf '%s' "$RESP" | jq -r '"permisos   ubicación: \(if .data.permission_location then "sí" else "NO (hace falta para ver el nombre del WiFi)" end) · ubicación del sistema: \(if .data.location_enabled then "sí" else "NO" end)"'
+    fi
+    return 0
+}
+
+# version [--check]
+cmd_version() {
+    if [ "${1:-}" != --check ]; then echo "nexo $NEXO_VERSION"; return 0; fi
+    echo "cliente    nexo $NEXO_VERSION (protocolo 1.$CLIENT_MINOR)"
+    need hello
+    have_jq || { printf '%s\n' "$RESP"; return 0; }
+    local info ver proto minor missing="" c ok=1
+    info=$(printf '%s' "$RESP" | jq -r '.data | [.version, .proto, (.minor // 1)] | @tsv')
+    IFS=$'\t' read -r ver proto minor <<<"$info"
+    printf 'app        %s (protocolo %s.%s)\n' "$ver" "$proto" "$minor"
+    if [ "$proto" != 1 ]; then
+        echo "✘ La app habla el protocolo $proto y este cliente el 1: actualiza el que sea más antiguo."
+        return 1
+    fi
+    if [ "$minor" -lt "$CLIENT_MINOR" ]; then
+        for c in audio media wifi.saved bt.info logs; do
+            if printf '%s' "$RESP" | jq -e --arg c "$c" '(.data.commands // []) | any(.[]; startswith($c))' >/dev/null 2>&1; then :; else missing+="$c "; fi
+        done
+        echo "✘ La app es más antigua que el cliente: faltan ${missing:-funciones nuevas}. Instala el APK nuevo (se actualiza encima, sin perder el enlace)."
+        ok=0
+    fi
+    if [ "$minor" -gt "$CLIENT_MINOR" ]; then
+        echo "• La app es más nueva que el cliente: todo lo viejo sigue funcionando; para lo nuevo, actualiza el cliente (copia el comando de instalación otra vez)."
+    fi
+    [ "$ok" = 1 ] && echo "✔ Cliente y app son compatibles."
+    [ "$ok" = 1 ]
+}
+
+# ------------------------------------------------------------------ programa principal
+
+main() {
+    # «nexo tools …» entrega todo a nexo-tools tal cual: sus opciones (--port, --json, --version…) son suyas, no del cliente.
+    if [ "${1:-}" = tools ]; then
+        shift
+        load_config                      # solo para saber el nombre del móvil (ver tools_device_name)
+        cmd_tools "$@"
+    fi
+    local ARGS=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --json) FMT=json ;;
+            --short) FMT=short ;;
+            --waybar) FMT=waybar ;;
+            --polybar) FMT=polybar ;;
+            --i3status|--i3blocks) FMT=i3status ;;
+            --qml) FMT=qml ;;
+            --dunst) FMT=dunst ;;
+            --tmux) FMT=tmux ;;
+            --starship) FMT=starship ;;
+            --csv) FMT=csv ;;
+            --env) FMT=env ;;
+            --pretty) PRETTY=1 ;;
+            --pass-stdin) PASS_STDIN=1 ;;
+            --token-stdin) TOKEN_STDIN=1 ;;
+            --host|--port|--timeout|--pass|--cache)
+                [ $# -ge 2 ] || die 2 "$1 necesita un valor"
+                case $1 in
+                    --host) NEXO_HOST=$2 ;;
+                    --port) NEXO_PORT=$2 ;;
+                    --timeout) NEXO_TIMEOUT=$2 ;;
+                    --pass) PASS_ARG=$2 ;;
+                    --cache) CACHE_ARG=$2 ;;
+                esac
+                shift ;;
+            -h|--help) usage; exit 0 ;;
+            -V|--version) echo "nexo $NEXO_VERSION"; exit 0 ;;
+            --) shift; ARGS+=("$@"); break ;;
+            *) ARGS+=("$1") ;;
+        esac
+        shift
+    done
+    load_config
+    case $CACHE_ARG in *[!0-9]*) die 2 "--cache son segundos enteros" ;; esac
+    if [ -z "$NEXO_TIMEOUT" ]; then
+        if is_bar; then NEXO_TIMEOUT=3; else NEXO_TIMEOUT=8; fi
+    fi
+    # Una barra se vuelve a ejecutar enseguida: reintentar dentro de la misma llamada solo la haría esperar más.
+    is_bar && NEXO_RETRY=${NEXO_RETRY:-0}
+    set_icons
+    if [ -z "${NEXO_BIN:-}" ]; then
+        if have nexo; then NEXO_BIN=nexo; else NEXO_BIN=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0"); fi
+    fi
+    JQA=(--arg gw "$G_WIFI" --arg gb "$G_BT" --arg gv "$G_VOL" --arg gl "$G_VOLLOW" --arg gm "$G_MUTE"
+         --arg gmu "$G_MUSIC" --arg gp "$G_PLAY" --arg gpa "$G_PAUSE" --arg gs "$G_STOP" --arg bin "$NEXO_BIN")
+
+    set -- "${ARGS[@]}"
+    local cmd=${1:-help}
+    [ $# -gt 0 ] && shift
+    case $cmd in
+        status|st) cmd_status ;;
+        wifi) cmd_wifi "$@" ;;
+        bt|bluetooth) cmd_bt "$@" ;;
+        audio|volume|vol) if [ "$cmd" = audio ]; then cmd_audio "$@"; else cmd_audio volume "$@"; fi ;;
+        media|music) cmd_media "$@" ;;
+        watch) cmd_watch "$@" ;;
+        ping) cmd_ping ;;
+        raw) cmd_raw "$@" ;;
+        pair) cmd_pair "$@" ;;
+        rekey) cmd_rekey "$@" ;;
+        unpair) cmd_unpair ;;
+        setup-guests|guests) cmd_setup_guests "$@" ;;
+        update|upgrade) cmd_update "$@" ;;
+        setup-dbus) cmd_setup_dbus "$@" ;;
+        dbus) cmd_dbus "$@" ;;
+        start) cmd_start ;;
+        doctor) cmd_doctor "$@" ;;
+        version) cmd_version "$@" ;;
+        logs) cmd_logs "$@" ;;
+        config) cmd_config "$@" ;;
+        help) usage ;;
+        *) die 2 "comando desconocido «$cmd». Prueba: nexo help" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,1 @@
+t=$(mktemp) && bash -c 'exec 3<>/dev/tcp/127.0.0.1/@PORT@ && echo "{\"cmd\":\"bootstrap\"}" >&3 && cat <&3' >"$t" && echo "@SHA256@  $t" | sha256sum -c - >/dev/null && NEXO_TOKEN=@TOKEN@ NEXO_PORT=@PORT@ bash "$t" || echo "Nexo: no se pudo instalar. ¿Está encendido el puente en la app?"; rm -f "$t"
