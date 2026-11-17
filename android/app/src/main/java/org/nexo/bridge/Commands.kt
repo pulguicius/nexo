@@ -5,13 +5,14 @@ import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Reparte cada comando del protocolo (docs/PROTOCOLO.md) al manejador de WiFi, Bluetooth, audio o medios. */
+/** Reparte cada comando del protocolo (docs/PROTOCOLO.md) al manejador de WiFi, Bluetooth, audio, medios o USB. */
 class Commands(context: Context) {
     private val ctx: Context = context.applicationContext
     private val wifi = WifiHandler(ctx)
     private val bt = BluetoothHandler(ctx)
     val audio = AudioHandler(ctx)
     val media = MediaHandler(ctx)
+    val usb = UsbHandler(ctx)
 
     /** Lo que se le devuelve a un cliente al autenticarse. */
     fun hello(): JSONObject {
@@ -26,21 +27,24 @@ class Commands(context: Context) {
         o.put("wifi", wifi.hasHardware())
         o.put("bluetooth", bt.hasHardware())
         o.put("listener", NexoNotificationListener.isEnabled(ctx))
+        o.put("usb", usb.hasHost())
         o.put("uptime_s", BridgeState.uptimeSeconds())
         o.put("commands", JSONArray(NAMES))
         return o
     }
 
-    /** Estado actual de un tema de eventos ("wifi", "bt", "audio" o "media"). */
+    /** Estado actual de un tema de eventos ("wifi", "bt", "audio", "media" o "usb"). */
     fun statusFor(topic: String): JSONObject = when (topic) {
         "wifi" -> wifi.status()
         "bt" -> bt.status()
         "audio" -> audio.status()
         "media" -> media.status()
+        "usb" -> usb.status()
         else -> throw CmdException("bad_request", "Tema desconocido: $topic")
     }
 
-    fun handle(cmd: String, req: JSONObject): JSONObject = when (cmd) {
+    /** `owner` es la conexión que manda el comando: las sesiones USB que abra se cierran con ella. */
+    fun handle(cmd: String, req: JSONObject, owner: Any? = null): JSONObject = when (cmd) {
         "wifi.status" -> wifi.status()
         "wifi.enable" -> wifi.setEnabled(true)
         "wifi.disable" -> wifi.setEnabled(false)
@@ -67,6 +71,12 @@ class Commands(context: Context) {
         "media.play", "media.pause", "media.playpause", "media.stop", "media.next", "media.prev" -> media.control(cmd)
         "media.seek" -> media.seek(req)
         "media.art" -> media.art()
+        "usb.status" -> usb.status()
+        "usb.permission" -> usb.permission(req)
+        "usb.open" -> usb.open(req, owner)
+        "usb.close" -> usb.close(req)
+        "usb.setup" -> usb.setup(req)
+        "usb.control" -> usb.control(req)
         "logs" -> logs(req)
         else -> throw CmdException("unknown_command", "Comando desconocido: $cmd")
     }
@@ -102,9 +112,10 @@ class Commands(context: Context) {
             "audio.status", "audio.volume", "audio.outputs", "audio.switch",
             "media.status", "media.play", "media.pause", "media.playpause", "media.stop", "media.next", "media.prev",
             "media.seek", "media.art",
+            "usb.status", "usb.permission", "usb.open", "usb.close", "usb.setup", "usb.control", "usb.attach",
         ).sorted()
 
         /** Temas a los que se puede suscribir un cliente. */
-        val TOPICS: List<String> = listOf("audio", "bt", "media", "wifi")
+        val TOPICS: List<String> = listOf("audio", "bt", "media", "usb", "wifi")
     }
 }

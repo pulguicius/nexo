@@ -1,0 +1,2520 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""nexo-usb: los adaptadores serie USB del móvil (Arduino, ESP32, CH340, CP210x, FTDI…) como puertos serie de tu distro.
+
+Es el cuarto programa de Nexo (los otros: el cliente `nexo`, `nexo-dbus` y `nexo-tools`). Una distro de proot no puede abrir
+/dev/bus/usb ni montar nada: el USB es de Android. La app Nexo abre el adaptador con la API oficial USB Host (UsbManager,
+con el permiso que tú das en el aviso de Android) y este programa se lo enseña a tu distro de tres maneras:
+
+  · monitor  → un monitor serie en la terminal (como el de Arduino IDE, miniterm o picocom).
+  · bridge   → un puerto serie falso (un PTY) para avrdude, arduino-cli, PlatformIO, minicom, screen, pyserial…
+               y, si quieres, un servidor RFC2217 (esptool, pyserial: llevan DTR y RTS de verdad)
+               y un TCP crudo (avrdude con «net:»).
+  · list, permit, status, stop, reset
+
+Solo necesita python3 (3.7 o más) y la biblioteca estándar. Habla con la app por el mismo protocolo que el cliente
+(docs/PROTOCOLO.md, revisión 1.3): 127.0.0.1, JSON por línea y token.
+
+Uso:  nexo-usb list|permit|monitor|bridge|status|stop|reset|version|help        (también:  nexo usb …)
+"""
+
+import collections
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import termios
+import threading
+import time
+
+NEXO_USB_VERSION = "0.4.1"
+CLIENT_NAME = "nexo-usb/" + NEXO_USB_VERSION
+
+EXIT_ERR, EXIT_USAGE, EXIT_TOUCH, EXIT_NODEV, EXIT_GONE = 1, 2, 3, 4, 5
+EXIT_NOAPP, EXIT_TOKEN, EXIT_TIMEOUT = 10, 11, 12
+
+HELP = """nexo usb — los adaptadores serie USB del móvil (Arduino, ESP32, CH340, CP210x, FTDI…) dentro de tu distro
+
+Uso: nexo usb COMANDO [DISPOSITIVO] [opciones]
+
+  list [--json|--lsusb|--all]    Lo que Android ve por USB y qué sirve como puerto serie
+  permit [DISPOSITIVO]           Pide a Android el permiso para usarlo (sale un aviso en la pantalla del móvil)
+  monitor [DISPOSITIVO]          Monitor serie en la terminal (salir: Ctrl+])
+  bridge [DISPOSITIVO]           Crea un puerto serie en tu distro para avrdude, arduino-cli, PlatformIO, minicom, screen…
+  status [--json]                Puentes que están en marcha
+  stop [NOMBRE…|--all]           Cierra puentes
+  reset [NOMBRE]                 Reinicia la placa (pulso en DTR) de un puente en marcha
+  version | help
+
+DISPOSITIVO: el id de «nexo usb list», un VID:PID (2341:0043) o parte del nombre o del número de serie.
+Sin él se usa el único adaptador serie conectado.
+
+Línea serie (monitor y bridge):  -b|--baud N (115200)  --format 8N1  --bits 5-8  --parity none|odd|even|mark|space  --stop 1|1.5|2
+
+monitor:  --no-reset (no reinicia el Arduino al abrir)  --dtr on|off  --rts on|off  --seconds N  --idle N  --lines N
+          --until REGEX (sale al verlo)  --send TEXTO (admite \\n \\r \\t \\xNN)  --eol lf|cr|crlf|none  --hex  -T|--timestamp
+          --no-input  --wait (espera a que enchufes el adaptador)  --json (con --until/--seconds: resumen en JSON)
+
+bridge:   --link RUTA (dónde dejar el puerto; por omisión en ~/.local/state/nexo/usb/NOMBRE.tty)  --no-pty
+          --rfc2217 [HOST:]PUERTO   servidor RFC2217 (esptool, pyserial, PlatformIO: DTR y RTS de verdad)
+          --tcp [HOST:]PUERTO       TCP crudo (avrdude -c arduino -P net:HOST:PUERTO)
+          --no-auto-reset           no emula el reinicio del Arduino al abrir el puerto
+          --name NOMBRE  -d|--detach (segundo plano)  --no-reconnect (salir si desenchufas)  --wait
+          --dtr on|off --rts on|off (estado inicial)  --perm-timeout S (60)  --log ARCHIVO
+
+Códigos de salida: 0 bien · 1 error · 2 uso · 3 hace falta un toque en el móvil (permiso) · 4 no hay dispositivo
+                   5 se desenchufó · 10 sin conexión con la app · 11 token · 12 sin respuesta a tiempo
+"""
+
+
+class UsbError(Exception):
+    """Un fallo que se le cuenta al usuario tal cual y acaba con un código de salida."""
+
+    def __init__(self, message, code=EXIT_ERR):
+        Exception.__init__(self, message)
+        self.message = message
+        self.code = code
+
+
+class Transient(UsbError):
+    """Un fallo que suele arreglarse solo en un momento (dispositivo ocupado, recién enchufado…)."""
+
+
+class Stopped(Exception):
+    pass
+
+
+class BridgeError(Exception):
+    """La app contestó con ok=false."""
+
+    def __init__(self, code, message="", extra=None):
+        Exception.__init__(self, message or code)
+        self.code = code
+        self.message = message or code
+        self.extra = extra or {}
+
+
+# ----------------------------------------------------------------------------------------------------- utilidades
+
+
+class Log(object):
+    stream = sys.stderr
+    stamp = False
+    verbose = False
+    lock = threading.Lock()
+
+
+def log(msg):
+    line = ("%s %s" % (time.strftime("%H:%M:%S"), msg)) if Log.stamp else msg
+    with Log.lock:
+        try:
+            Log.stream.write(line + "\n")
+            Log.stream.flush()
+        except (OSError, ValueError):
+            pass
+
+
+def dbg(msg):
+    if Log.verbose:
+        log("· " + msg)
+
+
+def home_dir():
+    h = os.path.expanduser("~")
+    return h if h and h != "~" else "/tmp"
+
+
+def state_dir():
+    d = os.environ.get("NEXO_USB_DIR")
+    if not d:
+        d = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(home_dir(), ".local", "state"), "nexo", "usb")
+    return d
+
+
+def ensure_state_dir():
+    d = state_dir()
+    try:
+        os.makedirs(d, 0o700)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise UsbError("No puedo crear %s (%s)" % (d, e.strerror or e))
+    return d
+
+
+def load_config():
+    """Mismo orden que el cliente `nexo`: variables de entorno, y luego el primer archivo de enlace que exista."""
+    cfg = {"NEXO_PORT": os.environ.get("NEXO_PORT", ""), "NEXO_TOKEN": os.environ.get("NEXO_TOKEN", ""),
+           "NEXO_HOST": os.environ.get("NEXO_HOST", "")}
+    paths = []
+    if os.environ.get("NEXO_CONFIG"):
+        paths.append(os.environ["NEXO_CONFIG"])
+    paths.append(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home_dir(), ".config"), "nexo", "config"))
+    paths.append("/etc/nexo/config")
+    if os.environ.get("PREFIX"):
+        paths.append(os.path.join(os.environ["PREFIX"], "etc", "nexo", "config"))
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            k, sep, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip("\r").strip("\"'")
+            if sep and k in ("NEXO_PORT", "NEXO_TOKEN") and not cfg[k]:
+                cfg[k] = v
+        break
+    if not cfg["NEXO_PORT"]:
+        cfg["NEXO_PORT"] = "8765"
+    if not cfg["NEXO_HOST"]:
+        cfg["NEXO_HOST"] = "127.0.0.1"
+    return cfg
+
+
+def jline(obj):
+    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def to_onoff(s):
+    v = str(s).strip().lower()
+    if v in ("on", "1", "si", "sí", "yes", "true"):
+        return True
+    if v in ("off", "0", "no", "false"):
+        return False
+    raise ValueError(s)
+
+
+def to_seconds(s):
+    v = float(s)
+    if v < 0:
+        raise ValueError(s)
+    return v
+
+
+def to_hostport(s, default_host="127.0.0.1"):
+    """«2217», «:2217» o «host:2217» → (host, puerto)."""
+    s = str(s)
+    host, sep, port = s.rpartition(":")
+    if not sep:
+        host, port = "", s
+    p = int(port)
+    if not 0 <= p <= 65535:
+        raise ValueError(s)
+    return (host or default_host, p)
+
+
+def parse_args(argv, spec, hint="Prueba: nexo usb help"):
+    """spec: {"--baud": ("baud", int), "-b": ("baud", int), "--no-reset": ("no_reset", True)} → (opciones, posicionales).
+    Un True en lugar de un tipo marca una opción sin valor. Acepta --opción=valor y -b9600."""
+    opts, pos = {}, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            pos.extend(argv[i:])
+            break
+        if not a.startswith("-") or a == "-":
+            pos.append(a)
+            continue
+        val = None
+        if a.startswith("--"):
+            name, eq, v = a.partition("=")
+            if eq:
+                val = v
+        else:
+            name = a[:2]
+            if len(a) > 2:
+                val = a[2:]
+        if name not in spec:
+            raise UsbError("opción desconocida «%s». %s" % (a, hint), EXIT_USAGE)
+        key, kind = spec[name]
+        if kind is True:
+            if val is not None:
+                raise UsbError("«%s» no lleva valor" % name, EXIT_USAGE)
+            opts[key] = True
+            continue
+        if val is None:
+            if i >= len(argv):
+                raise UsbError("«%s» necesita un valor" % name, EXIT_USAGE)
+            val = argv[i]
+            i += 1
+        try:
+            opts[key] = kind(val)
+        except ValueError:
+            raise UsbError("valor no válido para %s: «%s»" % (name, val), EXIT_USAGE)
+    return opts, pos
+
+
+LINE_SPEC = {
+    "--baud": ("baud", int), "-b": ("baud", int), "--bits": ("bits", int), "--parity": ("parity", str),
+    "--stop": ("stop", float), "--format": ("format", str),
+}
+
+PARITY_LETTER = {"none": "N", "odd": "O", "even": "E", "mark": "M", "space": "S"}
+LETTER_PARITY = dict((v, k) for k, v in PARITY_LETTER.items())
+DEFAULT_LINE = {"baud": 115200, "bits": 8, "parity": "none", "stop": 1}
+
+
+def norm_stop(v):
+    f = float(v)
+    return int(f) if f in (1.0, 2.0) else f
+
+
+def check_line(line):
+    if not 50 <= line["baud"] <= 4000000:
+        raise UsbError("baudios fuera de rango (50 a 4000000)", EXIT_USAGE)
+    if line["bits"] not in (5, 6, 7, 8):
+        raise UsbError("bits debe ser 5, 6, 7 u 8", EXIT_USAGE)
+    if line["parity"] not in PARITY_LETTER:
+        raise UsbError("parity debe ser none, odd, even, mark o space", EXIT_USAGE)
+    if float(line["stop"]) not in (1.0, 1.5, 2.0):
+        raise UsbError("stop debe ser 1, 1.5 o 2", EXIT_USAGE)
+    line["stop"] = norm_stop(line["stop"])
+    return line
+
+
+def line_from_opts(o, base=None):
+    line = dict(base or DEFAULT_LINE)
+    if "format" in o:
+        m = re.match(r"^([5-8])([NOEMS])(1|1\.5|2)$", o["format"].strip().upper())
+        if not m:
+            raise UsbError("--format es como 8N1 (bits, paridad N|O|E|M|S y parada 1|1.5|2)", EXIT_USAGE)
+        line.update(bits=int(m.group(1)), parity=LETTER_PARITY[m.group(2)], stop=float(m.group(3)))
+    for k in ("baud", "bits", "parity", "stop"):
+        if k in o:
+            line[k] = o[k]
+    return check_line(line)
+
+
+def line_str(line):
+    return "%d %d%s%s" % (line["baud"], line["bits"], PARITY_LETTER.get(line["parity"], "?"), line["stop"])
+
+
+def unescape(text):
+    """TEXTO de --send: \\n \\r \\t \\0 \\\\ y \\xNN; lo demás va en UTF-8."""
+    out = bytearray()
+    pos = 0
+    for m in re.finditer(r"\\(x[0-9a-fA-F]{2}|n|r|t|0|\\)", text):
+        out += text[pos:m.start()].encode("utf-8")
+        e = m.group(1)
+        out.append(int(e[1:], 16) if e[0] == "x" else {"n": 10, "r": 13, "t": 9, "0": 0, "\\": 92}[e])
+        pos = m.end()
+    out += text[pos:].encode("utf-8")
+    return bytes(out)
+
+
+KINDS_ES = {"serial": "serie", "storage": "almacenamiento", "hid": "teclado/ratón", "hub": "hub", "audio": "audio",
+            "video": "vídeo", "printer": "impresora", "net": "red", "other": "otro"}
+
+
+def dev_title(d):
+    return d.get("product") or d.get("vendor") or ("USB %s:%s" % (d.get("vid"), d.get("pid")))
+
+
+def dev_vidpid(d):
+    return "%s:%s" % (d.get("vid"), d.get("pid"))
+
+
+def dev_signature(d):
+    return (d.get("vid"), d.get("pid"), d.get("serial"))
+
+
+def sig_matches(sig, d):
+    """¿Es el mismo adaptador? (el id de Android cambia al volver a enchufarlo: se compara VID, PID y número de serie)"""
+    if (d.get("vid"), d.get("pid")) != (sig[0], sig[1]):
+        return False
+    return not sig[2] or not d.get("serial") or sig[2] == d.get("serial")
+
+
+def match_devices(devs, sel):
+    s = sel.strip()
+    if re.match(r"^[0-9]+$", s):
+        return [d for d in devs if str(d.get("id")) == s]
+    if re.match(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$", s):
+        return [d for d in devs if dev_vidpid(d) == s.lower()]
+    if s.startswith("/dev/bus/usb/"):
+        return [d for d in devs if d.get("path") == s]
+    low = s.lower()
+    out = []
+    for d in devs:
+        hay = " ".join(str(d.get(k) or "") for k in ("product", "vendor", "serial")).lower()
+        if low in hay:
+            out.append(d)
+    return out
+
+
+def unsupported_text(d):
+    if d.get("note"):
+        return "%s (%s): %s." % (dev_title(d), dev_vidpid(d), d["note"])
+    kind = d.get("kind")
+    why = {
+        "storage": "es una unidad de almacenamiento (pendrive, disco…): de eso se ocupará «nexo usb mounts» en la 0.4.2",
+        "hid": "es un teclado o ratón: Android ya lo usa, y una distro de proot no ve /dev/input",
+        "hub": "es un hub: no hace nada por sí solo; lo que cuelgue de él aparece aparte",
+    }.get(kind, "no es un adaptador serie que Nexo conozca todavía (sé hablar CDC-ACM, CP210x, FTDI y CH340)")
+    return "%s (%s) no sirve como puerto serie: %s." % (dev_title(d), dev_vidpid(d), why)
+
+
+def choose_device(devs, sel, need_serial=True):
+    if sel:
+        found = match_devices(devs, sel)
+        if not found:
+            raise UsbError("Ningún dispositivo USB encaja con «%s». Mira: nexo usb list" % sel, EXIT_NODEV)
+        if len(found) > 1:
+            raise UsbError("«%s» encaja con %d dispositivos (%s): usa el id o el VID:PID." % (
+                sel, len(found), ", ".join("%s %s" % (d.get("id"), dev_vidpid(d)) for d in found)), EXIT_USAGE)
+        d = found[0]
+        if need_serial and not d.get("serial_capable"):
+            raise UsbError(unsupported_text(d), EXIT_NODEV)
+        return d
+    cands = [d for d in devs if d.get("serial_capable")] if need_serial else list(devs)
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        if devs:
+            raise UsbError("Android ve %d dispositivo(s) USB, pero ninguno es un adaptador serie que Nexo conozca (mira: nexo usb list)." % len(devs), EXIT_NODEV)
+        raise UsbError("No veo ningún dispositivo USB. Enchúfalo con un cable OTG (en Xiaomi: Ajustes → Ajustes adicionales → OTG) y mira: nexo usb list", EXIT_NODEV)
+    raise UsbError("Hay %d dispositivos posibles; elige uno (id o VID:PID):\n%s" % (
+        len(cands), "\n".join("  %-6s %s  %s" % (d.get("id"), dev_vidpid(d), dev_title(d)) for d in cands)), EXIT_USAGE)
+
+
+# ----------------------------------------------------------------------------------------------------- la app Nexo
+
+
+def recv_line(sock, buf, timeout):
+    """Lee hasta el primer salto de línea sin tragarse lo que venga detrás. Devuelve (línea, resto)."""
+    end = time.monotonic() + timeout
+    while b"\n" not in buf:
+        left = end - time.monotonic()
+        if left <= 0:
+            raise socket.timeout()
+        sock.settimeout(left)
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("la app cerró la conexión")
+        buf += chunk
+        if len(buf) > (1 << 20) and b"\n" not in buf:
+            raise ConnectionError("línea demasiado larga")
+    line, _, rest = buf.partition(b"\n")
+    return line, rest
+
+
+def handshake(cfg, timeout=4.0):
+    """Conecta, saluda con el token y devuelve (socket, bytes sobrantes, datos del hello)."""
+    host, port = cfg["NEXO_HOST"], int(cfg["NEXO_PORT"])
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+    except OSError as e:
+        raise UsbError("No se puede conectar con Nexo en %s:%s (%s). ¿Está encendido el puente en la app? (mira: nexo doctor)" % (
+            host, port, e.strerror or e), EXIT_NOAPP)
+    try:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.sendall(jline({"id": "hello", "cmd": "hello", "token": cfg["NEXO_TOKEN"], "client": CLIENT_NAME}))
+        line, rest = recv_line(s, b"", 8.0)
+        o = json.loads(line.decode("utf-8", "replace"))
+    except socket.timeout:
+        s.close()
+        raise UsbError("La app Nexo no contestó (¿la tiene congelada Android? Ábrela un momento).", EXIT_TIMEOUT)
+    except (OSError, ValueError) as e:
+        s.close()
+        raise UsbError("Se perdió la conexión con la app Nexo (%s)." % e, EXIT_NOAPP)
+    if not isinstance(o, dict) or not o.get("ok"):
+        s.close()
+        if isinstance(o, dict) and o.get("error") == "unauthorized":
+            raise UsbError("Nexo rechazó el token. Vuelve a copiar el comando de instalación desde la app (o usa: nexo rekey TOKEN).", EXIT_TOKEN)
+        raise UsbError("La app rechazó el saludo: %s" % (o.get("message") or o.get("error") if isinstance(o, dict) else o), EXIT_ERR)
+    return s, rest, o.get("data") or {}
+
+
+def usb_capable(info):
+    return bool(info.get("usb")) or "usb.status" in (info.get("commands") or [])
+
+
+class Link(object):
+    """Conexión de control con la app: respuestas por id, eventos y un ping cuando se calla."""
+
+    PING_AFTER = 20.0
+    PING_TIMEOUT = 8.0
+
+    def __init__(self, cfg, on_event=None):
+        self.cfg = cfg
+        self.on_event = on_event
+        self.sock = None
+        self.info = {}
+        self.dead = threading.Event()
+        self.reason = ""
+        self._wlock = threading.Lock()
+        self._ilock = threading.Lock()
+        self._ids = 0
+        self._waiters = {}
+
+    def connect(self, timeout=4.0):
+        s, rest, info = handshake(self.cfg, timeout)
+        self.sock = s
+        self.info = info
+        threading.Thread(target=self._reader, args=(rest,), name="app", daemon=True).start()
+        return info
+
+    def _die(self, reason):
+        if self.dead.is_set():
+            return
+        self.reason = reason
+        self.dead.set()
+        s = self.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+        for w in list(self._waiters.values()):
+            w[0].set()
+
+    def close(self):
+        self._die("cerrada")
+
+    def _reader(self, buf):
+        s = self.sock
+        last_rx = time.monotonic()
+        last_ping = None
+        try:
+            s.settimeout(1.0)
+            while not self.dead.is_set():
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    self._on_line(line)
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    chunk = None
+                if chunk == b"":
+                    raise ConnectionError("la app cerró la conexión")
+                now = time.monotonic()
+                if chunk:
+                    last_rx, last_ping = now, None
+                    buf += chunk
+                    if len(buf) > (1 << 20) and b"\n" not in buf:
+                        raise ConnectionError("línea demasiado larga")
+                elif last_ping is None and now - last_rx > self.PING_AFTER:
+                    self._send({"id": "ping", "cmd": "ping"})
+                    last_ping = now
+                elif last_ping is not None and now - last_ping > self.PING_TIMEOUT:
+                    raise ConnectionError("la app no responde al ping")
+        except Exception as e:
+            self._die("%s" % (e,))
+
+    def _on_line(self, raw):
+        try:
+            o = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if not isinstance(o, dict):
+            return
+        if "event" in o:
+            if self.on_event is not None:
+                try:
+                    self.on_event(o["event"], o.get("data") or {})
+                except Exception as e:
+                    log("error procesando un evento: %r" % (e,))
+            return
+        w = self._waiters.get(o.get("id"))
+        if w is not None:
+            w[1] = o
+            w[0].set()
+
+    def _send(self, obj):
+        data = jline(obj)
+        with self._wlock:
+            s = self.sock
+            if s is None or self.dead.is_set():
+                raise BridgeError("no_connection", "No hay conexión con la app Nexo")
+            try:
+                s.sendall(data)
+            except OSError as e:
+                raise BridgeError("no_connection", "No pude escribir a la app Nexo: %s" % e)
+
+    def call(self, cmd, timeout=8.0, **params):
+        with self._ilock:
+            self._ids += 1
+            rid = "c%d" % self._ids
+        w = [threading.Event(), None]
+        self._waiters[rid] = w
+        req = dict((k, v) for k, v in params.items() if v is not None)
+        req["id"] = rid
+        req["cmd"] = cmd
+        try:
+            self._send(req)
+            if not w[0].wait(timeout):
+                raise BridgeError("timeout", "La app no contestó a tiempo (¿la congeló Android?)")
+        finally:
+            self._waiters.pop(rid, None)
+        r = w[1]
+        if r is None:
+            raise BridgeError("no_connection", "Se perdió la conexión con la app Nexo (%s)" % (self.reason or "?"))
+        if r.get("ok"):
+            return r.get("data") or {}
+        extra = dict((k, v) for k, v in r.items() if k not in ("id", "ok", "error", "message"))
+        raise BridgeError(r.get("error", "failed"), r.get("message", ""), extra)
+
+
+def open_data(cfg, session, timeout=8.0):
+    """La segunda conexión: saluda, pide usb.attach y, tras la línea de respuesta, todo son bytes crudos del adaptador."""
+    s, rest, _ = handshake(cfg, timeout)
+    try:
+        s.sendall(jline({"id": "attach", "cmd": "usb.attach", "session": session}))
+        line, rest = recv_line(s, rest, timeout)
+        o = json.loads(line.decode("utf-8", "replace"))
+    except (OSError, ValueError) as e:
+        s.close()
+        raise BridgeError("no_connection", "No pude abrir el flujo de datos USB (%s)" % e)
+    if not isinstance(o, dict) or not o.get("ok"):
+        s.close()
+        o = o if isinstance(o, dict) else {}
+        raise BridgeError(o.get("error", "failed"), o.get("message", ""))
+    s.settimeout(None)
+    return s, rest
+
+
+def explain(e):
+    """Un error de la app → un mensaje que diga qué hacer."""
+    c, m = e.code, e.message
+    if c in ("timeout", "no_connection"):
+        return Transient("%s" % m, EXIT_TIMEOUT if c == "timeout" else EXIT_NOAPP)
+    if c == "busy":
+        return Transient("%s. Si lo tiene abierto otra app (Arduino IDE, «Serial USB Terminal»…), ciérrala; "
+                         "si era un puente anterior, espera unos segundos." % m.rstrip("."), EXIT_ERR)
+    if c == "not_found":
+        return Transient(m, EXIT_NODEV)
+    if c == "failed":
+        return Transient(m, EXIT_ERR)
+    if c == "permission_denied":
+        return UsbError("Android no deja usar este dispositivo sin tu permiso. Prueba: nexo usb permit", EXIT_TOUCH)
+    if c == "unauthorized":
+        return UsbError("Nexo rechazó el token. Vuelve a copiar el comando de instalación desde la app (o usa: nexo rekey TOKEN).", EXIT_TOKEN)
+    if c == "unsupported":
+        return UsbError(m, EXIT_NODEV)
+    if c == "bad_request":
+        return UsbError(m, EXIT_USAGE)
+    if c == "unknown_command":
+        return UsbError("Esta versión de la app Nexo no sabe de USB. Instala el APK de la 0.4.1 o más nuevo (se actualiza encima, sin perder el enlace).", EXIT_ERR)
+    return UsbError("%s (%s)" % (m, c), EXIT_ERR)
+
+
+def connect_app(on_event=None):
+    cfg = load_config()
+    if not cfg["NEXO_TOKEN"]:
+        raise UsbError("No hay token. Pega en Termux el comando de instalación que copia la app Nexo, o usa: nexo pair TOKEN", EXIT_TOKEN)
+    if not re.match(r"^[0-9]+$", cfg["NEXO_PORT"]):
+        raise UsbError("Puerto inválido: %s" % cfg["NEXO_PORT"], EXIT_USAGE)
+    link = Link(cfg, on_event)
+    link.connect()
+    if not usb_capable(link.info):
+        link.close()
+        raise UsbError("Esta versión de la app Nexo (%s) no sabe de USB. Instala el APK de la 0.4.1 o más nuevo "
+                       "(se actualiza encima, sin perder el enlace)." % link.info.get("version", "?"), EXIT_ERR)
+    return link
+
+
+def call_app(link, cmd, timeout=8.0, **params):
+    try:
+        return link.call(cmd, timeout, **params)
+    except BridgeError as e:
+        raise explain(e)
+
+
+def ensure_permission(link, dev, say, timeout=60.0, stop=None):
+    """Pide el permiso de Android y espera la respuesta del usuario (el aviso sale en la pantalla del móvil)."""
+    if dev.get("permission"):
+        return
+    start = time.monotonic()
+    announced = False
+    while True:
+        if stop is not None and stop.is_set():
+            raise Stopped()
+        left = timeout - (time.monotonic() - start)
+        if left <= 0:
+            raise UsbError("Nadie contestó al aviso de Android. Si no te salió nada, abre la app Nexo un momento y repite: "
+                           "nexo usb permit  (en HyperOS/MIUI, mejor con Nexo en primer plano).", EXIT_TOUCH)
+        wait = int(min(left, 10.0) * 1000)
+        r = call_app(link, "usb.permission", wait / 1000.0 + 8.0, device=dev["id"], wait_ms=wait)
+        if r.get("granted"):
+            return
+        if r.get("denied"):
+            raise UsbError("Android no te dio permiso para usar «%s». Repite «nexo usb permit» y elige «Aceptar» "
+                           "(marca «Usar siempre» para que no vuelva a preguntar)." % dev_title(dev), EXIT_TOUCH)
+        if not announced:
+            say("Android pide permiso para usar «%s» (%s): mira la pantalla del móvil y acepta; marca «Usar siempre» "
+                "para que no vuelva a preguntar." % (dev_title(dev), dev_vidpid(dev)))
+            announced = True
+
+
+# ----------------------------------------------------------------------------------------------------- list y permit
+
+
+def table(rows, headers):
+    cols = [headers] + rows
+    widths = [max(len(str(r[i])) for r in cols) for i in range(len(headers))]
+    out = []
+    for n, r in enumerate(cols):
+        out.append("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+    return "\n".join(out)
+
+
+def cmd_list(argv):
+    o, pos = parse_args(argv, {"--json": ("json", True), "--pretty": ("pretty", True), "--lsusb": ("lsusb", True),
+                               "--all": ("all", True), "-a": ("all", True)})
+    if pos:
+        raise UsbError("«list» no lleva argumentos. Prueba: nexo usb help", EXIT_USAGE)
+    link = connect_app()
+    try:
+        st = call_app(link, "usb.status")
+    finally:
+        link.close()
+    devs = st.get("devices") or []
+    sess = dict((s.get("device"), s) for s in (st.get("sessions") or []))
+    if o.get("json"):
+        sys.stdout.write(json.dumps(st, ensure_ascii=False, indent=2 if o.get("pretty") or sys.stdout.isatty() else None) + "\n")
+        return 0
+    if o.get("lsusb"):
+        for d in devs:
+            sys.stdout.write("Bus %03d Device %03d: ID %s:%s %s\n" % (
+                d.get("bus", 0), d.get("address", 0), d.get("vid"), d.get("pid"),
+                " ".join(x for x in (d.get("vendor"), d.get("product")) if x) or "(sin nombre)"))
+        return 0
+    if not st.get("host", True):
+        log("Este móvil no tiene USB host (no puede recibir dispositivos USB).")
+        return EXIT_NODEV
+    if not devs:
+        log("Android no ve ningún dispositivo USB.")
+        log("Enchúfalo con un cable OTG. En Xiaomi/HyperOS: Ajustes → Ajustes adicionales → OTG (se apaga solo si no hay nada).")
+        return 0
+    rows = []
+    for d in devs:
+        s = sess.get(d.get("id"))
+        uso = "en uso (%s)" % s.get("session") if s else ("sí" if d.get("permission") else "no")
+        extra = " · ".join(x for x in (d.get("vendor"), d.get("serial") and "serie " + d["serial"]) if x)
+        rows.append((d.get("id"), dev_vidpid(d), KINDS_ES.get(d.get("kind"), d.get("kind") or "?"),
+                     d.get("driver") or ("—" if d.get("kind") == "serial" else ""), uso,
+                     dev_title(d) + (" · " + extra if extra else "")))
+    sys.stdout.write(table(rows, ("ID", "VID:PID", "TIPO", "CONTROLADOR", "PERMISO", "DISPOSITIVO")) + "\n")
+    notes = [d for d in devs if d.get("note")]
+    for d in notes:
+        sys.stdout.write("  %s: %s\n" % (dev_vidpid(d), d["note"]))
+    if any(d.get("serial_capable") and not d.get("permission") for d in devs):
+        sys.stdout.write("Siguiente paso: nexo usb permit   (Android te pregunta una vez; marca «Usar siempre»)\n")
+    elif any(d.get("serial_capable") for d in devs):
+        sys.stdout.write("Listo para: nexo usb monitor   ·   nexo usb bridge\n")
+    elif not o.get("all"):
+        sys.stdout.write("Ninguno sirve como puerto serie (los de almacenamiento llegan en la 0.4.2).\n")
+    return 0
+
+
+def cmd_permit(argv):
+    o, pos = parse_args(argv, {"--wait": ("wait", True), "--timeout": ("timeout", to_seconds)})
+    if len(pos) > 1:
+        raise UsbError("Solo un DISPOSITIVO. Prueba: nexo usb help", EXIT_USAGE)
+    link = connect_app()
+    try:
+        dev = wait_for_device(link, pos[0] if pos else None, o.get("wait"), pick=pick_for_permit)
+        if dev.get("permission"):
+            log("«%s» (%s) ya tiene permiso." % (dev_title(dev), dev_vidpid(dev)))
+            return 0
+        ensure_permission(link, dev, log, o.get("timeout", 60.0))
+        log("Permiso concedido para «%s» (%s)." % (dev_title(dev), dev_vidpid(dev)))
+        return 0
+    finally:
+        link.close()
+
+
+def pick_for_permit(devs, sel):
+    """Sin DISPOSITIVO: el único adaptador serie (o el único dispositivo) que aún no tiene permiso."""
+    if sel:
+        return choose_device(devs, sel, need_serial=False)
+    sin = [d for d in devs if not d.get("permission")]
+    serie = [d for d in sin if d.get("serial_capable")]
+    cands = serie or sin
+    if not cands:
+        if not devs:
+            raise UsbError("No veo ningún dispositivo USB. Enchúfalo con un cable OTG y mira: nexo usb list", EXIT_NODEV)
+        todos = [d for d in devs if d.get("serial_capable")] or devs     # todos tienen ya permiso: se dice cuál
+        return todos[0]
+    return choose_device(cands, None, need_serial=False)
+
+
+def wait_for_device(link, sel, wait, need_serial=True, stop=None, pick=None):
+    """El dispositivo elegido; con --wait, espera a que lo enchufes."""
+    told = False
+    while True:
+        st = call_app(link, "usb.status")
+        try:
+            devs = st.get("devices") or []
+            return pick(devs, sel) if pick else choose_device(devs, sel, need_serial)
+        except UsbError as e:
+            if e.code != EXIT_NODEV or not wait:
+                raise
+            if not told:
+                log("Esperando a que enchufes el dispositivo… (Ctrl+C para dejar de esperar)")
+                told = True
+        if stop is not None and stop.is_set():
+            raise Stopped()
+        time.sleep(1.0)
+
+
+# ----------------------------------------------------------------------------------------------------- monitor
+
+
+class Printer(object):
+    """Lo que llega del adaptador, tal cual, en hexadecimal o con la hora de cada línea."""
+
+    def __init__(self, hexmode=False, stamp=False):
+        self.out = sys.stdout.buffer
+        self.hexmode = hexmode
+        self.stamp = stamp
+        self.pend = b""
+        self.mid = False          # ya se escribió el principio de la línea actual (con su hora)
+        self.off = 0
+        self.last = time.monotonic()
+
+    @staticmethod
+    def _ts():
+        t = time.time()
+        return ("[%s.%03d] " % (time.strftime("%H:%M:%S", time.localtime(t)), int((t % 1) * 1000))).encode()
+
+    def _hexline(self, chunk):
+        hexs = " ".join("%02x" % b for b in chunk)
+        txt = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        self.out.write(("%08x  %-47s  |%s|\n" % (self.off, hexs, txt)).encode())
+        self.off += len(chunk)
+
+    def feed(self, data):
+        self.last = time.monotonic()
+        if self.hexmode:
+            self.pend += data
+            while len(self.pend) >= 16:
+                self._hexline(self.pend[:16])
+                self.pend = self.pend[16:]
+        elif self.stamp:
+            buf = self.pend + data
+            while True:
+                i = buf.find(b"\n")
+                if i < 0:
+                    break
+                line, buf = buf[:i + 1], buf[i + 1:]
+                self.out.write((b"" if self.mid else self._ts()) + line)
+                self.mid = False
+            self.pend = buf
+        else:
+            self.out.write(data)
+        self.out.flush()
+
+    def idle(self):
+        """Cuando no llega nada: enseña lo que haya a medias."""
+        if not self.pend or time.monotonic() - self.last < 0.3:
+            return
+        if self.hexmode:
+            self._hexline(self.pend)
+        else:
+            self.out.write((b"" if self.mid else self._ts()) + self.pend)
+            self.mid = True
+        self.pend = b""
+        self.out.flush()
+
+
+class Collector(object):
+    """Con --json: no escribe nada; guarda lo recibido para el resumen final."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        if len(self.buf) < (1 << 20):
+            self.buf += data[:(1 << 20) - len(self.buf)]
+
+    def idle(self):
+        pass
+
+
+def cmd_monitor(argv):
+    spec = dict(LINE_SPEC)
+    spec.update({"--no-reset": ("no_reset", True), "--dtr": ("dtr", to_onoff), "--rts": ("rts", to_onoff),
+                 "--seconds": ("seconds", to_seconds), "-t": ("seconds", to_seconds), "--idle": ("idle", to_seconds),
+                 "--lines": ("lines", int), "--until": ("until", str), "--send": ("send", str), "--eol": ("eol", str),
+                 "--hex": ("hex", True), "--timestamp": ("stamp", True), "-T": ("stamp", True),
+                 "--no-input": ("no_input", True), "--wait": ("wait", True), "--json": ("json", True)})
+    o, pos = parse_args(argv, spec)
+    if len(pos) > 1:
+        raise UsbError("Solo un DISPOSITIVO. Prueba: nexo usb help", EXIT_USAGE)
+    line = line_from_opts(o)
+    eols = {"lf": b"\n", "cr": b"\r", "crlf": b"\r\n", "none": None}
+    if o.get("eol", "lf") not in eols:
+        raise UsbError("--eol: lf, cr, crlf o none", EXIT_USAGE)
+    eol = eols[o.get("eol", "lf")]
+    rx = None
+    if "until" in o:
+        try:
+            rx = re.compile(o["until"].encode("utf-8"))
+        except re.error as e:
+            raise UsbError("--until no es una expresión regular válida (%s)" % e, EXIT_USAGE)
+    reset = not o.get("no_reset", False)
+    dtr, rts = o.get("dtr", reset), o.get("rts", reset)
+
+    link = connect_app()
+    sock = None
+    session = None
+    old_attr = None
+    code = 0
+    why = ""
+    try:
+        dev = wait_for_device(link, pos[0] if pos else None, o.get("wait"))
+        ensure_permission(link, dev, log, 60.0)
+        view = call_app(link, "usb.open", 15.0, device=dev["id"], baud=line["baud"], bits=line["bits"],
+                        parity=line["parity"], stop=line["stop"], dtr=dtr, rts=rts)
+        session = view["session"]
+        try:
+            sock, rest = open_data(link.cfg, session)
+        except BridgeError as e:
+            raise explain(e)
+        tty_in = False
+        try:
+            tty_in = os.isatty(0)
+        except OSError:
+            pass
+        forward = not o.get("no_input")
+        if tty_in and forward:
+            old_attr = termios.tcgetattr(0)
+            new = termios.tcgetattr(0)
+            new[0] &= ~(termios.IXON | termios.ICRNL | termios.INLCR | termios.IGNCR)
+            new[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN)
+            new[6][termios.VMIN] = 1
+            new[6][termios.VTIME] = 0
+            termios.tcsetattr(0, termios.TCSADRAIN, new)
+        if sys.stderr.isatty():
+            log("%s (%s) · %s · %s%s" % (dev_title(dev), dev_vidpid(dev), view.get("driver", "?"), line_str(line),
+                                        "   —   salir: Ctrl+]" if tty_in and forward else ""))
+        pr = Collector() if o.get("json") else Printer(o.get("hex"), o.get("stamp"))
+        tail = b""
+        total = 0
+        nlines = 0
+        matched = False
+        start = last_rx = time.monotonic()
+        eof_at = None
+        if "send" in o:
+            sock.sendall(unescape(o["send"]))
+        stdin_open = forward
+
+        def got(data):
+            nonlocal tail, total, nlines, matched, last_rx
+            pr.feed(data)
+            total += len(data)
+            nlines += data.count(b"\n")
+            last_rx = time.monotonic()
+            if rx is not None and not matched:
+                tail = (tail + data)[-65536:]
+                if rx.search(tail):
+                    matched = True
+
+        if rest:
+            got(rest)
+        done = False
+        while not done:
+            fds = [sock] + ([0] if stdin_open else [])
+            try:
+                r, _, _ = select.select(fds, [], [], 0.25)
+            except InterruptedError:
+                continue
+            now = time.monotonic()
+            if sock in r:
+                data = sock.recv(65536)
+                if not data:
+                    # Si la app murió, la conexión de control cae a la vez que la de datos: es otra causa que desenchufar.
+                    if link.dead.wait(0.5):
+                        code, why = EXIT_NOAPP, "Se perdió la conexión con la app Nexo (%s)." % (link.reason or "?")
+                    else:
+                        code, why = EXIT_GONE, "El dispositivo se desenchufó (o la app cerró el flujo de datos)."
+                    break
+                got(data)
+            else:
+                pr.idle()
+            if stdin_open and 0 in r:
+                try:
+                    data = os.read(0, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    stdin_open = False
+                    eof_at = now
+                else:
+                    if tty_in:
+                        i = data.find(b"\x1d")
+                        if i >= 0:
+                            data, done = data[:i], True
+                        if eol is not None:
+                            data = data.replace(b"\r", eol)
+                    elif "eol" in o and eol is not None:
+                        data = data.replace(b"\n", eol)
+                    if data:
+                        sock.sendall(data)
+            if link.dead.is_set():
+                code, why = EXIT_NOAPP, "Se perdió la conexión con la app Nexo (%s)." % (link.reason or "?")
+                break
+            if matched or (o.get("lines") and nlines >= o["lines"]):
+                break
+            if o.get("seconds") is not None and now - start >= o["seconds"]:
+                break
+            idle = o.get("idle")
+            if idle is None and eof_at is not None and o.get("seconds") is None:
+                idle = 1.0                       # una tubería que ya acabó: espera la respuesta y sale
+            if idle is not None and now - max(last_rx, eof_at or 0) >= idle:
+                break
+        if code == 0 and rx is not None and not matched:
+            code, why = EXIT_TIMEOUT, "No apareció lo que buscaba --until."
+        if o.get("json"):
+            sys.stdout.write(json.dumps({"bytes": total, "lines": nlines, "matched": matched,
+                                         "elapsed": round(time.monotonic() - start, 3),
+                                         "text": bytes(pr.buf).decode("utf-8", "replace"), "hex": bytes(pr.buf).hex()},
+                                        ensure_ascii=False) + "\n")
+        else:
+            pr.idle()
+        if why:
+            if old_attr is not None:
+                termios.tcsetattr(0, termios.TCSADRAIN, old_attr)
+                old_attr = None
+            log("\n" + why if sys.stderr.isatty() else why)
+        return code
+    except (KeyboardInterrupt, BrokenPipeError):
+        return 0
+    finally:
+        if old_attr is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSADRAIN, old_attr)
+            except (termios.error, OSError):
+                pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if session is not None:
+            try:
+                link.call("usb.close", 3.0, session=session)
+            except BridgeError:
+                pass
+        link.close()
+
+
+# ----------------------------------------------------------------------------------------------------- bridge: piezas
+
+TCGETS2 = 0x802C542A
+TCSETS2 = 0x402C542B
+CBAUD = 0o10017
+BOTHER = 0o10000
+CMSPAR = 0o10000000000
+IN_OPEN, IN_CLOSE_WRITE, IN_CLOSE_NOWRITE = 0x20, 0x8, 0x10
+RESET_SETTLE = 0.15       # tras el pulso de reinicio, lo que tarda el cargador del Arduino en estar escuchando
+
+STD_SPEEDS = {}
+for _n in (50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400,
+           460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000, 3000000, 3500000, 4000000):
+    _c = getattr(termios, "B%d" % _n, None)
+    if _c is not None:
+        STD_SPEEDS[_n] = _c
+
+
+def pty_get_line(fd):
+    """La línea serie que un programa le ha puesto al PTY: dict(baud, bits, parity, stop), o None si no se puede saber."""
+    try:
+        raw = fcntl.ioctl(fd, TCGETS2, b"\0" * 44)
+        cflag = struct.unpack_from("=I", raw, 8)[0]
+        ospeed = struct.unpack_from("=I", raw, 40)[0]
+    except (OSError, struct.error):
+        try:
+            t = termios.tcgetattr(fd)
+        except termios.error:
+            return None
+        cflag = t[2]
+        ospeed = next((n for n, c in STD_SPEEDS.items() if c == t[5]), 0)
+    if not ospeed:
+        return None                       # B0 = «colgar», no es una velocidad
+    bits = {termios.CS5: 5, termios.CS6: 6, termios.CS7: 7, termios.CS8: 8}[cflag & termios.CSIZE]
+    if cflag & termios.PARENB:
+        if cflag & CMSPAR:
+            parity = "mark" if cflag & termios.PARODD else "space"
+        else:
+            parity = "odd" if cflag & termios.PARODD else "even"
+    else:
+        parity = "none"
+    return {"baud": ospeed, "bits": bits, "parity": parity, "stop": 2 if cflag & termios.CSTOPB else 1}
+
+
+def pty_init(fd, line):
+    """El PTY como un puerto serie «en crudo» (sin eco, sin traducciones) y con la línea inicial."""
+    t = termios.tcgetattr(fd)
+    t[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK | termios.ISTRIP | termios.IXON | termios.INLCR | termios.IGNCR | termios.IXOFF)
+    t[1] &= ~termios.OPOST
+    t[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.IEXTEN | termios.ISIG)
+    t[6][termios.VMIN] = 1
+    t[6][termios.VTIME] = 0
+    c = t[2] & ~(termios.CSIZE | termios.PARENB | termios.PARODD | termios.CSTOPB | termios.HUPCL | CMSPAR)
+    c |= {5: termios.CS5, 6: termios.CS6, 7: termios.CS7, 8: termios.CS8}[line["bits"]] | termios.CREAD | termios.CLOCAL
+    if line["parity"] != "none":
+        c |= termios.PARENB
+        if line["parity"] in ("odd", "mark"):
+            c |= termios.PARODD
+        if line["parity"] in ("mark", "space"):
+            c |= CMSPAR
+    if line["stop"] != 1:
+        c |= termios.CSTOPB
+    t[2] = c
+    code = STD_SPEEDS.get(line["baud"])
+    if code is not None:
+        t[4] = t[5] = code
+    termios.tcsetattr(fd, termios.TCSANOW, t)
+    if code is None:                      # una velocidad que no tiene constante B…: termios2 con BOTHER
+        try:
+            raw = bytearray(fcntl.ioctl(fd, TCGETS2, b"\0" * 44))
+            cf = struct.unpack_from("=I", raw, 8)[0]
+            struct.pack_into("=I", raw, 8, (cf & ~CBAUD) | BOTHER)
+            struct.pack_into("=II", raw, 36, line["baud"], line["baud"])
+            fcntl.ioctl(fd, TCSETS2, bytes(raw))
+        except OSError as e:
+            dbg("no pude poner %d baudios al PTY (%s)" % (line["baud"], e))
+
+
+def inotify_watch(path):
+    """Un descriptor de inotify que avisa de cada apertura y cierre de `path`. OSError si el sistema no lo permite."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = libc.inotify_init1
+        add = libc.inotify_add_watch
+    except (OSError, AttributeError) as e:
+        raise OSError(errno.ENOSYS, "sin inotify (%s)" % e)
+    init.argtypes = [ctypes.c_int]
+    init.restype = ctypes.c_int
+    add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    add.restype = ctypes.c_int
+    fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    if add(fd, os.fsencode(path), IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) < 0:
+        e = ctypes.get_errno()
+        os.close(fd)
+        raise OSError(e, os.strerror(e))
+    return fd
+
+
+def inotify_masks(fd):
+    try:
+        data = os.read(fd, 4096)
+    except (BlockingIOError, InterruptedError):
+        return []
+    out = []
+    i = 0
+    while i + 16 <= len(data):
+        _wd, mask, _cookie, ln = struct.unpack_from("=iIII", data, i)
+        out.append(mask)
+        i += 16 + ln
+    return out
+
+
+def proc_holders(path):
+    """Cuántos procesos (de tu mismo usuario) tienen abierto `path`, mirando /proc/PID/fd. None si /proc no se puede leer."""
+    me = os.getpid()
+    n = 0
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for p in pids:
+        if int(p) == me:
+            continue
+        d = "/proc/%s/fd" % p
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for f in names:
+            try:
+                if os.readlink(d + "/" + f) == path:
+                    n += 1
+                    break
+            except OSError:
+                continue
+    return n
+
+
+class Sink(object):
+    """Cola de salida con hilo propio: lo que llega del dispositivo para un destino que puede ir lento (PTY o cliente de red)."""
+
+    LIMIT = 1 << 20
+
+    def __init__(self, name, write, on_error):
+        self._write = write
+        self._on_error = on_error
+        self.cv = threading.Condition()
+        self.q = collections.deque()
+        self.size = 0
+        self.dropped = 0
+        self.closed = False
+        threading.Thread(target=self._run, name="sink-" + name, daemon=True).start()
+
+    def put(self, data):
+        with self.cv:
+            if self.closed:
+                return
+            self.q.append(data)
+            self.size += len(data)
+            while self.size > self.LIMIT and len(self.q) > 1:
+                old = self.q.popleft()
+                self.size -= len(old)
+                self.dropped += len(old)
+            self.cv.notify()
+
+    def clear(self):
+        with self.cv:
+            self.q.clear()
+            self.size = 0
+
+    def close(self):
+        with self.cv:
+            self.closed = True
+            self.q.clear()
+            self.size = 0
+            self.cv.notify_all()
+
+    def _run(self):
+        while True:
+            with self.cv:
+                while not self.q and not self.closed:
+                    self.cv.wait()
+                if self.closed:
+                    return
+                data = self.q.popleft()
+                self.size -= len(data)
+            try:
+                self._write(data)
+            except Exception as e:
+                if not self.closed:
+                    self.close()
+                    self._on_error(e)
+                return
+
+
+class Session(object):
+    """Mientras el dispositivo esté abierto: la conexión de control, la de datos y una cola ORDENADA de lo que se le manda
+    (datos y órdenes de línea/DTR/RTS van por la misma cola, así «cambia la velocidad y escribe» llega en ese orden)."""
+
+    HIGH = 1 << 20
+
+    def __init__(self, br, link, dev, view, sock, rest):
+        self.br, self.link, self.dev, self.view = br, link, dev, view
+        self.id = view["session"]
+        self.sock, self.rest = sock, rest
+        self.q = collections.deque()
+        self.qbytes = 0
+        self.cv = threading.Condition()
+        self.closed = threading.Event()
+        self.lost_reason = ""
+        self.rx = 0
+        self.tx = 0
+
+    def start(self):
+        threading.Thread(target=self._reader, name="usb-rx", daemon=True).start()
+        threading.Thread(target=self._writer, name="usb-tx", daemon=True).start()
+
+    def fail(self, reason):
+        with self.cv:
+            if self.closed.is_set():
+                return
+            self.lost_reason = reason
+            self.closed.set()
+            self.cv.notify_all()
+        self.br.wake.set()
+
+    def _reader(self):
+        try:
+            if self.rest:
+                self.rx += len(self.rest)
+                self.br.on_rx(self.rest)
+            while not self.closed.is_set():
+                data = self.sock.recv(65536)
+                if not data:
+                    if self.link.dead.wait(0.5):          # la app murió (cayó también la conexión de control)
+                        self.fail("se perdió la conexión con la app Nexo")
+                    else:
+                        self.fail("el dispositivo se desenchufó (o la app cerró el flujo de datos)")
+                    return
+                self.rx += len(data)
+                self.br.on_rx(data)
+        except OSError as e:
+            self.fail("se cortó el flujo de datos (%s)" % (e.strerror or e))
+
+    def _writer(self):
+        while True:
+            with self.cv:
+                while not self.q and not self.closed.is_set():
+                    self.cv.wait()
+                if self.closed.is_set():
+                    return
+                op = self.q.popleft()
+                if op[0] == "d":
+                    self.qbytes -= len(op[1])
+                    self.cv.notify_all()
+            try:
+                if op[0] == "d":
+                    self.sock.sendall(op[1])
+                    self.tx += len(op[1])
+                elif op[0] == "setup":
+                    self._call("usb.setup", **op[1])
+                elif op[0] == "lines":
+                    self._call("usb.control", dtr=op[1], rts=op[2])
+                elif op[0] == "brk":
+                    self._call("usb.control", brk=op[1])
+            except OSError as e:
+                self.fail("no pude escribir al dispositivo (%s)" % (e.strerror or e))
+                return
+
+    def _call(self, cmd, **params):
+        try:
+            return self.link.call(cmd, 8.0, session=self.id, **params)
+        except BridgeError as e:
+            if e.code in ("timeout", "no_connection", "not_found"):
+                self.fail("la app dejó de contestar (%s)" % e.message)
+            else:
+                log("USB: «%s» falló: %s" % (cmd, e.message))      # p. ej. una velocidad que el adaptador no admite: se sigue
+        return None
+
+    def send(self, data):
+        with self.cv:
+            while self.qbytes > self.HIGH and not self.closed.is_set():
+                self.cv.wait(0.5)
+            if self.closed.is_set():
+                return False
+            self.q.append(("d", data))
+            self.qbytes += len(data)
+            self.cv.notify_all()
+        return True
+
+    def ctl(self, op):
+        with self.cv:
+            if self.closed.is_set():
+                return
+            if op[0] == "setup" and self.q and self.q[-1][0] == "setup":
+                self.q[-1] = op                   # varios cambios seguidos de velocidad/formato: solo importa el último
+            else:
+                self.q.append(op)
+            self.cv.notify_all()
+
+    def close(self, polite=True):
+        self.fail("cerrada")
+        if polite and not self.link.dead.is_set():
+            try:
+                self.link.call("usb.close", 3.0, session=self.id)
+            except BridgeError:
+                pass
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.link.close()
+
+
+class PtyFront(object):
+    """Un pseudo-terminal que cualquier programa de la distro ve como «un puerto serie».
+
+    Un PTY no puede llevar DTR/RTS (no hay ioctl de módem), así que:
+      · la velocidad y el formato se leen del termios del PTY y se pasan al adaptador (antes de cada dato que se reenvía);
+      · el reinicio automático de los Arduino (que ocurre al ABRIR el puerto) se emula: al abrirlo el primer programa se
+        pulsa DTR/RTS, y al cerrarlo el último se sueltan. Para saber cuándo abren y cierran se usa inotify, o /proc/PID/fd
+        si el sistema no deja usar inotify en /dev/pts."""
+
+    def __init__(self, br, link_path, auto_reset):
+        self.br = br
+        self.auto_reset = auto_reset
+        self.master, self.slave = os.openpty()
+        self.path = os.ttyname(self.slave)
+        pty_init(self.slave, br.line)
+        os.set_blocking(self.master, False)
+        self.last_line = pty_get_line(self.slave) or dict(br.line)
+        self.opens = 0
+        self.mode = "none"
+        self.ino = None
+        self.link_path = link_path
+        self.stop = threading.Event()
+        force = os.environ.get("NEXO_USB_WATCH", "")       # solo para depurar: inotify | proc | none
+        try:
+            if force in ("proc", "none"):
+                raise OSError(errno.ENOSYS, "desactivado con NEXO_USB_WATCH=%s" % force)
+            self.ino = inotify_watch(self.path)
+            self.mode = "inotify"
+        except OSError as e:
+            dbg("inotify no sirve aquí (%s)" % (e.strerror or e))
+            if force != "none" and proc_holders(self.path) is not None:
+                self.mode = "proc"
+        if self.mode == "none" and auto_reset:
+            log("Aviso: no puedo saber cuándo un programa abre o cierra el puerto (ni inotify ni /proc): sin reinicio automático del Arduino. "
+                "«nexo usb reset» lo reinicia a mano.")
+        self.sink = Sink("pty", self._write_master, lambda e: log("PTY: %s" % e))
+        self._link()
+        threading.Thread(target=self._run, name="pty", daemon=True).start()
+
+    def _link(self):
+        lp = self.link_path
+        d = os.path.dirname(lp)
+        if d:
+            try:
+                os.makedirs(d, 0o700)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise UsbError("No puedo crear la carpeta %s (%s)" % (d, e.strerror or e))
+        tmp = "%s.%d.tmp" % (lp, os.getpid())
+        try:
+            os.symlink(self.path, tmp)
+            if os.path.isdir(lp) and not os.path.islink(lp):
+                raise UsbError("%s es una carpeta: pon --link con un nombre de archivo" % lp, EXIT_USAGE)
+            os.replace(tmp, lp)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise UsbError("No puedo crear el enlace %s (%s)" % (lp, e.strerror or e))
+
+    def deliver(self, data):
+        """Lo que llega del dispositivo. Si nadie tiene abierto el puerto se tira (así el siguiente que lo abra no recibe restos)."""
+        if self.opens > 0 or self.mode == "none":
+            self.sink.put(data)
+
+    def _write_master(self, data):
+        view = memoryview(data)
+        while view and not self.stop.is_set():
+            if self.opens == 0 and self.mode != "none":
+                return
+            try:
+                n = os.write(self.master, view)
+            except BlockingIOError:
+                select.select([], [self.master], [], 0.2)
+                continue
+            except OSError as e:
+                if e.errno == errno.EIO:
+                    return
+                raise
+            view = view[n:]
+
+    def _opened(self):
+        self.sink.clear()
+        try:
+            termios.tcflush(self.slave, termios.TCIFLUSH)
+        except termios.error:
+            pass
+        log("puerto %s abierto por un programa" % os.path.basename(self.link_path))
+        if self.auto_reset and self.br.reset_pulse(hold=True):
+            time.sleep(RESET_SETTLE)
+
+    def _closed(self):
+        self.sink.clear()
+        log("puerto %s cerrado" % os.path.basename(self.link_path))
+        if self.auto_reset:
+            self.br.lines_off()
+
+    def _follow(self):
+        cur = pty_get_line(self.slave)
+        if cur is not None and cur != self.last_line:
+            self.last_line = cur
+            self.br.set_line(cur, "PTY")
+
+    def _run(self):
+        next_scan = 0.0
+        while not self.stop.is_set():
+            fds = [self.master] + ([self.ino] if self.ino is not None else [])
+            try:
+                r, _, _ = select.select(fds, [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if self.ino is not None and self.ino in r:
+                for mask in inotify_masks(self.ino):
+                    if mask & IN_OPEN:
+                        self.opens += 1
+                        if self.opens == 1:
+                            self._opened()
+                    elif mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) and self.opens > 0:
+                        self.opens -= 1
+                        if self.opens == 0:
+                            self._closed()
+            if self.mode == "proc" and time.monotonic() >= next_scan:
+                next_scan = time.monotonic() + 0.25
+                n = proc_holders(self.path)
+                if n is not None:
+                    was = self.opens
+                    self.opens = n
+                    if n > 0 and was == 0:
+                        self._opened()
+                    elif n == 0 and was > 0:
+                        self._closed()
+            if self.master in r:
+                try:
+                    data = os.read(self.master, 65536)
+                except (BlockingIOError, InterruptedError):
+                    data = b""
+                except OSError:
+                    data = b""
+                    time.sleep(0.05)
+                self._follow()                    # primero la velocidad nueva y después los datos
+                if data:
+                    self.br.tx(data)
+            else:
+                self._follow()
+
+    def close(self):
+        self.stop.set()
+        self.sink.close()
+        try:
+            if os.readlink(self.link_path) == self.path:
+                os.unlink(self.link_path)
+        except OSError:
+            pass
+        for fd in (self.ino, self.master, self.slave):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+# ----------------------------------------------------------------------------------------------------- bridge: red
+
+IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
+T_BINARY, T_ECHO, T_SGA, T_COM = 0, 1, 3, 44
+(C_SIGNATURE, C_BAUD, C_DATASIZE, C_PARITY, C_STOPSIZE, C_CONTROL, C_LINESTATE, C_MODEMSTATE, C_FC_SUSPEND, C_FC_RESUME,
+ C_LINEMASK, C_MODEMMASK, C_PURGE) = range(13)
+RFC_PARITY = {1: "none", 2: "odd", 3: "even", 4: "mark", 5: "space"}
+PARITY_RFC = dict((v, k) for k, v in RFC_PARITY.items())
+RFC_STOP = {1: 1, 2: 2, 3: 1.5}
+STOP_RFC = {1: 1, 2: 2, 1.5: 3}
+
+
+class NetClient(object):
+    """Un cliente TCP del puente (RFC2217 o crudo): un hilo que lee, y una cola con su hilo que escribe."""
+
+    kind = "net"
+    count = 0
+
+    def __init__(self, br, sock, addr):
+        NetClient.count += 1
+        self.br, self.sock, self.addr = br, sock, addr
+        self.n = NetClient.count
+        self.closed = False
+        self.sink = Sink("%s%d" % (self.kind, self.n), self._send, lambda e: self.close("no pude escribirle (%s)" % e))
+
+    def _send(self, data):
+        self.sock.sendall(data)
+
+    def start(self):
+        threading.Thread(target=self._run, name="%s%d" % (self.kind, self.n), daemon=True).start()
+
+    def deliver(self, data):
+        self.sink.put(data)
+
+    def close(self, why=""):
+        if self.closed:
+            return
+        self.closed = True
+        self.sink.close()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.br.client_left(self, why)
+
+    def _run(self):
+        try:
+            self.br.client_joined(self)
+            self.loop()
+            self.close("")
+        except OSError as e:
+            self.close(e.strerror or "")
+        except Exception as e:
+            log("error con el cliente %s %s: %r" % (self.kind, self.addr, e))
+            self.close("error interno")
+
+    def loop(self):
+        raise NotImplementedError
+
+
+class RawClient(NetClient):
+    """TCP crudo: lo que entra va al dispositivo y lo que sale del dispositivo va al cliente (avrdude net:, nc, socat…)."""
+
+    kind = "raw"
+
+    def loop(self):
+        while not self.closed:
+            data = self.sock.recv(65536)
+            if not data:
+                return
+            self.br.tx(data)
+
+
+class Rfc2217Client(NetClient):
+    """Servidor RFC 2217 (control de puerto serie sobre Telnet): lo que hablan pyserial («rfc2217://»), esptool y PlatformIO."""
+
+    kind = "rfc2217"
+
+    def __init__(self, br, sock, addr):
+        NetClient.__init__(self, br, sock, addr)
+        self.st = 0
+        self.cmd = 0
+        self.sb = bytearray()
+        self.we = {}                  # opción → 0 no · 1 la pedimos · 2 sí      (lo que hacemos nosotros: WILL)
+        self.they = {}                # lo mismo para lo que hace el cliente     (DO)
+        self.line = dict(br.line)
+        self.dtr = br.dtr
+        self.rts = br.rts
+        self.brk = False
+        self.touched = False
+
+    def deliver(self, data):
+        self.sink.put(data.replace(b"\xff", b"\xff\xff"))
+
+    def _put(self, *b):
+        self.sink.put(bytes(bytearray(b)))
+
+    def hello(self):
+        for opt in (T_COM, T_BINARY):
+            self.we[opt] = 1
+            self._put(IAC, WILL, opt)
+            self.they[opt] = 1
+            self._put(IAC, DO, opt)
+        self.we[T_SGA] = 1
+        self._put(IAC, WILL, T_SGA)
+        self.we[T_ECHO] = 1
+        self._put(IAC, WILL, T_ECHO)
+
+    def loop(self):
+        self.hello()
+        while not self.closed:
+            data = self.sock.recv(65536)
+            if not data:
+                return
+            user = self.feed(data)
+            if user:
+                self.br.tx(user)
+
+    # --- Telnet
+    def feed(self, data):
+        if self.st == 0 and b"\xff" not in data:
+            return data
+        out = bytearray()
+        for b in bytearray(data):
+            st = self.st
+            if st == 0:
+                if b == IAC:
+                    self.st = 1
+                else:
+                    out.append(b)
+            elif st == 1:
+                if b == IAC:
+                    out.append(255)
+                    self.st = 0
+                elif b in (WILL, WONT, DO, DONT):
+                    self.cmd = b
+                    self.st = 2
+                elif b == SB:
+                    self.sb = bytearray()
+                    self.st = 3
+                else:
+                    self.st = 0
+            elif st == 2:
+                self.option(self.cmd, b)
+                self.st = 0
+            elif st == 3:
+                if b == IAC:
+                    self.st = 4
+                else:
+                    self.sb.append(b)
+            else:
+                if b == IAC:
+                    self.sb.append(255)
+                    self.st = 3
+                elif b == SE:
+                    self.sub(bytes(self.sb))
+                    self.st = 0
+                else:
+                    self.st = 0
+        return bytes(out)
+
+    def option(self, cmd, opt):
+        mine = opt in (T_COM, T_BINARY, T_SGA, T_ECHO)          # lo que ofrecemos (WILL)
+        theirs = opt in (T_COM, T_BINARY)                       # lo que le pedimos al cliente (DO)
+        if cmd == DO:
+            if mine:
+                if self.we.get(opt, 0) == 0:
+                    self._put(IAC, WILL, opt)
+                self.we[opt] = 2
+            else:
+                self._put(IAC, WONT, opt)
+        elif cmd == DONT:
+            if self.we.get(opt, 0) == 2:
+                self._put(IAC, WONT, opt)
+            self.we[opt] = 0
+        elif cmd == WILL:
+            if theirs:
+                if self.they.get(opt, 0) == 0:
+                    self._put(IAC, DO, opt)
+                self.they[opt] = 2
+            else:
+                self._put(IAC, DONT, opt)
+        elif cmd == WONT:
+            if self.they.get(opt, 0) == 2:
+                self._put(IAC, DONT, opt)
+            self.they[opt] = 0
+
+    def reply(self, code, value=b""):
+        payload = (bytes(bytearray([code + 100])) + value).replace(b"\xff", b"\xff\xff")
+        self.sink.put(bytes(bytearray([IAC, SB, T_COM])) + payload + bytes(bytearray([IAC, SE])))
+
+    def sub(self, p):
+        if len(p) < 2 or p[0] != T_COM:
+            return
+        cmd, val = p[1], p[2:]
+        br = self.br
+        if cmd == C_SIGNATURE:
+            self.reply(C_SIGNATURE, ("Nexo USB " + NEXO_USB_VERSION).encode())
+        elif cmd == C_BAUD and len(val) == 4:
+            n = struct.unpack("!I", val)[0]
+            if n and 50 <= n <= 4000000:
+                self.line["baud"] = n
+                self.apply_line()
+            self.reply(C_BAUD, struct.pack("!I", self.line["baud"]))
+        elif cmd == C_DATASIZE and len(val) == 1:
+            if val[0] in (5, 6, 7, 8):
+                self.line["bits"] = val[0]
+                self.apply_line()
+            self.reply(C_DATASIZE, bytes(bytearray([self.line["bits"]])))
+        elif cmd == C_PARITY and len(val) == 1:
+            if val[0] in RFC_PARITY:
+                self.line["parity"] = RFC_PARITY[val[0]]
+                self.apply_line()
+            self.reply(C_PARITY, bytes(bytearray([PARITY_RFC[self.line["parity"]]])))
+        elif cmd == C_STOPSIZE and len(val) == 1:
+            if val[0] in RFC_STOP:
+                self.line["stop"] = RFC_STOP[val[0]]
+                self.apply_line()
+            self.reply(C_STOPSIZE, bytes(bytearray([STOP_RFC[self.line["stop"]]])))
+        elif cmd == C_CONTROL and len(val) == 1:
+            self.control(val[0])
+        elif cmd == C_LINEMASK and len(val) == 1:
+            self.reply(C_LINEMASK, val)
+        elif cmd == C_MODEMMASK and len(val) == 1:
+            self.reply(C_MODEMMASK, val)
+            self.sink.put(bytes(bytearray([IAC, SB, T_COM, C_MODEMSTATE + 100, 0xB0 & val[0], IAC, SE])))
+        elif cmd == C_PURGE and len(val) == 1:
+            self.reply(C_PURGE, val)
+        elif cmd in (C_FC_SUSPEND, C_FC_RESUME):
+            pass
+
+    def apply_line(self):
+        self.touched = True
+        self.br.set_line(self.line, "RFC2217")
+
+    def control(self, v):
+        """SET-CONTROL: DTR, RTS, BREAK y control de flujo. La respuesta repite el valor pedido (así lo comprueba pyserial)."""
+        if v == 0:
+            self.reply(C_CONTROL, b"\x01")                     # ¿control de flujo? → ninguno
+        elif v == 1:
+            self.reply(C_CONTROL, b"\x01")
+        elif v in (2, 3):
+            log("RFC2217: un cliente pide control de flujo por %s y Nexo no lo tiene; sigue sin control de flujo"
+                % ("XON/XOFF" if v == 2 else "RTS/CTS"))
+            self.reply(C_CONTROL, b"\x01")                     # la verdad: no se aplica
+        elif v == 4:
+            self.reply(C_CONTROL, b"\x05" if self.brk else b"\x06")
+        elif v in (5, 6):
+            self.brk = v == 5
+            self.touched = True
+            self.br.set_break(self.brk)
+            self.reply(C_CONTROL, bytes(bytearray([v])))
+        elif v == 7:
+            self.reply(C_CONTROL, b"\x08" if self.dtr else b"\x09")
+        elif v in (8, 9):
+            self.dtr = v == 8
+            self.touched = True
+            self.br.set_lines(self.dtr, self.rts)
+            self.reply(C_CONTROL, bytes(bytearray([v])))
+        elif v == 10:
+            self.reply(C_CONTROL, b"\x0b" if self.rts else b"\x0c")
+        elif v in (11, 12):
+            self.rts = v == 11
+            self.touched = True
+            self.br.set_lines(self.dtr, self.rts)
+            self.reply(C_CONTROL, bytes(bytearray([v])))
+
+
+class Listener(object):
+    def __init__(self, br, cls, host, port):
+        self.br, self.cls = br, cls
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind((host, port))
+        except OSError as e:
+            self.sock.close()
+            raise UsbError("No puedo escuchar en %s:%d (%s). ¿Ya hay un puente en ese puerto? (mira: nexo usb status)" % (host, port, e.strerror or e))
+        self.sock.listen(5)
+        self.sock.settimeout(0.5)
+        self.host, self.port = host, self.sock.getsockname()[1]
+        self.stop = threading.Event()
+        threading.Thread(target=self._accept, name="listen-%s" % cls.kind, daemon=True).start()
+
+    def _accept(self):
+        while not self.stop.is_set():
+            try:
+                c, addr = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if self.br.session is None:
+                c.close()                         # sin dispositivo no hay a quién conectar
+                continue
+            c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            c.settimeout(None)
+            self.cls(self.br, c, addr).start()
+
+    def close(self):
+        self.stop.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------------------------------- bridge: el puente
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (ValueError, TypeError, OverflowError, OSError):
+        return False
+    return True
+
+
+def is_ours(pid):
+    """¿Es de verdad un nexo-usb? (por si el sistema reutilizó el número de proceso)"""
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as f:
+            return b"nexo-usb" in f.read()
+    except (OSError, ValueError):
+        return True                           # sin /proc no se puede saber: se fía del número
+
+
+def cleanup_state(path, st):
+    lp = st.get("link")
+    try:
+        if lp and os.readlink(lp) == st.get("pty"):
+            os.unlink(lp)
+    except OSError:
+        pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def read_states(clean=True):
+    """Los puentes en marcha (sus archivos de estado; los de procesos que ya no existen se limpian)."""
+    d = state_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    out = []
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(d, fn)
+        try:
+            with open(p, encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(st, dict) or "name" not in st:
+            continue
+        if not pid_alive(st.get("pid")) or not is_ours(st.get("pid")):
+            if clean:
+                cleanup_state(p, st)
+            continue
+        out.append(st)
+    return out
+
+
+def free_name():
+    live = set(s.get("name") for s in read_states())
+    for n in range(100):
+        if "usb%d" % n not in live:
+            return "usb%d" % n
+    raise UsbError("Hay demasiados puentes USB en marcha (mira: nexo usb status).")
+
+
+def format_banner(info, detached):
+    d = info.get("device") or {}
+    out = ["✔ %s (%s:%s) · %s · %s" % (d.get("title") or "?", d.get("vid"), d.get("pid"), info.get("driver", "?"), line_str(info["line"]))]
+    if info.get("link"):
+        out.append("  Puerto serie:  %s" % info["link"])
+        out.append("                 úsalo donde pondrías /dev/ttyACM0 (avrdude -P, arduino-cli -p, minicom -D, screen, pyserial…)")
+        if info.get("auto_reset"):
+            out.append("                 al abrirlo un programa, el Arduino se reinicia (como en un PC); --no-auto-reset lo evita")
+    if info.get("rfc2217"):
+        out.append("  RFC2217:       rfc2217://%s   (esptool --port rfc2217://%s · pyserial serial_for_url)" % (info["rfc2217"], info["rfc2217"]))
+    if info.get("tcp"):
+        out.append("  TCP crudo:     %s   (avrdude -c arduino -P net:%s)" % (info["tcp"], info["tcp"]))
+    out.append("  Para cerrarlo: nexo usb stop %s%s" % (info.get("name", ""), "" if detached else "   (o Ctrl+C en esta terminal)"))
+    return "\n".join(out)
+
+
+class FgNotifier(object):
+    """El puente en primer plano: todo va a la terminal."""
+    detached = False
+
+    def say(self, msg):
+        log(msg)
+
+    def ready(self, info):
+        log(format_banner(info, False))
+
+    def fail(self, e):
+        pass
+
+
+class PipeNotifier(object):
+    """El puente en segundo plano: hasta estar listo, cuenta lo que pasa al proceso que lo lanzó (por un tubo) y al registro."""
+    detached = True
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def _w(self, obj):
+        if self.fd is not None:
+            try:
+                os.write(self.fd, jline(obj))
+            except OSError:
+                pass
+
+    def say(self, msg):
+        log(msg)
+        self._w({"t": "msg", "m": msg})
+
+    def ready(self, info):
+        log("listo: %s" % json.dumps(info, ensure_ascii=False))
+        self._w({"t": "ready", "info": info})
+        self.close()
+
+    def fail(self, e):
+        self._w({"t": "fail", "code": e.code, "m": e.message})
+        self.close()
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+class Bridge(object):
+    """Mantiene abierto el adaptador y lo ofrece por el PTY, RFC2217 y TCP; si se desenchufa, espera y lo vuelve a abrir."""
+
+    def __init__(self, o, nt):
+        self.o = o
+        self.nt = nt
+        self.stop = threading.Event()
+        self.wake = threading.Event()
+        self.reset_req = threading.Event()
+        self.slock = threading.Lock()
+        self.sel = o.get("sel")
+        self.sig = None
+        self.line = dict(o["line"])
+        self.dtr = bool(o.get("dtr", False))
+        self.rts = bool(o.get("rts", False))
+        self.session = None
+        self.pty = None
+        self.listeners = []
+        self.clients = set()
+        self.name = o["name"]
+        self.state_path = os.path.join(state_dir(), self.name + ".json")
+        self.started = int(time.time())
+        self.rx_bytes = 0
+        self.tx_bytes = 0
+        self.dropped_tx = 0
+        self.warned_down = False
+        self.auto_reset = not o.get("no_auto_reset")
+        self.closed = False
+
+    def say(self, msg):
+        self.nt.say(msg)
+
+    # --- lo que usan las vías (PTY, clientes de red)
+
+    def on_rx(self, data):
+        self.rx_bytes += len(data)
+        p = self.pty
+        if p is not None:
+            p.deliver(data)
+        with self.slock:
+            cs = list(self.clients)
+        for c in cs:
+            c.deliver(data)
+
+    def tx(self, data):
+        s = self.session
+        if s is not None and s.send(data):
+            self.tx_bytes += len(data)
+            return
+        if not self.warned_down:
+            self.warned_down = True
+            log("no hay dispositivo: se descarta lo que escriben los programas")
+        self.dropped_tx += len(data)
+
+    def set_line(self, line, who):
+        line = dict(line)
+        if line == self.line:
+            return
+        self.line = line
+        log("línea serie (%s): %s" % (who, line_str(line)))
+        s = self.session
+        if s is not None:
+            s.ctl(("setup", dict(line)))
+        self.write_state()
+
+    def set_lines(self, dtr, rts):
+        self.dtr, self.rts = bool(dtr), bool(rts)
+        s = self.session
+        if s is not None:
+            s.ctl(("lines", self.dtr, self.rts))
+
+    def lines_off(self):
+        self.set_lines(False, False)
+
+    def set_break(self, on):
+        s = self.session
+        if s is not None:
+            s.ctl(("brk", bool(on)))
+
+    def reset_pulse(self, hold=True):
+        """DTR/RTS de apagado a encendido: es lo que reinicia un Arduino (y lo que hace un PC al abrir el puerto)."""
+        if self.session is None:
+            return False
+        self.set_lines(False, False)
+        time.sleep(0.05)
+        self.set_lines(True, True)
+        if not hold:
+            time.sleep(0.1)
+            self.lines_off()
+        return True
+
+    def manual_reset(self):
+        if self.session is None:
+            log("reinicio: no hay dispositivo conectado")
+            return
+        keep = (self.pty is not None and self.pty.opens > 0) or any(c.kind == "raw" for c in list(self.clients))
+        log("reinicio de la placa (pulso en DTR)")
+        self.reset_pulse(hold=keep)
+
+    def client_joined(self, c):
+        with self.slock:
+            self.clients.add(c)
+            n_raw = sum(1 for x in self.clients if x.kind == "raw")
+        log("cliente %s conectado (%s:%s)" % (c.kind, c.addr[0], c.addr[1]))
+        if c.kind == "raw" and n_raw == 1 and self.auto_reset and self.reset_pulse(hold=True):
+            time.sleep(RESET_SETTLE)
+
+    def client_left(self, c, why):
+        with self.slock:
+            self.clients.discard(c)
+            raw = sum(1 for x in self.clients if x.kind == "raw")
+            rfc = sum(1 for x in self.clients if x.kind == "rfc2217")
+        log("cliente %s desconectado%s" % (c.kind, " (%s)" % why if why else ""))
+        if self.session is None or self.stop.is_set():
+            return
+        if (c.kind == "raw" and raw == 0 and self.auto_reset) or (c.kind == "rfc2217" and rfc == 0 and getattr(c, "touched", False)):
+            self.lines_off()
+
+    # --- el dispositivo
+
+    def on_event(self, name, data):
+        if name != "usb":
+            return
+        s = self.session
+        devs, sess = data.get("devices"), data.get("sessions")
+        if s is None or s.closed.is_set() or devs is None:
+            return
+        if not any(d.get("id") == s.dev.get("id") for d in devs):
+            s.fail("el dispositivo se desenchufó")
+        elif sess is not None and not any(x.get("session") == s.id for x in sess):
+            s.fail("la app cerró la sesión USB")
+
+    def pick(self, devs, sessions):
+        busy = set(x.get("device") for x in sessions)
+        if self.sig is None:
+            return choose_device(devs, self.sel, True)
+        cands = [d for d in devs if d.get("serial_capable") and sig_matches(self.sig, d)]
+        if not cands:
+            raise UsbError("Esperando a %s:%s%s…" % (self.sig[0], self.sig[1], " (serie %s)" % self.sig[2] if self.sig[2] else ""), EXIT_NODEV)
+        return ([d for d in cands if d.get("id") not in busy] or cands)[0]
+
+    def acquire_once(self):
+        cfg = load_config()                       # se relee: «nexo rekey» puede haber cambiado el token
+        if not cfg["NEXO_TOKEN"]:
+            raise UsbError("No hay token. Pega el comando de instalación de la app, o usa: nexo pair TOKEN", EXIT_TOKEN)
+        link = Link(cfg, self.on_event)
+        link.connect()
+        try:
+            if not usb_capable(link.info):
+                raise UsbError("Esta versión de la app Nexo no sabe de USB: instala el APK de la 0.4.1 o más nuevo.", EXIT_ERR)
+            st = call_app(link, "usb.status")
+            dev = self.pick(st.get("devices") or [], st.get("sessions") or [])
+            ensure_permission(link, dev, self.say, self.o.get("perm_timeout", 60.0), self.stop)
+            if self.pty is not None and self.pty.opens > 0 and self.auto_reset:
+                self.dtr = self.rts = True        # un programa sigue con el puerto abierto: el dispositivo nuevo nace «abierto»
+            view = call_app(link, "usb.open", 15.0, device=dev["id"], dtr=self.dtr, rts=self.rts, **self.line)
+            try:
+                sock, rest = open_data(cfg, view["session"])
+            except BridgeError as e:
+                try:
+                    link.call("usb.close", 3.0, session=view["session"])
+                except BridgeError:
+                    pass
+                raise explain(e)
+            sess = Session(self, link, dev, view, sock, rest)
+            self.session = sess
+            sess.start()
+            try:
+                link.call("subscribe", 5.0, topics=["usb"])
+            except BridgeError:
+                pass
+            self.sig = dev_signature(dev)
+            return sess
+        except BaseException:
+            self.session = None
+            link.close()
+            raise
+
+    def acquire(self, first):
+        delay, tries, told = 0.5, 0, None
+        while True:
+            if self.stop.is_set():
+                raise Stopped()
+            try:
+                return self.acquire_once()
+            except BridgeError as e:
+                err = explain(e)
+            except UsbError as e:
+                err = e
+            if isinstance(err, Transient):
+                tries += 1
+                fatal = first and tries > 5
+            elif err.code == EXIT_NODEV:
+                fatal = first and not self.o.get("wait")
+            elif err.code in (EXIT_NOAPP, EXIT_TIMEOUT, EXIT_TOKEN):
+                fatal = first
+            else:
+                fatal = True
+            if fatal:
+                raise err
+            if err.message != told:
+                self.say(err.message if err.code == EXIT_NODEV and not first else err.message)
+                told = err.message
+            if self.stop.wait(delay):
+                raise Stopped()
+            delay = min(delay * 1.5, 3.0)
+
+    def drop_session(self, sess):
+        self.session = None
+        with self.slock:
+            cs = list(self.clients)
+        for c in cs:
+            c.close("el dispositivo ya no está")
+        self.dtr, self.rts = bool(self.o.get("dtr", False)), bool(self.o.get("rts", False))
+        sess.close(polite=not sess.link.dead.is_set())
+
+    # --- vías, estado, bucle
+
+    def create_frontends(self):
+        o = self.o
+        if not o.get("no_pty"):
+            self.pty = PtyFront(self, o.get("link") or os.path.join(state_dir(), self.name + ".tty"), self.auto_reset)
+        for key, cls in (("rfc2217", Rfc2217Client), ("tcp", RawClient)):
+            hp = o.get(key)
+            if hp:
+                if hp[0] not in ("127.0.0.1", "localhost", "::1"):
+                    self.say("Aviso: %s escucha en %s, no solo en este móvil, y no tiene contraseña: cualquiera de esa red podrá usar el adaptador." % (key, hp[0]))
+                l = Listener(self, cls, hp[0], hp[1])
+                l.key = key
+                self.listeners.append(l)
+
+    def info(self, state="conectado"):
+        s = self.session
+        d = s.dev if s is not None else None
+        info = {"name": self.name, "pid": os.getpid(), "version": NEXO_USB_VERSION, "started": self.started, "state": state,
+                "line": dict(self.line), "log": self.o.get("log_path"), "auto_reset": self.auto_reset}
+        if d is not None:
+            info["device"] = {"id": d.get("id"), "vid": d.get("vid"), "pid": d.get("pid"), "vendor": d.get("vendor"),
+                              "product": d.get("product"), "serial": d.get("serial"), "title": dev_title(d)}
+            info["driver"] = s.view.get("driver")
+        elif self.sig is not None:
+            info["device"] = {"vid": self.sig[0], "pid": self.sig[1], "serial": self.sig[2], "title": "%s:%s" % (self.sig[0], self.sig[1])}
+        if self.pty is not None:
+            info["pty"], info["link"], info["pty_watch"] = self.pty.path, self.pty.link_path, self.pty.mode
+        for l in self.listeners:
+            info[l.key] = "%s:%d" % (l.host, l.port)
+        return info
+
+    def write_state(self, state="conectado"):
+        try:
+            ensure_state_dir()
+            tmp = self.state_path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.info(state), f, ensure_ascii=False)
+            os.replace(tmp, self.state_path)
+        except (OSError, UsbError) as e:
+            dbg("no pude escribir el estado: %s" % e)
+
+    def shutdown(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.stop.set()
+        s, self.session = self.session, None
+        if s is not None:
+            s.close(polite=not s.link.dead.is_set())
+        for l in self.listeners:
+            l.close()
+        with self.slock:
+            cs = list(self.clients)
+        for c in cs:
+            c.close("el puente se cierra")
+        if self.pty is not None:
+            self.pty.close()
+        try:
+            os.unlink(self.state_path)
+        except OSError:
+            pass
+        log("puente cerrado · recibido %d bytes del dispositivo · enviado %d" % (self.rx_bytes, self.tx_bytes))
+
+    def run(self):
+        code = 0
+        try:
+            sess = self.acquire(True)
+            self.create_frontends()
+            self.write_state()
+            self.nt.ready(self.info())
+            while True:
+                while not self.stop.is_set() and not sess.closed.is_set():
+                    self.wake.wait(0.5)
+                    self.wake.clear()
+                    if self.reset_req.is_set():
+                        self.reset_req.clear()
+                        self.manual_reset()
+                if self.stop.is_set():
+                    break
+                reason = sess.lost_reason or "se perdió el dispositivo"
+                self.drop_session(sess)
+                log("USB: %s" % reason)
+                if not self.o.get("reconnect", True):
+                    code = EXIT_GONE
+                    break
+                self.write_state("esperando")
+                self.say("Esperando a que vuelva el dispositivo… (el puerto se queda donde está)")
+                try:
+                    sess = self.acquire(False)
+                except Stopped:
+                    break
+                except UsbError as e:
+                    self.say("error: %s" % e.message)
+                    code = e.code
+                    break
+                self.warned_down = False
+                self.write_state()
+                self.say("Dispositivo de vuelta: %s · %s" % (dev_title(sess.dev), line_str(self.line)))
+        except Stopped:
+            pass
+        finally:
+            self.shutdown()
+        return code
+
+
+def run_bridge(o, nt):
+    br = Bridge(o, nt)
+
+    def term(_sig, _frm):
+        br.stop.set()
+        br.wake.set()
+
+    def usr1(_sig, _frm):
+        br.reset_req.set()
+        br.wake.set()
+    signal.signal(signal.SIGTERM, term)
+    signal.signal(signal.SIGINT, term)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN if nt.detached else term)
+    signal.signal(signal.SIGUSR1, usr1)
+    try:
+        return br.run()
+    except UsbError as e:
+        nt.fail(e)
+        if not nt.detached:
+            log("nexo usb: %s" % e.message)
+        else:
+            log("error: %s" % e.message)
+        return e.code
+    except Exception:
+        import traceback
+        log("error inesperado:\n" + traceback.format_exc())
+        nt.fail(UsbError("error inesperado (mira el registro)", EXIT_ERR))
+        return EXIT_ERR
+
+
+def wait_ready(r, logpath):
+    buf = b""
+    end = time.monotonic() + 180
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            log("nexo usb: el puente tarda demasiado en estar listo. Mira su registro: %s" % logpath)
+            return EXIT_TIMEOUT
+        rl, _, _ = select.select([r], [], [], min(left, 1.0))
+        if not rl:
+            continue
+        chunk = os.read(r, 65536)
+        if not chunk:
+            log("nexo usb: el puente en segundo plano terminó sin avisar. Mira su registro: %s" % logpath)
+            return EXIT_ERR
+        buf += chunk
+        while b"\n" in buf:
+            line, _, buf = buf.partition(b"\n")
+            try:
+                m = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            t = m.get("t")
+            if t == "msg":
+                log(m.get("m", ""))
+            elif t == "ready":
+                log(format_banner(m["info"], True))
+                return 0
+            elif t == "fail":
+                log("nexo usb: %s" % m.get("m"))
+                return int(m.get("code", EXIT_ERR))
+
+
+def start_detached(o):
+    ensure_state_dir()
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid > 0:
+        os.close(w)
+        try:
+            os.waitpid(pid, 0)                    # el intermedio sale enseguida
+        except OSError:
+            pass
+        return wait_ready(r, o["log_path"])
+    code = EXIT_ERR
+    try:
+        os.close(r)
+        os.setsid()
+        if os.fork() > 0:
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        lf = os.open(o["log_path"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(lf, 1)
+        os.dup2(lf, 2)
+        Log.stream = os.fdopen(2, "w", buffering=1, encoding="utf-8", errors="replace", closefd=False)
+        Log.stamp = True
+        code = run_bridge(o, PipeNotifier(w))
+    except BaseException:
+        pass
+    finally:
+        os._exit(code)
+
+
+def cmd_bridge(argv):
+    spec = dict(LINE_SPEC)
+    spec.update({"--link": ("link", str), "--no-pty": ("no_pty", True), "--rfc2217": ("rfc2217", to_hostport),
+                 "--tcp": ("tcp", to_hostport), "--no-auto-reset": ("no_auto_reset", True), "--name": ("name", str),
+                 "--detach": ("detach", True), "-d": ("detach", True), "--no-reconnect": ("no_reconnect", True),
+                 "--wait": ("wait", True), "--dtr": ("dtr", to_onoff), "--rts": ("rts", to_onoff),
+                 "--perm-timeout": ("perm_timeout", to_seconds), "--log": ("log", str), "--verbose": ("verbose", True),
+                 "-v": ("verbose", True)})
+    o, pos = parse_args(argv, spec)
+    if len(pos) > 1:
+        raise UsbError("Solo un DISPOSITIVO. Prueba: nexo usb help", EXIT_USAGE)
+    if o.get("no_pty") and not o.get("rfc2217") and not o.get("tcp"):
+        raise UsbError("Con --no-pty hace falta --rfc2217 o --tcp; si no, no hay por dónde usar el adaptador.", EXIT_USAGE)
+    if o.get("no_pty") and o.get("link"):
+        raise UsbError("--link y --no-pty se contradicen.", EXIT_USAGE)
+    cfg = load_config()
+    if not cfg["NEXO_TOKEN"]:
+        raise UsbError("No hay token. Pega en Termux el comando de instalación que copia la app Nexo, o usa: nexo pair TOKEN", EXIT_TOKEN)
+    line = line_from_opts(o)
+    live = set(s.get("name") for s in read_states())
+    name = o.get("name")
+    if name:
+        if not re.match(r"^[A-Za-z0-9_.-]{1,32}$", name):
+            raise UsbError("--name: letras, números, «.», «_» y «-» (hasta 32)", EXIT_USAGE)
+        if name in live:
+            raise UsbError("Ya hay un puente llamado «%s» en marcha (nexo usb stop %s)." % (name, name), EXIT_USAGE)
+    else:
+        name = free_name()
+    ensure_state_dir()
+    opts = {"sel": pos[0] if pos else None, "line": line, "name": name, "dtr": o.get("dtr", False), "rts": o.get("rts", False),
+            "link": os.path.abspath(os.path.expanduser(o["link"])) if o.get("link") else None, "no_pty": o.get("no_pty", False),
+            "rfc2217": o.get("rfc2217"), "tcp": o.get("tcp"), "no_auto_reset": o.get("no_auto_reset", False),
+            "reconnect": not o.get("no_reconnect", False), "wait": o.get("wait", False), "perm_timeout": o.get("perm_timeout", 60.0),
+            "log_path": os.path.abspath(os.path.expanduser(o["log"])) if o.get("log") else os.path.join(state_dir(), name + ".log")}
+    Log.verbose = bool(o.get("verbose"))
+    if o.get("detach"):
+        return start_detached(opts)
+    return run_bridge(opts, FgNotifier())
+
+
+# ----------------------------------------------------------------------------------------------------- status, stop, reset
+
+
+def cmd_status(argv):
+    o, pos = parse_args(argv, {"--json": ("json", True)})
+    if pos:
+        raise UsbError("«status» no lleva argumentos.", EXIT_USAGE)
+    sts = read_states()
+    if o.get("json"):
+        sys.stdout.write(json.dumps(sts, ensure_ascii=False) + "\n")
+        return 0
+    if not sts:
+        sys.stdout.write("No hay ningún puente USB en marcha. Crea uno con:  nexo usb bridge\n")
+        return 0
+    for s in sts:
+        d = s.get("device") or {}
+        sys.stdout.write("%s · pid %s · %s · %s (%s:%s) · %s\n" % (
+            s.get("name"), s.get("pid"), s.get("state", "?"), d.get("title") or "?", d.get("vid"), d.get("pid"),
+            line_str(s["line"]) if s.get("line") else "?"))
+        if s.get("link"):
+            sys.stdout.write("    puerto serie   %s\n" % s["link"])
+        if s.get("rfc2217"):
+            sys.stdout.write("    RFC2217        rfc2217://%s\n" % s["rfc2217"])
+        if s.get("tcp"):
+            sys.stdout.write("    TCP crudo      %s\n" % s["tcp"])
+        if s.get("log"):
+            sys.stdout.write("    registro       %s\n" % s["log"])
+    return 0
+
+
+def pick_bridges(names, all_, verb):
+    sts = read_states()
+    if names:
+        found = [s for s in sts if s.get("name") in names]
+        lost = [n for n in names if n not in [s.get("name") for s in found]]
+        if lost:
+            raise UsbError("No hay ningún puente llamado %s (mira: nexo usb status)." % ", ".join("«%s»" % n for n in lost), EXIT_NODEV)
+        return found
+    if len(sts) > 1 and not all_:
+        raise UsbError("Hay varios puentes (%s): di cuál (nexo usb %s NOMBRE)%s." % (
+            ", ".join(s.get("name") for s in sts), verb, " o usa --all" if verb == "stop" else ""), EXIT_USAGE)
+    return sts
+
+
+def cmd_stop(argv):
+    o, pos = parse_args(argv, {"--all": ("all", True), "-a": ("all", True)})
+    sts = pick_bridges(pos, o.get("all"), "stop")
+    if not sts:
+        sys.stdout.write("No hay ningún puente USB en marcha.\n")
+        return 0
+    bad = 0
+    for s in sts:
+        pid = int(s["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            log("No pude avisar a %s (pid %d): %s" % (s.get("name"), pid, e.strerror or e))
+            bad = 1
+            continue
+        end = time.monotonic() + 6.0
+        while pid_alive(pid) and time.monotonic() < end:
+            time.sleep(0.1)
+        if pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            cleanup_state(os.path.join(state_dir(), s["name"] + ".json"), s)
+            log("«%s» no contestó y lo forcé a cerrar." % s.get("name"))
+        else:
+            sys.stdout.write("Cerrado «%s».\n" % s.get("name"))
+    return bad
+
+
+def cmd_reset(argv):
+    o, pos = parse_args(argv, {})
+    sts = pick_bridges(pos, False, "reset")
+    if not sts:
+        raise UsbError("No hay ningún puente USB en marcha: crea uno con «nexo usb bridge».", EXIT_NODEV)
+    for s in sts:
+        os.kill(int(s["pid"]), signal.SIGUSR1)
+        sys.stdout.write("Reinicio enviado a «%s».\n" % s.get("name"))
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        sys.stdout.write(HELP)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("version", "--version", "-V"):
+        sys.stdout.write("nexo-usb %s\n" % NEXO_USB_VERSION)
+        return 0
+    cmds = {"list": cmd_list, "ls": cmd_list, "permit": cmd_permit, "monitor": cmd_monitor, "bridge": cmd_bridge,
+            "status": cmd_status, "stop": cmd_stop, "reset": cmd_reset}
+    fn = cmds.get(cmd)
+    if fn is None:
+        sys.stderr.write("nexo usb: comando desconocido «%s». Prueba: nexo usb help\n" % cmd)
+        return EXIT_USAGE
+    if "--help" in rest or "-h" in rest:
+        sys.stdout.write(HELP)
+        return 0
+    try:
+        return fn(rest)
+    except UsbError as e:
+        sys.stderr.write("nexo usb: %s\n" % e.message)
+        return e.code
+    except Stopped:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

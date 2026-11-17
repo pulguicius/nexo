@@ -19,8 +19,8 @@ android {
         // Como no se publica en Google Play, no hay obligación de apuntar más alto.
         targetSdk = 28
 
-        versionCode = 5
-        versionName = "0.4.0-beta2"
+        versionCode = 6
+        versionName = "0.4.1"
     }
 
     // Archivos que viajan dentro del APK como assets: el cliente y el instalador de Termux.
@@ -69,6 +69,8 @@ android {
     }
 }
 
-// Sin librerías de terceros a propósito: solo el framework de Android y la stdlib de Kotlin.
+// Sin librerías de terceros en la app a propósito: solo el framework de Android y la stdlib de Kotlin.
 dependencies {
+    // Solo para las pruebas de la JVM (./gradlew testDebugUnitTest, sin móvil): no entra en el APK.
+    testImplementation("junit:junit:4.13.2")
 }

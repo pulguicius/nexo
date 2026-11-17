@@ -78,6 +78,7 @@ class BridgeService : Service() {
         "bt" to Runnable { emit("bt") },
         "audio" to Runnable { emit("audio") },
         "media" to Runnable { emit("media") },
+        "usb" to Runnable { emit("usb") },
     )
 
     /** Los avisos de Android llegan a ráfagas: se juntan 300 ms antes de avisar a los clientes. */
@@ -187,6 +188,8 @@ class BridgeService : Service() {
         registerEvents()
         cmds.media.onChange = { schedule("media") }
         cmds.media.watch()
+        cmds.usb.onChange = { schedule("usb") }
+        cmds.usb.watch()
         NexoNotificationListener.onChange = {
             main.post {
                 commands?.media?.watch()
@@ -375,6 +378,10 @@ class BridgeService : Service() {
         unregisterEvents()
         NexoNotificationListener.onChange = null
         commands?.media?.let {
+            it.onChange = null
+            it.unwatch()
+        }
+        commands?.usb?.let {
             it.onChange = null
             it.unwatch()
         }

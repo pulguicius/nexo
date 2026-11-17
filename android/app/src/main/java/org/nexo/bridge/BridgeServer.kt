@@ -154,6 +154,8 @@ class BridgeServer(
         "bt.connect", "bt.disconnect", "bt.forget", "bt.rename", "bt.info" -> cmd + " " + req.optString("address", "").take(17)
         "wifi.forget" -> "wifi.forget " + req.optString("ssid", req.opt("network_id")?.toString() ?: "").take(32)
         "audio.volume" -> "audio.volume " + listOf("percent", "level", "delta", "mute").firstOrNull { req.has(it) }.orEmpty()
+        "usb.permission", "usb.open" -> cmd + " " + req.optInt("device", -1)
+        "usb.setup", "usb.control", "usb.close" -> cmd + " " + req.optString("session", "").take(12)
         else -> cmd
     }
 
@@ -178,6 +180,8 @@ class BridgeServer(
         "wifi.enable", "wifi.disable" -> 10000L
         "bt.enable", "bt.disable" -> 12000L
         "bt.paired", "bt.info", "bt.forget" -> 10000L
+        "usb.permission" -> req.optLong("wait_ms", 0).coerceIn(0L, 30000L) + 6000L
+        "usb.open" -> 15000L
         else -> 8000L
     }
 
@@ -220,6 +224,10 @@ class BridgeServer(
                 sock.close()
             } catch (_: IOException) {
             }
+            try {
+                commands.usb.ownerGone(this)
+            } catch (_: Exception) {
+            }
             if (clients.remove(this) && !silent) refreshCount()
         }
 
@@ -233,7 +241,7 @@ class BridgeServer(
                     val deadline = if (authed) 0L else connectedAt + AUTH_TIMEOUT_MS
                     val raw = readLine(input, deadline) ?: break
                     if (raw.isBlank()) continue
-                    if (!handleLine(raw)) break
+                    if (!handleLine(raw, input)) break
                 }
             } catch (_: SocketTimeoutException) {
                 BridgeState.log("Se cerró una conexión que no se autenticó a tiempo")
@@ -248,8 +256,8 @@ class BridgeServer(
             }
         }
 
-        /** Devuelve false si hay que cerrar la conexión. */
-        private fun handleLine(raw: String): Boolean {
+        /** Devuelve false si hay que cerrar la conexión. `input` es el flujo del que se lee, por si la conexión pasa a ser de bytes (usb.attach). */
+        private fun handleLine(raw: String, input: InputStream): Boolean {
             val req: JSONObject = try {
                 JSONObject(raw)
             } catch (_: JSONException) {
@@ -302,6 +310,7 @@ class BridgeServer(
                     topics = emptySet()
                     send(Protocol.ok(id))
                 }
+                "usb.attach" -> return attachUsb(id, req, input)
                 else -> runCommand(id, cmd, req)
             }
             return true
@@ -336,7 +345,7 @@ class BridgeServer(
         private fun runCommand(id: Any?, cmd: String, req: JSONObject) {
             val t0 = SystemClock.elapsedRealtime()
             val job = try {
-                cmdPool.submit(Callable { commands.handle(cmd, req) })
+                cmdPool.submit(Callable { commands.handle(cmd, req, this@Client) })
             } catch (_: RejectedExecutionException) {
                 send(Protocol.error(id, "internal", "El puente se está deteniendo"))
                 return
@@ -358,6 +367,29 @@ class BridgeServer(
             } else {
                 BridgeState.log("x " + cmd + ": " + resp.optString("error", "error") + if (ms >= 300) " ($ms ms)" else "")
             }
+        }
+
+        /**
+         * usb.attach: reserva el flujo de datos de una sesión USB. Si sale bien, contesta `{"session":…,"raw":true}` y a partir de ahí
+         * esta conexión deja de ser JSON: son los bytes del dispositivo y del cliente, tal cual, hasta que uno de los dos se cierre.
+         * Devuelve true si la conexión sigue siendo JSON (hubo un error) y false si hay que cerrarla (terminó el flujo).
+         */
+        private fun attachUsb(id: Any?, req: JSONObject, input: InputStream): Boolean {
+            val s = try {
+                commands.usb.attach(req)
+            } catch (e: Exception) {
+                send(errorFor(id, e))
+                return true
+            }
+            try {
+                topics = emptySet()          // en una conexión de bytes no puede haber eventos JSON mezclados
+                send(Protocol.ok(id, JSONObject().put("session", s.id).put("raw", true)))
+                BridgeState.log("> usb.attach " + s.id)
+                s.pump(input, sock.getOutputStream(), writeLock, { close() }, { commands.usb.isPlugged(s) })
+            } finally {
+                commands.usb.detach(s)
+            }
+            return false
         }
 
         private fun errorFor(id: Any?, t: Throwable): JSONObject = when (t) {

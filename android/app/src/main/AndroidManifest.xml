@@ -31,6 +31,7 @@
     <uses-feature android:name="android.hardware.location" android:required="false" />
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <application
         android:allowBackup="false"
@@ -63,6 +64,26 @@
             android:noHistory="true"
             android:taskAffinity=""
             android:theme="@style/Theme.Nexo.Transparent" />
+
+        <!--
+            USB serie (Arduino, ESP32…): Android ofrece «abrir Nexo cuando se conecte este dispositivo». Si el usuario acepta y marca
+            «usar siempre», Android recuerda el permiso USB de ese dispositivo. La actividad no muestra nada: se cierra al abrirse.
+            Qué dispositivos ofrece: res/xml/usb_device_filter.xml.
+        -->
+        <activity
+            android:name=".UsbAttachedActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Nexo.Transparent">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity>
 
         <!--
             Android solo deja ver la música de otras apps (título, botones, carátula) a quien tenga concedido el

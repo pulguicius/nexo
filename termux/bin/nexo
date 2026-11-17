@@ -4,8 +4,8 @@
 # y da la salida con formato. No depende de qué Termux uses (F-Droid, GitHub, Monet, forks...).
 # Licencia: GPL-3.0-or-later
 
-NEXO_VERSION="0.4.0-beta2"
-CLIENT_MINOR=2          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
+NEXO_VERSION="0.4.1"
+CLIENT_MINOR=3          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
 export LC_ALL=C
 
 NEXO_HOST=${NEXO_HOST:-127.0.0.1}
@@ -88,18 +88,26 @@ Archivos entre móviles (nexo-tools: no hace falta el puente; solo la misma red 
                                   tools connect IP --code C  se empareja con uno (guarda su huella)
                                   tools browse|ls|get|put|web  explora, baja y sube; web = gestor en el navegador
                                   tools help                 todo lo demás
+Arduino, ESP32 y adaptadores serie USB (nexo-usb: cable OTG, la app con el permiso de Android y python3)
+  usb list                      Lo que Android ve por USB y cuáles sirven como puerto serie (--json, --lsusb, --all)
+  usb permit [DISPOSITIVO]      Pide el permiso a Android (sale un aviso en la pantalla del móvil)
+  usb monitor [DISPOSITIVO]     Monitor serie en la terminal, como el del IDE de Arduino (salir: Ctrl+])
+  usb bridge [DISPOSITIVO]      Crea un puerto serie en tu distro para avrdude, arduino-cli, PlatformIO, minicom, screen…
+                                 (--rfc2217 PUERTO: servidor para esptool con DTR y RTS; -d lo deja en segundo plano)
+  usb status|stop|reset         Los puentes en marcha: verlos, cerrarlos o reiniciar la placa
+                                 (todo lo que sigue a «usb» es de nexo-usb: opciones --baud, --json… y «nexo usb help»)
 Enlace e instalación
   pair [TOKEN] [PUERTO]         Guarda el token de la app (--token-stdin lo lee de la entrada: no queda en el historial)
   rekey [TOKEN]                 Cambia el token tras «Token nuevo» en la app (y actualiza tus distros)
   unpair                        Borra el enlace guardado
-  update [RUTA|ARCHIVO.zip]     Pone al día nexo, nexo-dbus y nexo-tools desde la carpeta del repositorio (o un .zip) y después
+  update [RUTA|ARCHIVO.zip]     Pone al día nexo, nexo-dbus, nexo-tools y nexo-usb desde la carpeta del repositorio (o un .zip) y después
                                 tus distros; sin RUTA busca la carpeta sola (--check solo mira, --no-guests no toca las distros)
   setup-guests [NOMBRE|RUTA...] (Termux) copia el cliente y el enlace a tus distros de proot-distro (las de
                                 containers/NOMBRE/rootfs y las de installed-rootfs); si ya había copias de nexo, las
                                 actualiza TODAS y comprueba cuál ejecuta de verdad cada distro
                                 (--list las muestra, --uninstall las limpia, --private deja el enlace solo para root,
-                                 --with-dbus y --with-tools les copian también nexo-dbus y nexo-tools, --no-verify no
-                                 ejecuta las distros para comprobarlo)
+                                 --with-dbus, --with-tools y --with-usb les copian también nexo-dbus, nexo-tools y nexo-usb,
+                                 --no-verify no ejecuta las distros para comprobarlo)
   start                         (Termux) abre la app Nexo para despertar el puente
   doctor [--fix]                Diagnóstico de todo el enlace (--fix intenta repararlo)
   version [--check]             Versión del cliente (--check la compara con la app)
@@ -1324,7 +1332,7 @@ guest_resolve() {
 # ¿hay un programa en esa distro? (sirve tanto con enlaces relativos como absolutos)
 guest_has() { [ -e "$1/usr/bin/$2" ] || [ -L "$1/usr/bin/$2" ] || [ -e "$1/bin/$2" ] || [ -L "$1/bin/$2" ]; }
 
-# Dónde está nexo-dbus / nexo-tools: en el PATH o junto a este cliente.
+# Dónde está nexo-dbus / nexo-tools / nexo-usb: en el PATH o junto a este cliente.
 find_sibling_bin() {
     local p d
     p=$(command -v "$1" 2>/dev/null) && [ -n "$p" ] && { printf '%s' "$p"; return 0; }
@@ -1334,18 +1342,20 @@ find_sibling_bin() {
 }
 find_dbus_bin() { find_sibling_bin nexo-dbus; }
 find_tools_bin() { find_sibling_bin nexo-tools; }
+find_usb_bin() { find_sibling_bin nexo-usb; }
 
 # Cómo reconocer cada programa de Nexo, de qué lenguaje es y cuál es su «versión»
-prog_marker()  { case $1 in nexo) printf '^NEXO_VERSION=' ;; nexo-dbus) printf '^VERSION = ' ;; nexo-tools) printf '^NEXO_TOOLS_VERSION=' ;; esac; }
-prog_kind()    { case $1 in nexo) printf nexo ;; nexo-dbus) printf dbus ;; nexo-tools) printf tools ;; esac; }
-prog_shebang() { case $1 in nexo-dbus) printf '#!/usr/bin/env python3' ;; *) printf '#!/usr/bin/env bash' ;; esac; }
+prog_marker()  { case $1 in nexo) printf '^NEXO_VERSION=' ;; nexo-dbus) printf '^VERSION = ' ;; nexo-tools) printf '^NEXO_TOOLS_VERSION=' ;; nexo-usb) printf '^NEXO_USB_VERSION = ' ;; esac; }
+prog_kind()    { case $1 in nexo) printf nexo ;; nexo-dbus) printf dbus ;; nexo-tools) printf tools ;; nexo-usb) printf usb ;; esac; }
+prog_shebang() { case $1 in nexo-dbus|nexo-usb) printf '#!/usr/bin/env python3' ;; *) printf '#!/usr/bin/env bash' ;; esac; }
 
-# La versión que declara un archivo de Nexo (kind: nexo, dbus o tools); vacío si no la encuentra.
+# La versión que declara un archivo de Nexo (kind: nexo, dbus, tools o usb); vacío si no la encuentra.
 copy_version() {
     case $2 in
         nexo)  sed -n 's/^NEXO_VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
         dbus)  sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
         tools) sed -n 's/^NEXO_TOOLS_VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
+        usb)   sed -n 's/^NEXO_USB_VERSION = "\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1 ;;
     esac
 }
 
@@ -1407,7 +1417,7 @@ guest_verify() {
     fi
 }
 
-# Pone en la distro el cliente (y nexo-dbus / nexo-tools si los pediste o ya estaban) y el enlace con la app.
+# Pone en la distro el cliente (y nexo-dbus / nexo-tools / nexo-usb si los pediste o ya estaban) y el enlace con la app.
 # Si ya hay copias de «nexo» (en /usr/local/bin, /usr/bin, ~/.local/bin…) actualiza TODAS: la que ejecuta la distro
 # depende de su PATH y, si solo se actualizara una, otra podría seguir ganando con la versión vieja.
 # Si no hay ninguna, lo instala en /usr/local/bin.
@@ -1416,13 +1426,13 @@ install_in_guest() {
     if [ ! -d "$r/usr" ] && [ ! -d "$r/bin" ]; then warn "$name: $r no parece la raíz de una distro"; return 1; fi
     mkdir -p "$r/usr/local/bin" "$r/etc/nexo" 2>/dev/null || { warn "$name: no pude escribir en $r"; return 1; }
     echo "✔ $name"
-    for spec in "nexo|$SELF|1" "nexo-dbus|${DBUS_SRC:-}|$WITH_DBUS" "nexo-tools|${TOOLS_SRC:-}|$WITH_TOOLS"; do
+    for spec in "nexo|$SELF|1" "nexo-dbus|${DBUS_SRC:-}|$WITH_DBUS" "nexo-tools|${TOOLS_SRC:-}|$WITH_TOOLS" "nexo-usb|${USB_SRC:-}|$WITH_USB"; do
         IFS='|' read -r prog src want <<<"$spec"
         [ -n "$src" ] || continue
         copies=()
         while IFS= read -r f; do [ -n "$f" ] && copies+=("$f"); done < <(guest_copies "$r" "$prog")
         if [ "${#copies[@]}" -eq 0 ]; then
-            [ "$want" = 1 ] || continue                     # nexo-dbus y nexo-tools solo si los pides (o si esa distro ya los tenía)
+            [ "$want" = 1 ] || continue                     # nexo-dbus, nexo-tools y nexo-usb solo si los pides (o si esa distro ya los tenía)
             copies=("$r/usr/local/bin/$prog")
         fi
         for f in "${copies[@]}"; do
@@ -1448,6 +1458,12 @@ install_in_guest() {
                 else
                     echo "   ↳ nexo-tools copiado, pero a $name le falta python3 u openssl (en Debian/Ubuntu: apt install python3 openssl)"
                 fi ;;
+            nexo-usb)
+                if guest_has "$r" python3; then
+                    echo "   ↳ nexo-usb copiado. Dentro de $name:  nexo usb list"
+                else
+                    echo "   ↳ nexo-usb copiado, pero a $name le falta python3 (en Debian/Ubuntu: apt install python3)"
+                fi ;;
         esac
     done
     write_config "$NEXO_TOKEN" "$NEXO_PORT" "$r/etc/nexo/config" "$GUEST_MODE" || { warn "$name: no pude escribir la configuración"; return 1; }
@@ -1471,7 +1487,7 @@ install_in_guest() {
 
 uninstall_in_guest() {
     local name=$1 r=${2%/} h f prog
-    for prog in nexo nexo-dbus nexo-tools; do
+    for prog in nexo nexo-dbus nexo-tools nexo-usb; do
         while IFS= read -r f; do [ -n "$f" ] && rm -f "$f"; done < <(guest_copies "$r" "$prog")
     done
     rm -f "$r/etc/nexo/config"
@@ -1490,8 +1506,8 @@ uninstall_in_guest() {
 cmd_setup_guests() {
     [ -n "${PREFIX:-}" ] || die 2 "setup-guests se ejecuta desde Termux, no dentro de una distro."
     local op=install entries=() list=() a e name path f v extra copies mark stale
-    GUEST_MODE=644; WITH_DBUS=0; WITH_TOOLS=0; VERIFY=1; VERIFY_SKIPPED=0; ANY_DBUS=0
-    DBUS_SRC=""; TOOLS_SRC=""
+    GUEST_MODE=644; WITH_DBUS=0; WITH_TOOLS=0; WITH_USB=0; VERIFY=1; VERIFY_SKIPPED=0; ANY_DBUS=0
+    DBUS_SRC=""; TOOLS_SRC=""; USB_SRC=""
     for a in "$@"; do
         case $a in
             --list) op=list ;;
@@ -1499,8 +1515,9 @@ cmd_setup_guests() {
             --private) GUEST_MODE=600 ;;
             --with-dbus) WITH_DBUS=1 ;;
             --with-tools) WITH_TOOLS=1 ;;
+            --with-usb) WITH_USB=1 ;;
             --no-verify) VERIFY=0 ;;
-            -*) die 2 "setup-guests: opción desconocida «$a» (--list, --uninstall, --private, --with-dbus, --with-tools, --no-verify)" ;;
+            -*) die 2 "setup-guests: opción desconocida «$a» (--list, --uninstall, --private, --with-dbus, --with-tools, --with-usb, --no-verify)" ;;
             *) list+=("$a") ;;
         esac
     done
@@ -1523,6 +1540,7 @@ cmd_setup_guests() {
             extra=""
             [ -n "$(guest_copies "$path" nexo-dbus)" ] && extra+=" · con nexo-dbus"
             [ -n "$(guest_copies "$path" nexo-tools)" ] && extra+=" · con nexo-tools"
+            [ -n "$(guest_copies "$path" nexo-usb)" ] && extra+=" · con nexo-usb"
             echo "✔ $name  (nexo instalado)$extra"
             stale=0
             for f in "${copies[@]}"; do
@@ -1544,11 +1562,15 @@ cmd_setup_guests() {
     SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
     DBUS_SRC=$(find_dbus_bin) || DBUS_SRC=""
     TOOLS_SRC=$(find_tools_bin) || TOOLS_SRC=""
+    USB_SRC=$(find_usb_bin) || USB_SRC=""
     if [ "$WITH_DBUS" = 1 ] && [ -z "$DBUS_SRC" ]; then
-        die 1 "No encuentro nexo-dbus en Termux. Vuelve a instalar el cliente con el comando de la app (trae los tres archivos) y repite."
+        die 1 "No encuentro nexo-dbus en Termux. Vuelve a instalar el cliente con el comando de la app (trae los cuatro archivos) y repite."
     fi
     if [ "$WITH_TOOLS" = 1 ] && [ -z "$TOOLS_SRC" ]; then
-        die 1 "No encuentro nexo-tools en Termux. Vuelve a instalar el cliente con el comando de la app (trae los tres archivos) y repite."
+        die 1 "No encuentro nexo-tools en Termux. Vuelve a instalar el cliente con el comando de la app (trae los cuatro archivos) y repite."
+    fi
+    if [ "$WITH_USB" = 1 ] && [ -z "$USB_SRC" ]; then
+        die 1 "No encuentro nexo-usb en Termux. Vuelve a instalar el cliente con el comando de la app (trae los cuatro archivos) y repite."
     fi
     for e in "${entries[@]}"; do install_in_guest "${e%%$'\t'*}" "${e#*$'\t'}"; done
     echo "Dentro de cada distro, el comando es: nexo status"
@@ -1557,6 +1579,9 @@ cmd_setup_guests() {
     fi
     if [ "$ANY_DBUS" = 1 ]; then
         echo "Si nexo-dbus ya estaba en marcha dentro de una distro, reinícialo allí para que use la versión nueva:  nexo dbus restart"
+    fi
+    if [ "$WITH_USB" = 1 ]; then
+        echo "Para un Arduino o un ESP32 por USB (cable OTG), dentro de la distro:  nexo usb list"
     fi
     if [ "$VERIFY" = 1 ] && [ "$VERIFY_SKIPPED" = 1 ]; then
         echo "• No comprobé qué copia de nexo ejecuta cada distro: no encuentro proot-distro en el PATH."
@@ -1594,8 +1619,8 @@ update_find_src() {
     return 1
 }
 
-# update [RUTA|ARCHIVO.zip] [--check] [--no-guests] [--with-dbus] [--with-tools] [--private] [--no-verify]
-# Pone al día nexo, nexo-dbus y nexo-tools desde una carpeta del repositorio o un .zip (lo que antes era copiar a mano),
+# update [RUTA|ARCHIVO.zip] [--check] [--no-guests] [--with-dbus] [--with-tools] [--with-usb] [--private] [--no-verify]
+# Pone al día nexo, nexo-dbus, nexo-tools y nexo-usb desde una carpeta del repositorio o un .zip (lo que antes era copiar a mano),
 # y después las distros de proot-distro. No descarga nada de internet ni de la app: solo copia archivos que ya tienes.
 cmd_update() {
     local src="" check=0 guests=1 gfl=() a tmp="" rc=0
@@ -1603,8 +1628,8 @@ cmd_update() {
         case $a in
             --check) check=1 ;;
             --no-guests) guests=0 ;;
-            --with-dbus|--with-tools|--private|--no-verify) gfl+=("$a") ;;
-            -*) die 2 "update: opción desconocida «$a» (--check, --no-guests, --with-dbus, --with-tools, --private, --no-verify)" ;;
+            --with-dbus|--with-tools|--with-usb|--private|--no-verify) gfl+=("$a") ;;
+            -*) die 2 "update: opción desconocida «$a» (--check, --no-guests, --with-dbus, --with-tools, --with-usb, --private, --no-verify)" ;;
             *) [ -z "$src" ] || die 2 "update: indica una sola ruta"; src=$a ;;
         esac
     done
@@ -1644,13 +1669,13 @@ cmd_update() {
 }
 
 update_run() {
-    local src=$1 check=$2 guests=$3 prog kind newv oldv copies f bindir changed=0 dbus_changed=0 first="" tgt
+    local src=$1 check=$2 guests=$3 prog kind newv oldv copies f bindir changed=0 dbus_changed=0 usb_changed=0 first="" tgt ub
     shift 3
     local gfl=("$@") want
-    for prog in nexo nexo-dbus nexo-tools; do
+    for prog in nexo nexo-dbus nexo-tools nexo-usb; do
         [ -f "$src/$prog" ] || continue
         case $prog in
-            nexo-dbus) if have python3; then python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$src/$prog" 2>/dev/null || die 1 "$src/$prog no es un programa de Python válido: no toco nada."; fi ;;
+            nexo-dbus|nexo-usb) if have python3; then python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$src/$prog" 2>/dev/null || die 1 "$src/$prog no es un programa de Python válido: no toco nada."; fi ;;
             *) bash -n "$src/$prog" 2>/dev/null || die 1 "$src/$prog no es un script válido (bash -n lo rechaza): no toco nada." ;;
         esac
     done
@@ -1663,7 +1688,7 @@ update_run() {
     first=$(local_copies nexo | head -n 1)
     [ -n "$first" ] && bindir=$(dirname "$first")
     first=""
-    for prog in nexo nexo-dbus nexo-tools; do
+    for prog in nexo nexo-dbus nexo-tools nexo-usb; do
         [ -f "$src/$prog" ] || continue
         kind=$(prog_kind "$prog")
         newv=$(copy_version "$src/$prog" "$kind")
@@ -1672,9 +1697,10 @@ update_run() {
         if [ "${#copies[@]}" -eq 0 ]; then
             want=0
             [ "$prog" = nexo ] && want=1
-            [ -n "${PREFIX:-}" ] && want=1                       # en Termux se instalan los tres, como con el comando de la app
+            [ -n "${PREFIX:-}" ] && want=1                       # en Termux se instalan los cuatro, como con el comando de la app
             case " ${gfl[*]} " in *" --with-dbus "*) [ "$prog" = nexo-dbus ] && want=1 ;; esac
             case " ${gfl[*]} " in *" --with-tools "*) [ "$prog" = nexo-tools ] && want=1 ;; esac
+            case " ${gfl[*]} " in *" --with-usb "*) [ "$prog" = nexo-usb ] && want=1 ;; esac
             [ "$want" = 1 ] || continue
             copies=("$bindir/$prog")
             oldv=""
@@ -1692,6 +1718,7 @@ update_run() {
                 printf '  %-11s %s → %s  %s\n' "$prog" "${oldv:-nuevo}" "${newv:-?}" "$f"
                 changed=1
                 [ "$prog" = nexo-dbus ] && dbus_changed=1
+                [ "$prog" = nexo-usb ] && usb_changed=1
             fi
             if [ "$prog" = nexo ] && [ -z "$first" ]; then first=$f; fi
         done
@@ -1708,6 +1735,10 @@ update_run() {
     fi
     if [ "$dbus_changed" = 1 ] && have python3 && [ -x "$(dirname "${first:-$SELF}")/nexo-dbus" ]        && "$(dirname "${first:-$SELF}")/nexo-dbus" status >/dev/null 2>&1; then
         echo "nexo-dbus está en marcha aquí con el código anterior: reinícialo con  nexo dbus restart"
+    fi
+    ub="$(dirname "${first:-$SELF}")/nexo-usb"
+    if [ "$usb_changed" = 1 ] && have python3 && [ -f "$ub" ] && [ "$(python3 "$ub" status --json 2>/dev/null || echo '[]')" != '[]' ]; then
+        echo "Hay puentes USB en marcha aquí con el código anterior: ciérralos y ábrelos otra vez con  nexo usb stop --all"
     fi
     return 0
 }
@@ -1729,7 +1760,7 @@ tools_device_name() {
 
 cmd_tools() {
     local bin n
-    bin=$(find_tools_bin) || die 1 "No encuentro nexo-tools. Reinstala el cliente con el comando de la app (trae los tres archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-tools"
+    bin=$(find_tools_bin) || die 1 "No encuentro nexo-tools. Reinstala el cliente con el comando de la app (trae los cuatro archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-tools"
     have python3 || warn "nexo-tools necesita python3 y openssl para casi todo (en Termux: pkg install python openssl)"
     if [ -z "${NEXO_TOOLS_DEVICE:-}" ] && ! have getprop; then
         case ${1:-} in ''|server|send|pair|web)
@@ -1737,6 +1768,58 @@ cmd_tools() {
         esac
     fi
     exec "$bin" "$@"
+}
+
+# ------------------------------------------------------------------ nexo usb (Arduino, ESP32 y adaptadores serie USB → nexo-usb)
+
+# Sin python3 solo se puede mirar qué ve Android: «nexo usb list». Lo demás (monitor, bridge…) es de nexo-usb y lo necesita.
+usb_list_bash() {
+    local a json=0 n
+    for a in "$@"; do
+        case $a in
+            --json) json=1 ;;
+            *) die 1 "usb: sin python3 solo funciona «nexo usb list [--json]». Instálalo y vuelve a probar (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3)" ;;
+        esac
+    done
+    need usb.status
+    have_jq || { printf '%s\n' "$RESP"; return 0; }
+    if [ "$json" = 1 ]; then printf '%s' "$RESP" | jq '.data'; return 0; fi
+    if [ "$(printf '%s' "$RESP" | jq -r '.data.host // true')" = false ]; then
+        warn "usb: este móvil no tiene USB host (no puede recibir dispositivos USB)."
+        return 4
+    fi
+    n=$(printf '%s' "$RESP" | jq -r '(.data.devices // []) | length')
+    if [ "${n:-0}" = 0 ]; then
+        echo "Android no ve ningún dispositivo USB."
+        echo "Enchúfalo con un cable OTG. En Xiaomi/HyperOS: Ajustes → Ajustes adicionales → OTG (se apaga solo si no hay nada)."
+        return 0
+    fi
+    printf '%-6s %-9s %-8s %-8s %s\n' ID VID:PID TIPO PERMISO DISPOSITIVO
+    printf '%s' "$RESP" | jq -r '(.data.devices // [])[] | [(.id | tostring), "\(.vid // "?"):\(.pid // "?")", (.kind // "?"), (if .permission then "sí" else "no" end), ((.product // .vendor // "(sin nombre)") + (if .serial then " · serie " + .serial else "" end))] | join("\t")' |
+        while IFS=$'\t' read -r id vp kind perm name; do printf '%-6s %-9s %-8s %-8s %s\n' "$id" "$vp" "$kind" "$perm" "$name"; done
+    echo "(Sin python3 no puedo decirte qué controlador usaría cada uno; instálalo para usar «nexo usb monitor» o «nexo usb bridge».)"
+    return 0
+}
+
+# nexo usb … → nexo-usb. Todo lo que sigue es suyo, incluidas opciones como --json, --baud o --rfc2217.
+cmd_usb() {
+    local bin
+    if ! bin=$(find_usb_bin); then
+        die 1 "No encuentro nexo-usb. Reinstala el cliente con el comando de la app (trae los cuatro archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-usb"
+    fi
+    if ! have python3; then
+        [ -n "$NEXO_TIMEOUT" ] || NEXO_TIMEOUT=8        # (este camino no pasa por el resto de main(), que es donde se fija)
+        case ${1:-} in list|ls) shift; usb_list_bash "$@"; exit $? ;; esac
+        die 1 "usb: «nexo usb ${1:-help}» necesita python3 (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3). Sin él solo funciona «nexo usb list»."
+    fi
+    # nexo-usb lee el mismo enlace que este cliente: se le dice cuál fue (y dónde está la app, si pasaste --host o --port).
+    [ -n "$CONFIG_FILE" ] && [ -z "${NEXO_CONFIG:-}" ] && export NEXO_CONFIG=$CONFIG_FILE
+    export NEXO_HOST NEXO_PORT
+    # «nexo --json usb list»: el --json lo recogió este cliente; se lo pasamos a quien lo entiende.
+    if [ "$FMT" = json ]; then
+        case ${1:-} in list|ls|status) set -- "$@" --json ;; esac
+    fi
+    exec python3 "$bin" "$@"
 }
 
 # ------------------------------------------------------------------ nexo-dbus (la música del móvil como reproductor MPRIS)
@@ -1969,7 +2052,7 @@ cmd_setup_dbus() {
         return 0
     fi
 
-    bin=$(find_dbus_bin) || die 1 "No encuentro nexo-dbus. Reinstala el cliente con el comando de la app (trae los dos archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-dbus"
+    bin=$(find_dbus_bin) || die 1 "No encuentro nexo-dbus. Reinstala el cliente con el comando de la app (trae los cuatro archivos); en una distro de proot, desde Termux:  nexo setup-guests --with-dbus"
     [ -n "$NEXO_TOKEN" ] || die 11 "Primero enlaza con la app (pega el comando de instalación, o: nexo pair TOKEN)."
 
     # 1) python3
@@ -2185,6 +2268,17 @@ cmd_doctor() {
     else
         printf 'nexo-tools no instalado (opcional: pasar y explorar archivos entre móviles; se instala con el comando de la app)\n'
     fi
+    local ubin uver
+    if ubin=$(find_usb_bin); then
+        uver=$(copy_version "$ubin" usb)
+        printf 'nexo-usb   %s %s\n' "$ubin" "${uver:-?}"
+        have python3 || echo "           ⚠ sin python3 solo funciona «nexo usb list» (en Termux: pkg install python)"
+        if [ -n "$uver" ] && [ "$uver" != "$NEXO_VERSION" ]; then
+            echo "           ⚠ es de otra versión que el cliente ($NEXO_VERSION): reinstala con el comando de la app (o: nexo update)"
+        fi
+    else
+        printf 'nexo-usb   no instalado (opcional: Arduino, ESP32 y adaptadores serie USB; se instala con el comando de la app)\n'
+    fi
     if devtcp_ok; then echo "/dev/tcp   sí"; else echo "/dev/tcp   no (se usará python3)"; fi
 
     if [ "$fix" = 1 ]; then
@@ -2223,6 +2317,7 @@ cmd_doctor() {
     if have_jq && call_try hello; then
         h=$RESP
         printf '%s' "$h" | jq -r '.data | "app        \(.version) · protocolo \(.proto).\(.minor // 1) · \(.device) · Android \(.android_sdk)"'
+        printf '%s' "$h" | jq -r '.data | if has("usb") then "usb        este móvil \(if .usb then "tiene" else "NO tiene" end) USB host (OTG)\(if .usb then ": nexo usb list" else "" end)" else empty end'
         printf '%s' "$h" | jq -r '.data | if has("listener") then "medios     acceso a notificaciones: \(if .listener then "sí" else "NO (Nexo → Permisos → Acceso a notificaciones; hace falta para «nexo media»)" end)" else empty end'
     fi
     if have_jq && call_try wifi.status; then
@@ -2246,7 +2341,7 @@ cmd_version() {
         return 1
     fi
     if [ "$minor" -lt "$CLIENT_MINOR" ]; then
-        for c in audio media wifi.saved bt.info logs; do
+        for c in audio media wifi.saved bt.info logs usb; do
             if printf '%s' "$RESP" | jq -e --arg c "$c" '(.data.commands // []) | any(.[]; startswith($c))' >/dev/null 2>&1; then :; else missing+="$c "; fi
         done
         echo "✘ La app es más antigua que el cliente: faltan ${missing:-funciones nuevas}. Instala el APK nuevo (se actualiza encima, sin perder el enlace)."
@@ -2267,6 +2362,12 @@ main() {
         shift
         load_config                      # solo para saber el nombre del móvil (ver tools_device_name)
         cmd_tools "$@"
+    fi
+    # «nexo usb …» entrega todo a nexo-usb tal cual: sus opciones (--json, --baud, --rfc2217…) son suyas, no del cliente.
+    if [ "${1:-}" = usb ]; then
+        shift
+        load_config                      # para que nexo-usb use el mismo enlace y para «nexo usb list» sin python3
+        cmd_usb "$@"
     fi
     local ARGS=()
     while [ $# -gt 0 ]; do
@@ -2335,6 +2436,7 @@ main() {
         update|upgrade) cmd_update "$@" ;;
         setup-dbus) cmd_setup_dbus "$@" ;;
         dbus) cmd_dbus "$@" ;;
+        usb) cmd_usb "$@" ;;
         start) cmd_start ;;
         doctor) cmd_doctor "$@" ;;
         version) cmd_version "$@" ;;

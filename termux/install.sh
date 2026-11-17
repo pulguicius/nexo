@@ -6,12 +6,14 @@
 # de sí misma (sin internet) y lo lanza ya con el token. A mano, desde este repositorio:
 #   bash termux/install.sh                                  # solo instala el cliente
 #   NEXO_TOKEN=... NEXO_PORT=8765 bash termux/install.sh    # instala y enlaza
-#   bash termux/install.sh --uninstall                      # quita cliente, nexo-dbus, nexo-tools y el enlace
+#   bash termux/install.sh --uninstall                      # quita cliente, nexo-dbus, nexo-tools, nexo-usb y el enlace
 #   bash termux/install.sh --uninstall --purge              # además borra lo que nexo-tools guarda (claves y emparejamientos)
+#                                                           # y los registros de nexo-usb
 #
-# Instala tres archivos: «nexo» (el cliente), «nexo-dbus» (el reproductor MPRIS/BlueZ/NetworkManager para escritorios;
-# necesita python3 y se activa aparte con «nexo setup-dbus») y «nexo-tools» (archivos entre móviles; necesita python3 y
-# openssl; se usa con «nexo tools»).
+# Instala cuatro archivos: «nexo» (el cliente), «nexo-dbus» (el reproductor MPRIS/BlueZ/NetworkManager para escritorios;
+# necesita python3 y se activa aparte con «nexo setup-dbus»), «nexo-tools» (archivos entre móviles; necesita python3 y
+# openssl; se usa con «nexo tools») y «nexo-usb» (Arduino, ESP32 y adaptadores serie USB; necesita python3; se usa con
+# «nexo usb»).
 #
 # Variables opcionales: NEXO_BIN_DIR, NEXO_CONFIG_DIR, NEXO_NO_DEPS=1 (no instalar jq)
 
@@ -57,9 +59,15 @@ if [ "${1:-}" = "--uninstall" ]; then
     if [ -x "$BIN_DIR/nexo" ]; then "$BIN_DIR/nexo" setup-dbus --uninstall >/dev/null 2>&1; fi
     # Y el servidor de nexo-tools: si sigue compartiendo una carpeta, que deje de hacerlo antes de borrar el programa.
     if [ -x "$BIN_DIR/nexo-tools" ]; then "$BIN_DIR/nexo-tools" stop >/dev/null 2>&1; fi
-    rm -f "$BIN_DIR/nexo" "$BIN_DIR/nexo-dbus" "$BIN_DIR/nexo-tools" "$CONF_DIR/config"
+    # Y los puentes USB que sigan abiertos (un puerto serie falso que ya no tendría programa detrás).
+    if [ -f "$BIN_DIR/nexo-usb" ] && have python3; then python3 "$BIN_DIR/nexo-usb" stop --all >/dev/null 2>&1; fi
+    rm -f "$BIN_DIR/nexo" "$BIN_DIR/nexo-dbus" "$BIN_DIR/nexo-tools" "$BIN_DIR/nexo-usb" "$CONF_DIR/config"
     rmdir "$CONF_DIR" 2>/dev/null
-    say "✔ Nexo (cliente, nexo-dbus y nexo-tools) desinstalado de $BIN_DIR"
+    say "✔ Nexo (cliente, nexo-dbus, nexo-tools y nexo-usb) desinstalado de $BIN_DIR"
+    USB_STATE=${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/nexo/usb
+    if [ "$PURGE" = 1 ] && [ -d "$USB_STATE" ]; then
+        rm -rf "$USB_STATE" && say "✔ Borré los registros de nexo-usb ($USB_STATE)"
+    fi
     TOOLS_STATE=${NEXO_TOOLS_STATE:-${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/nexo-tools}
     if [ -d "$TOOLS_STATE" ]; then
         if [ "$PURGE" = 1 ]; then
@@ -152,6 +160,25 @@ if [ -n "${NEXO_TOOLS_B64:-}" ] || [ -f "$SRC_DIR/bin/nexo-tools" ]; then
     fi
 fi
 
+# nexo-usb (Arduino, ESP32 y adaptadores serie USB): igual de opcional que los dos anteriores.
+if [ -n "${NEXO_USB_B64:-}" ] || [ -f "$SRC_DIR/bin/nexo-usb" ]; then
+    TMPU=$BIN_DIR/nexo-usb.tmp.$$
+    USB_OK=1
+    if [ -n "${NEXO_USB_B64:-}" ]; then
+        printf '%s' "$NEXO_USB_B64" | base64 -d > "$TMPU" 2>/dev/null || USB_OK=0
+    else
+        cp "$SRC_DIR/bin/nexo-usb" "$TMPU" 2>/dev/null || USB_OK=0
+    fi
+    if [ "$USB_OK" = 1 ] && chmod 755 "$TMPU" && mv -f "$TMPU" "$BIN_DIR/nexo-usb"; then
+        if [ "$IS_TERMUX" = 1 ] && have termux-fix-shebang; then termux-fix-shebang "$BIN_DIR/nexo-usb" 2>/dev/null; fi
+        say "✔ nexo-usb instalado en $BIN_DIR/nexo-usb (Arduino, ESP32 y adaptadores serie USB con un cable OTG: nexo usb list)"
+        have python3 || warn "nexo-usb necesita python3:  pkg install python"
+    else
+        rm -f "$TMPU"
+        warn "No pude instalar nexo-usb (es opcional; el cliente funciona igual)."
+    fi
+fi
+
 case ":${PATH:-}:" in
     *":$BIN_DIR:"*) ;;
     *) warn "$BIN_DIR no está en tu PATH. Añade:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
@@ -184,7 +211,7 @@ fi
 say ""
 say "Listo. Prueba:   nexo status"
 if [ "$IS_TERMUX" = 1 ] && { [ -d "$PREFIX/var/lib/proot-distro/containers" ] || [ -d "$PREFIX/var/lib/proot-distro/installed-rootfs" ]; }; then
-    say "¿Usas distros de proot-distro?   nexo setup-guests --with-dbus --with-tools   (les copia el cliente, el enlace y, si quieres, nexo-dbus y nexo-tools)"
+    say "¿Usas distros de proot-distro?   nexo setup-guests --with-dbus --with-tools --with-usb   (les copia el cliente, el enlace y, si quieres, nexo-dbus, nexo-tools y nexo-usb)"
 fi
 if [ "$IS_TERMUX" != 1 ] && [ -x "$BIN_DIR/nexo-dbus" ]; then
     say "¿Tienes un escritorio aquí (playerctl, Waybar, Quickshell…)?   nexo setup-dbus   (muestra la música del móvil como reproductor)"

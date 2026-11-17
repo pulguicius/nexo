@@ -13,7 +13,8 @@ APP_PIDS=()
 # (en Windows, con core.filemode=false, git no lo conserva).
 mkdir -p "$T/bin"
 cp "$ROOT/termux/bin/nexo" "$T/bin/nexo"
-chmod +x "$T/bin/nexo"
+cp "$ROOT/termux/bin/nexo-usb" "$T/bin/nexo-usb"        # «nexo usb …» lo busca junto al cliente
+chmod +x "$T/bin/nexo" "$T/bin/nexo-usb"
 NEXO=$T/bin/nexo
 CLIENT_VERSION=$(sed -n 's/^NEXO_VERSION="\(.*\)"/\1/p' "$ROOT/termux/bin/nexo")
 APP_MINOR=$(sed -n 's/^APP_MINOR = \([0-9]*\).*/\1/p' "$ROOT/tests/fake_app.py")   # revisión del protocolo que habla la app falsa (= la real)
@@ -22,7 +23,7 @@ cleanup() {
     local p f
     for p in "${APP_PIDS[@]}"; do kill "$p" 2>/dev/null; done
     for f in "$T"/*.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
-    pkill -f "$T/bin/nexo" 2>/dev/null
+    pkill -f "$T/bin/nexo" 2>/dev/null          # (también los puentes de nexo-usb: se ejecutan como $T/bin/nexo-usb)
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -54,15 +55,27 @@ for need in python3 jq; do
 done
 
 echo "== Sintaxis"
-for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/bin/nexo-tools" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh" "$ROOT/tests/tools_tests.sh"; do
+for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/bin/nexo-tools" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh" "$ROOT/tests/tools_tests.sh" "$ROOT/tests/usb_tests.sh" "$ROOT/tests/usb_hardware_check.sh"; do
     if bash -n "$f" 2>"$T/err"; then ok "bash -n $(basename "$f")"; else bad "bash -n $(basename "$f")" "$(cat "$T/err")"; fi
 done
-for f in "$ROOT"/tests/*.py "$ROOT/termux/bin/nexo-dbus"; do
+for f in "$ROOT"/tests/*.py "$ROOT/termux/bin/nexo-dbus" "$ROOT/termux/bin/nexo-usb"; do
     if python3 -B -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$f" 2>"$T/err"; then ok "python3 compila $(basename "$f")"; else bad "python3 compila $(basename "$f")" "$(cat "$T/err")"; fi
 done
+if python3 -B "$ROOT/tests/ref_baud.py" --check "$ROOT/android/app/src/test/java/org/nexo/bridge/UsbSerialTest.kt" >"$T/refbaud" 2>&1; then
+    ok "las velocidades de FTDI y CH34x del test de Kotlin coinciden con tests/ref_baud.py ($(tail -n 1 "$T/refbaud"))"
+else
+    bad "tests/ref_baud.py --check" "$(head -5 "$T/refbaud")"
+fi
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S error "$ROOT/termux/bin/nexo" "$ROOT/termux/install.sh" >"$T/sc" 2>&1; then ok "shellcheck (solo errores)"; else bad "shellcheck" "$(head -20 "$T/sc")"; fi
 fi
+
+finish() {
+    echo
+    echo "Resultado: $PASS bien, $FAIL con fallos"
+    [ "$FAIL" -eq 0 ]
+    exit $?
+}
 
 echo "== Contrato: la app Android, la app falsa y docs/PROTOCOLO.md dicen lo mismo"
 python3 -I "$ROOT/tests/check_contract.py" "$ROOT" >"$T/contract.out" 2>&1; CONTRACT_RC=$?
@@ -87,13 +100,10 @@ unset XDG_CONFIG_HOME XDG_CACHE_HOME PREFIX NEXO_TOKEN NEXO_CONFIG NEXO_TRANSPOR
 export NEXO_PORT=$PORT
 export NEXO_CACHE_TTL=0     # sin caché salvo en las pruebas que la quieren
 
-# Para iterar rápido: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh  (solo nexo-dbus), o =tools (solo nexo-tools)
-if [ "${NEXO_TESTS_ONLY:-}" = dbus ] || [ "${NEXO_TESTS_ONLY:-}" = tools ]; then
+# Para iterar rápido: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh  (solo nexo-dbus), =tools (solo nexo-tools) o =usb (solo nexo-usb)
+if [ "${NEXO_TESTS_ONLY:-}" = dbus ] || [ "${NEXO_TESTS_ONLY:-}" = tools ] || [ "${NEXO_TESTS_ONLY:-}" = usb ]; then
     . "$ROOT/tests/${NEXO_TESTS_ONLY}_tests.sh"
-    echo
-    echo "Resultado: $PASS bien, $FAIL con fallos"
-    [ "$FAIL" -eq 0 ]
-    exit
+    finish
 fi
 
 echo "== Enlace y token"
@@ -559,17 +569,19 @@ has "…y avisa de que instaló nexo-dbus (el reproductor MPRIS)" "nexo-dbus ins
 cmp -s "$FP/bin/nexo-dbus" "$ROOT/termux/bin/nexo-dbus" && ok "…e idéntico al del repositorio" || bad "nexo-dbus instalado distinto"
 has "…y de que instaló nexo-tools (archivos entre móviles)" "nexo-tools instalado en $FP/bin/nexo-tools"
 [ -x "$FP/bin/nexo-tools" ] && cmp -s "$FP/bin/nexo-tools" "$ROOT/termux/bin/nexo-tools" && ok "nexo-tools queda ejecutable en \$PREFIX/bin e idéntico al del repositorio" || bad "nexo-tools instalado"
+has "…y de que instaló nexo-usb (Arduino, ESP32 y adaptadores serie USB)" "nexo-usb instalado en $FP/bin/nexo-usb"
+[ -x "$FP/bin/nexo-usb" ] && cmp -s "$FP/bin/nexo-usb" "$ROOT/termux/bin/nexo-usb" && ok "nexo-usb queda ejecutable en \$PREFIX/bin e idéntico al del repositorio" || bad "nexo-usb instalado"
 [ -x "$FP/bin/nexo" ] && ok "el cliente queda ejecutable en \$PREFIX/bin" || bad "cliente ejecutable"
 [ "$(stat -c %a "$T/a/home/.config/nexo/config")" = 600 ] && ok "config con modo 600 en \$HOME/.config/nexo" || bad "config de la instalación"
 run fenv a "$FP/bin/nexo" wifi status --short; eq "el cliente instalado funciona sin variables de entorno" "MiCasa"
 cmp -s "$FP/bin/nexo" "$ROOT/termux/bin/nexo" && ok "el cliente instalado es idéntico al del repositorio" || bad "cliente instalado distinto"
 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PORT; echo '{\"cmd\":\"bootstrap\"}' >&3; cat <&3" > "$T/bundle.sh" 2>/dev/null
-if [ -s "$T/bundle.sh" ] && ! sed -n '1,4p' "$T/bundle.sh" | grep -q '^export'; then
+if [ -s "$T/bundle.sh" ] && ! sed -n '1,5p' "$T/bundle.sh" | grep -q '^export'; then
     ok "el script de instalación no exporta el cliente en base64 (límite de 128 KiB por variable de entorno)"
 else
     bad "el bundle exporta NEXO_CLIENT_B64"
 fi
-[ "$(sed -n 2p "$T/bundle.sh" | cut -c1-17)" = "NEXO_CLIENT_B64='" ] && [ "$(sed -n 3p "$T/bundle.sh" | cut -c1-15)" = "NEXO_DBUS_B64='" ] && [ "$(sed -n 4p "$T/bundle.sh" | cut -c1-16)" = "NEXO_TOOLS_B64='" ] && ok "…y lleva el cliente, nexo-dbus y nexo-tools en las líneas 2, 3 y 4" || bad "formato del bundle"
+[ "$(sed -n 2p "$T/bundle.sh" | cut -c1-17)" = "NEXO_CLIENT_B64='" ] && [ "$(sed -n 3p "$T/bundle.sh" | cut -c1-15)" = "NEXO_DBUS_B64='" ] && [ "$(sed -n 4p "$T/bundle.sh" | cut -c1-16)" = "NEXO_TOOLS_B64='" ] && [ "$(sed -n 5p "$T/bundle.sh" | cut -c1-14)" = "NEXO_USB_B64='" ] && ok "…y lleva el cliente, nexo-dbus, nexo-tools y nexo-usb en las líneas 2, 3, 4 y 5" || bad "formato del bundle"
 
 FP2=$(mkfork b)
 run fenv b bash -c "$(mk_one "$PORT" "$(printf '0%.0s' $(seq 64))" "$TOKEN")"
@@ -741,6 +753,19 @@ echo "# vieja" >> "$GC/ubuntu/rootfs/usr/local/bin/nexo-tools"
 run gen bash "$FP/bin/nexo" setup-guests --no-verify ubuntu quantum_os
 cmp -s <(tail -n +2 "$GC/ubuntu/rootfs/usr/local/bin/nexo-tools") <(tail -n +2 "$ROOT/termux/bin/nexo-tools") && ok "sin --with-tools, una distro que ya tenía nexo-tools lo recibe nuevo" || bad "no se actualizó nexo-tools"
 [ ! -e "$GC/quantum_os/rootfs/usr/local/bin/nexo-tools" ] && ok "…y una que no lo tenía, no lo recibe" || bad "nexo-tools en una distro que no lo pidió"
+[ ! -e "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb" ] && ok "(antes) sin --with-usb no hay nexo-usb en la distro" || bad "nexo-usb apareció solo"
+run gen bash "$FP/bin/nexo" setup-guests --no-verify --with-usb ubuntu
+has "--with-usb copia nexo-usb a la distro" "nexo-usb copiado"
+[ -x "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb" ] && cmp -s <(tail -n +2 "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb") <(tail -n +2 "$ROOT/termux/bin/nexo-usb") && ok "…igual que el de Termux" || bad "nexo-usb en la distro"
+[ "$(head -n 1 "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb")" = '#!/usr/bin/env python3' ] && ok "…con el shebang de python3" || bad "shebang de nexo-usb en la distro"
+has "…y avisa de que a esa distro le falta python3" "le falta python3"
+has "…y de cómo probarlo" "nexo usb list"
+run gen bash "$FP/bin/nexo" setup-guests --list
+has "--list dice qué distros llevan nexo-usb" "· con nexo-usb"
+echo "# vieja" >> "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb"
+run gen bash "$FP/bin/nexo" setup-guests --no-verify ubuntu quantum_os
+cmp -s <(tail -n +2 "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb") <(tail -n +2 "$ROOT/termux/bin/nexo-usb") && ok "sin --with-usb, una distro que ya tenía nexo-usb lo recibe nuevo" || bad "no se actualizó nexo-usb"
+[ ! -e "$GC/quantum_os/rootfs/usr/local/bin/nexo-usb" ] && ok "…y una que no lo tenía, no lo recibe" || bad "nexo-usb en una distro que no lo pidió"
 mkdir -p "$T/cwd"
 pushd "$T/cwd" >/dev/null
 run gen bash "$FP/bin/nexo" setup-guests noexiste
@@ -758,18 +783,19 @@ has "…las copia" "✔ quantum_os"
 hasnt "…sin ejecutarlas para comprobar (sería lento)" "comprobado"
 run gen bash "$FP/bin/nexo" setup-guests --uninstall ubuntu
 n=0
-for f in "$GC/ubuntu/rootfs/usr/local/bin/nexo" "$GC/ubuntu/rootfs/usr/bin/nexo" "$GC/ubuntu/rootfs/usr/local/bin/nexo-tools"; do [ ! -e "$f" ] && n=$((n + 1)); done
-[ "$n" = 3 ] && ok "--uninstall quita TODAS las copias (también la de /usr/bin) y nexo-tools" || bad "--uninstall dejó copias ($n de 3 quitadas)"
+for f in "$GC/ubuntu/rootfs/usr/local/bin/nexo" "$GC/ubuntu/rootfs/usr/bin/nexo" "$GC/ubuntu/rootfs/usr/local/bin/nexo-tools" "$GC/ubuntu/rootfs/usr/local/bin/nexo-usb"; do [ ! -e "$f" ] && n=$((n + 1)); done
+[ "$n" = 4 ] && ok "--uninstall quita TODAS las copias (también la de /usr/bin), nexo-tools y nexo-usb" || bad "--uninstall dejó copias ($n de 4 quitadas)"
 [ ! -e "$GC/ubuntu/rootfs/home/ana/.config/nexo/config" ] && ok "…y el enlace propio de los usuarios (lleva el token)" || bad "--uninstall dejó el enlace de ana"
 [ -x "$GC/quantum_os/rootfs/usr/bin/nexo" ] && ok "…sin tocar las demás distros" || bad "--uninstall tocó otra distro"
 
 echo "== nexo update (lo que antes era copiar a mano)"
 U=$T/upd; rm -rf "$U"; mkdir -p "$U/repo/termux/bin" "$U/home/.config/nexo" "$U/tmp"
 TOOLS_VER=$(sed -n 's/^NEXO_TOOLS_VERSION="\(.*\)"/\1/p' "$ROOT/termux/bin/nexo-tools")
+USB_VER=$(sed -n 's/^NEXO_USB_VERSION = "\(.*\)"/\1/p' "$ROOT/termux/bin/nexo-usb")
 UP=$U/data/data/com.termux/files/usr; mkdir -p "$UP/bin"
-for f in nexo nexo-dbus nexo-tools; do cp "$ROOT/termux/bin/$f" "$U/repo/termux/bin/$f"; done
+for f in nexo nexo-dbus nexo-tools nexo-usb; do cp "$ROOT/termux/bin/$f" "$U/repo/termux/bin/$f"; done
 sed -i 's/^NEXO_VERSION=.*/NEXO_VERSION="9.9.9-test"/' "$U/repo/termux/bin/nexo"
-old_nexo 0.3.0 > "$UP/bin/nexo"; chmod +x "$UP/bin/nexo"                      # Termux con el cliente viejo, sin nexo-dbus ni nexo-tools
+old_nexo 0.3.0 > "$UP/bin/nexo"; chmod +x "$UP/bin/nexo"                      # Termux con el cliente viejo, sin nexo-dbus, nexo-tools ni nexo-usb
 printf 'NEXO_PORT=%s\nNEXO_TOKEN=%s\n' "$PORT" "$TOKEN" > "$U/home/.config/nexo/config"
 UG=$U/gb
 mkdir -p "$UG/containers/ubuntu/rootfs/usr/bin" "$UG/containers/ubuntu/rootfs/usr/local/bin"
@@ -785,7 +811,8 @@ rm -f "$FP/bin/proot-distro"
 run uenv bash "$UP/bin/nexo" update --check "$U/repo"
 rc_is "update --check" 0
 has "…dice qué cambiaría" "nexo        0.3.0 → 9.9.9-test"
-has "…y que instalaría los que faltan (en Termux se instalan los tres)" "nexo-tools  nuevo → $TOOLS_VER"
+has "…y que instalaría los que faltan (en Termux se instalan los cuatro)" "nexo-tools  nuevo → $TOOLS_VER"
+has "…también nexo-usb" "nexo-usb    nuevo → $USB_VER"
 [ "$(sed -n 's/^NEXO_VERSION="\(.*\)"/\1/p' "$UP/bin/nexo")" = 0.3.0 ] && [ ! -e "$UP/bin/nexo-tools" ] && ok "…sin cambiar nada" || bad "--check cambió algo"
 [ "$(sed -n 's/^NEXO_VERSION="\(.*\)"/\1/p' "$UG/containers/ubuntu/rootfs/usr/local/bin/nexo")" = 0.3.0 ] && ok "…ni en las distros" || bad "--check cambió una distro"
 run uenv bash "$UP/bin/nexo" update "$U/repo"
@@ -795,6 +822,7 @@ has "…y pasa a las distros" "Distros de proot-distro:"
 run uenv "$UP/bin/nexo" version
 eq "…y el nexo de Termux ya es el nuevo" "nexo 9.9.9-test"
 [ -x "$UP/bin/nexo-dbus" ] && [ -x "$UP/bin/nexo-tools" ] && cmp -s <(tail -n +2 "$UP/bin/nexo-tools") <(tail -n +2 "$ROOT/termux/bin/nexo-tools") && ok "…y trae nexo-dbus y nexo-tools, ejecutables e iguales a los del origen" || bad "nexo-dbus / nexo-tools tras update"
+[ -x "$UP/bin/nexo-usb" ] && cmp -s <(tail -n +2 "$UP/bin/nexo-usb") <(tail -n +2 "$ROOT/termux/bin/nexo-usb") && ok "…y nexo-usb, ejecutable e igual al del origen" || bad "nexo-usb tras update"
 [ "$(head -n 1 "$UP/bin/nexo")" = '#!/usr/bin/env bash' ] && ok "…con el shebang normal (termux-fix-shebang lo cambia en un Termux de verdad)" || bad "shebang tras update"
 [ "$(sed -n 's/^NEXO_VERSION="\(.*\)"/\1/p' "$UG/containers/ubuntu/rootfs/usr/local/bin/nexo")" = 9.9.9-test ] && ok "…la copia vieja de ubuntu queda en la versión nueva" || bad "update no actualizó la distro"
 run uenv bash "$UP/bin/nexo" update "$U/repo"
@@ -809,7 +837,7 @@ python3 - "$U" <<'EOF'
 import sys, os, zipfile
 u = sys.argv[1]
 with zipfile.ZipFile(os.path.join(u, "nexo.zip"), "w") as z:
-    for f in ("nexo", "nexo-dbus", "nexo-tools"):
+    for f in ("nexo", "nexo-dbus", "nexo-tools", "nexo-usb"):
         z.write(os.path.join(u, "repo", "termux", "bin", f), "nexo/termux/bin/" + f)
 EOF
 run uenv bash "$UP/bin/nexo" update --no-guests "$U/nexo.zip"
@@ -847,9 +875,15 @@ run env -i PATH="$GP:$UT" HOME="$U/home" TMPDIR="$U/tmp" bash "$GP/nexo" update 
 rc_is "update dentro de una distro (sin PREFIX)" 0
 run env -i PATH="$GP:$UT" HOME="$U/home" "$GP/nexo" version
 eq "…actualiza el nexo de su PATH" "nexo 9.9.9-test"
-[ ! -e "$GP/nexo-dbus" ] && [ ! -e "$GP/nexo-tools" ] && ok "…sin instalar nexo-dbus ni nexo-tools si no los pides" || bad "update instaló de más en una distro"
+[ ! -e "$GP/nexo-dbus" ] && [ ! -e "$GP/nexo-tools" ] && [ ! -e "$GP/nexo-usb" ] && ok "…sin instalar nexo-dbus, nexo-tools ni nexo-usb si no los pides" || bad "update instaló de más en una distro"
 run env -i PATH="$GP:$UT" HOME="$U/home" TMPDIR="$U/tmp" bash "$GP/nexo" update --with-tools "$U/repo"
 [ -x "$GP/nexo-tools" ] && ok "…y con --with-tools sí instala nexo-tools" || bad "update --with-tools en una distro"
+run env -i PATH="$GP:$UT" HOME="$U/home" TMPDIR="$U/tmp" bash "$GP/nexo" update --with-usb "$U/repo"
+[ -f "$GP/nexo-usb" ] && ok "…y con --with-usb, nexo-usb" || bad "update --with-usb en una distro"
+mkdir -p "$U/roto2/termux/bin"; cp "$U/repo/termux/bin/"* "$U/roto2/termux/bin/"; printf 'def (\n' >> "$U/roto2/termux/bin/nexo-usb"
+run uenv bash "$UP/bin/nexo" update --no-guests "$U/roto2"
+rc_is "un nexo-usb nuevo que no es Python válido → error (1)" 1
+has "…lo rechaza" "no es un programa de Python válido"
 
 echo "== nexo tools (todo lo que sigue a «tools» es de nexo-tools)"
 run fenv a bash "$FP/bin/nexo" tools --version
@@ -876,6 +910,10 @@ run env -i PATH="$T/stub:$UT" HOME="$T/a/home" NEXO_PORT=1 NEXO_TOKEN="$TOKEN" b
 eq "…y si la app no contesta, no se queda esperando: sigue sin nombre" "[] server"
 run fenv a bash "$FP/bin/nexo" doctor
 has "doctor muestra nexo-tools y su versión" "nexo-tools $FP/bin/nexo-tools $TOOLS_VER"
+has "…y nexo-usb y su versión" "nexo-usb   $FP/bin/nexo-usb $USB_VER"
+has "…y si el móvil tiene USB host" "este móvil tiene USB host"
+run env -i PATH="$UT" HOME="$T/a/home" NEXO_PORT="$PORT" NEXO_TOKEN="$TOKEN" bash "$T/solo2/bin/nexo" doctor
+has "sin nexo-usb instalado, doctor lo dice (es opcional)" "nexo-usb   no instalado"
 
 
 echo "== Desinstalar"
@@ -883,6 +921,7 @@ run fenv a bash "$ROOT/termux/install.sh" --uninstall
 [ ! -e "$FP/bin/nexo" ] && [ ! -e "$T/a/home/.config/nexo/config" ] && ok "--uninstall quita cliente y enlace" || bad "--uninstall"
 [ ! -e "$FP/bin/nexo-dbus" ] && ok "…y nexo-dbus" || bad "--uninstall no quitó nexo-dbus"
 [ ! -e "$FP/bin/nexo-tools" ] && ok "…y nexo-tools" || bad "--uninstall no quitó nexo-tools"
+[ ! -e "$FP/bin/nexo-usb" ] && ok "…y nexo-usb" || bad "--uninstall no quitó nexo-usb"
 echo "== Instalador: --uninstall y lo que guarda nexo-tools"
 mkdir -p "$T/a/home/.local/state/nexo-tools"; : > "$T/a/home/.local/state/nexo-tools/known.json"
 run fenv a bash "$ROOT/termux/install.sh" --uninstall
@@ -890,24 +929,38 @@ has "--uninstall avisa de lo que deja guardado nexo-tools (certificado, empareja
 [ -e "$T/a/home/.local/state/nexo-tools/known.json" ] && ok "…y no lo borra sin que lo pidas" || bad "--uninstall borró el estado de nexo-tools"
 run fenv a bash "$ROOT/termux/install.sh" --uninstall --purge
 [ ! -e "$T/a/home/.local/state/nexo-tools" ] && ok "--uninstall --purge sí lo borra" || bad "--purge no borró el estado"
+mkdir -p "$T/a/home/.local/state/nexo/usb"; : > "$T/a/home/.local/state/nexo/usb/usb0.log"
+run fenv a bash "$ROOT/termux/install.sh" --uninstall
+[ -e "$T/a/home/.local/state/nexo/usb/usb0.log" ] && ok "--uninstall no borra los registros de nexo-usb sin que lo pidas" || bad "--uninstall borró los registros de nexo-usb"
+run fenv a bash "$ROOT/termux/install.sh" --uninstall --purge
+[ ! -e "$T/a/home/.local/state/nexo/usb" ] && ok "--uninstall --purge sí los borra" || bad "--purge no borró los registros de nexo-usb"
 
 echo "== Instalador desde el repositorio (bash termux/install.sh)"
 mkdir -p "$T/ri/home"
 run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri/bin" NEXO_NO_DEPS=1 bash "$ROOT/termux/install.sh"
 rc_is "instala desde el repositorio" 0
-[ -x "$T/ri/bin/nexo" ] && [ -x "$T/ri/bin/nexo-dbus" ] && [ -x "$T/ri/bin/nexo-tools" ] && ok "…y deja nexo, nexo-dbus y nexo-tools ejecutables" || bad "instalación desde el repositorio"
+[ -x "$T/ri/bin/nexo" ] && [ -x "$T/ri/bin/nexo-dbus" ] && [ -x "$T/ri/bin/nexo-tools" ] && [ -x "$T/ri/bin/nexo-usb" ] && ok "…y deja nexo, nexo-dbus, nexo-tools y nexo-usb ejecutables" || bad "instalación desde el repositorio"
 cmp -s "$T/ri/bin/nexo-dbus" "$ROOT/termux/bin/nexo-dbus" && ok "…con el nexo-dbus del repositorio" || bad "nexo-dbus distinto"
 cmp -s "$T/ri/bin/nexo-tools" "$ROOT/termux/bin/nexo-tools" && ok "…y con el nexo-tools del repositorio" || bad "nexo-tools distinto"
+cmp -s "$T/ri/bin/nexo-usb" "$ROOT/termux/bin/nexo-usb" && ok "…y con el nexo-usb del repositorio" || bad "nexo-usb distinto"
 has "…y sugiere nexo setup-dbus" "nexo setup-dbus"
 run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri/bin" NEXO_NO_DEPS=1 bash "$ROOT/termux/install.sh" --uninstall
-[ ! -e "$T/ri/bin/nexo" ] && [ ! -e "$T/ri/bin/nexo-dbus" ] && [ ! -e "$T/ri/bin/nexo-tools" ] && ok "--uninstall desde el repositorio quita los tres" || bad "--uninstall desde el repositorio"
+[ ! -e "$T/ri/bin/nexo" ] && [ ! -e "$T/ri/bin/nexo-dbus" ] && [ ! -e "$T/ri/bin/nexo-tools" ] && [ ! -e "$T/ri/bin/nexo-usb" ] && ok "--uninstall desde el repositorio quita los cuatro" || bad "--uninstall desde el repositorio"
 mkdir -p "$T/ri2/src/bin"
 cp "$ROOT/termux/install.sh" "$T/ri2/src/install.sh"; cp "$ROOT/termux/bin/nexo" "$T/ri2/src/bin/nexo"
 run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri2/bin" NEXO_NO_DEPS=1 bash "$T/ri2/src/install.sh"
-[ -x "$T/ri2/bin/nexo" ] && [ ! -e "$T/ri2/bin/nexo-dbus" ] && [ ! -e "$T/ri2/bin/nexo-tools" ] && ok "sin nexo-dbus ni nexo-tools en el origen, instala solo el cliente (y no se queja)" || bad "instalación sin nexo-dbus"
+[ -x "$T/ri2/bin/nexo" ] && [ ! -e "$T/ri2/bin/nexo-dbus" ] && [ ! -e "$T/ri2/bin/nexo-tools" ] && [ ! -e "$T/ri2/bin/nexo-usb" ] && ok "sin nexo-dbus, nexo-tools ni nexo-usb en el origen, instala solo el cliente (y no se queja)" || bad "instalación sin nexo-dbus"
 
 # nexo-dbus (necesita dbus-daemon, busctl y gdbus; si faltan, esas pruebas se omiten con un aviso)
 . "$ROOT/tests/dbus_tests.sh"
+
+# nexo-usb: monitor serie, puente (PTY, RFC2217, TCP), permisos y desenchufar/volver a enchufar, contra la app falsa
+# (NEXO_TESTS_USB=skip las omite: en la integración continua van en su propio trabajo, que no bloquea)
+if [ "${NEXO_TESTS_USB:-}" = skip ]; then
+    echo "== nexo-usb (omitido: NEXO_TESTS_USB=skip)"
+else
+    . "$ROOT/tests/usb_tests.sh"
+fi
 
 # nexo-tools: servidor HTTPS, emparejamiento, explorador, escritura, send/fetch (necesita openssl)
 # (NEXO_TESTS_TOOLS=skip las omite: en la integración continua van en su propio trabajo, que no bloquea)
@@ -917,6 +970,4 @@ else
     . "$ROOT/tests/tools_tests.sh"
 fi
 
-echo
-echo "Resultado: $PASS bien, $FAIL con fallos"
-[ "$FAIL" -eq 0 ]
+finish

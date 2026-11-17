@@ -69,43 +69,44 @@ def body(src, signature):
 
 
 # Campos que solo aparecen dentro de los datos extra de un ERROR (permission_denied, needs_user_action): no son de la respuesta.
-ERROR_EXTRAS = {"permission", "action", "opens"}
+ERROR_EXTRAS = {"permission", "action", "opens", "needs_permission"}
 
 
-def keys_in(text):
-    """Campos JSON que escribe un trozo de Kotlin: .put("campo", …) / .putOrNull("campo", …) / put("campo")."""
-    return set(re.findall(r'\.put(?:OrNull)?\(\s*"([a-z_]+)"', text or "")) - ERROR_EXTRAS
+def keys_in(text, keep=()):
+    """Campos JSON que escribe un trozo de Kotlin: .put("campo", …) / .putOrNull("campo", …) / put("campo").
+    Se descartan los campos extra de los errores (ERROR_EXTRAS), salvo los que se indican en `keep` (p. ej. el campo `permission` de un dispositivo USB)."""
+    return set(re.findall(r'\.put(?:OrNull)?\(\s*"([a-z_]+)"', text or "")) - (ERROR_EXTRAS - set(keep))
 
 
 # ---------------------------------------------------------------- la app falsa
 spec = importlib.util.spec_from_file_location("fake_app", os.path.join(ROOT, "tests", "fake_app.py"))
 fa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fa)
-fa.ARGS = argparse.Namespace(old=False, listener=True, no_session=False, record=None, reqlog=None, minor2=False, minor3=False)
+fa.ARGS = argparse.Namespace(old=False, listener=True, no_session=False, record=None, reqlog=None, minor2=False, minor3=False, minor4=False)
 
 # ---------------------------------------------------------------- comandos y temas
 commands_kt = kt("Commands.kt")
 minor = int(re.search(r"const val MINOR = (\d+)", kt("Protocol.kt")).group(1))
 m = re.search(r"val NAMES: List<String> = listOf\((.*?)\)\.sorted\(\)", commands_kt, re.S)
 names = sorted(re.findall(r'"([a-z.]+)"', m.group(1))) if m else []
-spec_names = sorted(fa.OLD_COMMANDS | fa.NEW_COMMANDS | (fa.V13_COMMANDS if minor >= 3 else set()))
+spec_names = sorted(fa.OLD_COMMANDS | fa.NEW_COMMANDS | (fa.V13_COMMANDS if minor >= 3 else set()) | (fa.V14_COMMANDS if minor >= 4 else set()))
 check("la lista de comandos de la app (Commands.NAMES) es la de la app falsa", names == spec_names,
       "  solo en la app: %s\n  solo en la falsa: %s" % (sorted(set(names) - set(spec_names)), sorted(set(spec_names) - set(names))))
 
-handle = body(commands_kt, r"fun handle\(cmd: String, req: JSONObject\): JSONObject = when \(cmd\) \{") or ""
+handle = body(commands_kt, r"fun handle\(cmd: String, req: JSONObject(?:, owner: Any\?(?: = null)?)?\): JSONObject = when \(cmd\) \{") or ""
 handled = set(re.findall(r'"([a-z]+\.[a-z]+|logs)"', handle))
-server_side = {"hello", "ping", "subscribe", "unsubscribe"}
+server_side = {"hello", "ping", "subscribe", "unsubscribe"} | ({"usb.attach"} if minor >= 3 else set())   # usb.attach lo atiende el servidor: la conexión pasa a ser de bytes
 check("cada comando anunciado tiene su rama en Commands.handle (o en el servidor)",
       handled == set(names) - server_side,
       "  sin rama: %s\n  rama sin anunciar: %s" % (sorted(set(names) - server_side - handled), sorted(handled - set(names))))
 server_kt = kt("BridgeServer.kt")
-check("el servidor atiende hello, ping, subscribe y unsubscribe",
+check("el servidor atiende hello, ping, subscribe, unsubscribe (y usb.attach)",
       all(('"%s" ->' % c) in server_kt for c in sorted(server_side)))
 
 m = re.search(r"val TOPICS: List<String> = listOf\((.*?)\)", commands_kt, re.S)
 topics = set(re.findall(r'"([a-z]+)"', m.group(1))) if m else set()
-check("los temas a los que se suscribe quien no indica ninguno son wifi, bt, audio y media", topics == {"wifi", "bt", "audio", "media"}, "  son: %s" % sorted(topics))
-if minor >= 3:
+check("los temas a los que se suscribe quien no indica ninguno son wifi, bt, audio, media y usb", topics == {"wifi", "bt", "audio", "media", "usb"}, "  son: %s" % sorted(topics))
+if minor >= 4:
     m = re.search(r"val OPTIONAL_TOPICS: List<String> = listOf\((.*?)\)", commands_kt, re.S)
     optional_topics = set(re.findall(r'"([a-z]+)"', m.group(1))) if m else set()
     check("…y los temas que hay que pedir expresamente (OPTIONAL_TOPICS) son net y notif", optional_topics == {"net", "notif"}, "  son: %s" % sorted(optional_topics))
@@ -137,17 +138,19 @@ m2 = re.search(r'head = "((?:[^"\\]|\\.)*)" % \(', fa_src)
 fa_head = m2.group(1).replace("\\n", "\n") if m2 else None
 check("el instalador que sirve la app (Bootstrap.kt) empieza igual que el de la app falsa", kt_head is not None and kt_head == fa_head,
       "  app: %r\n  falsa: %r" % (kt_head, fa_head))
-check("el instalador lleva el cliente, nexo-dbus y nexo-tools, en ese orden, como variables de shell",
-      kt_head is not None and re.findall(r"^(NEXO_[A-Z0-9_]+)=", kt_head, re.M) == ["NEXO_CLIENT_B64", "NEXO_DBUS_B64", "NEXO_TOOLS_B64"])
+check("el instalador lleva el cliente, nexo-dbus, nexo-tools y nexo-usb, en ese orden, como variables de shell",
+      kt_head is not None and re.findall(r"^(NEXO_[A-Z0-9_]+)=", kt_head, re.M) == ["NEXO_CLIENT_B64", "NEXO_DBUS_B64", "NEXO_TOOLS_B64", "NEXO_USB_B64"])
 check("el instalador NO exporta las variables con los archivos (límite de 128 KiB por variable de entorno)",
-      all(("export " + v) not in bk for v in ("NEXO_CLIENT_B64", "NEXO_DBUS_B64", "NEXO_TOOLS_B64")))
-check("la app lee de sus assets bin/nexo, bin/nexo-dbus y bin/nexo-tools, y los tres existen en el repositorio",
-      all(('readAsset(ctx, "bin/%s")' % n) in bk and os.path.isfile(os.path.join(ROOT, "termux", "bin", n)) for n in ("nexo", "nexo-dbus", "nexo-tools")))
+      all(("export " + v) not in bk for v in ("NEXO_CLIENT_B64", "NEXO_DBUS_B64", "NEXO_TOOLS_B64", "NEXO_USB_B64")))
+check("la app lee de sus assets bin/nexo, bin/nexo-dbus, bin/nexo-tools y bin/nexo-usb, y los cuatro existen en el repositorio",
+      all(('readAsset(ctx, "bin/%s")' % n) in bk and os.path.isfile(os.path.join(ROOT, "termux", "bin", n)) for n in ("nexo", "nexo-dbus", "nexo-tools", "nexo-usb")))
 inst = rd("termux/install.sh")
 check("install.sh instala nexo-dbus desde NEXO_DBUS_B64 (o desde bin/nexo-dbus si se ejecuta desde el repositorio)",
       "NEXO_DBUS_B64" in inst and "$SRC_DIR/bin/nexo-dbus" in inst)
 check("install.sh instala nexo-tools desde NEXO_TOOLS_B64 (o desde bin/nexo-tools) y lo quita con --uninstall",
       "NEXO_TOOLS_B64" in inst and "$SRC_DIR/bin/nexo-tools" in inst and 'rm -f "$BIN_DIR/nexo" "$BIN_DIR/nexo-dbus" "$BIN_DIR/nexo-tools"' in inst)
+check("install.sh instala nexo-usb desde NEXO_USB_B64 (o desde bin/nexo-usb) y lo quita con --uninstall",
+      "NEXO_USB_B64" in inst and "$SRC_DIR/bin/nexo-usb" in inst and '"$BIN_DIR/nexo-usb"' in inst and 'nexo-usb" stop --all' in inst)
 
 # ---------------------------------------------------------------- campos de cada respuesta
 wifi_kt, bt_kt, audio_kt, media_kt = kt("WifiHandler.kt"), kt("BluetoothHandler.kt"), kt("AudioHandler.kt"), kt("MediaHandler.kt")
@@ -183,8 +186,8 @@ same("media.seek", keys_in(body(media_kt, r"fun seek\(req: JSONObject\): JSONObj
 same("media.play/pause/…", keys_in(body(media_kt, r"fun control\(cmd: String\): JSONObject \{")), {"requested", "state"})
 same("logs", keys_in(body(commands_kt, r"private fun logs\(req: JSONObject\): JSONObject \{")), fa.dispatch("logs", {}).keys())
 
-# protocolo 1.3: estado de la red del móvil y reenvío de notificaciones
-if minor >= 3:
+# protocolo 1.4: estado de la red del móvil y reenvío de notificaciones
+if minor >= 4:
     net_kt, notif_kt = kt("NetHandler.kt"), kt("NotifBridge.kt")
     same("net.status (y el evento «net»)", keys_in(body(net_kt, r"fun status\(\): JSONObject \{")), fa.net_status().keys())
     same("notif.status", keys_in(body(notif_kt, r"fun status\(\): JSONObject \{")), fa.notif_status().keys())
@@ -195,9 +198,37 @@ if minor >= 3:
     same("evento notif «removed»", keys_in(body(notif_kt, r"fun removedEvent\(.*?\): JSONObject \{")), {"op", "key", "reason"})
     check("los motivos de «removed» (clicked, dismissed, cancelled, timeout, other) están en NotifBridge.kt",
           all(('"%s"' % r) in notif_kt for r in ("clicked", "dismissed", "cancelled", "timeout", "other", "posted", "removed")))
-    check("docs/PROTOCOLO.md documenta todos los comandos de la app",
-          all(("`%s`" % n) in doc for n in names), "  sin documentar: %s" % [n for n in names if ("`%s`" % n) not in doc])
     check("docs/PROTOCOLO.md documenta los temas net y notif", "`net`" in doc and "`notif`" in doc)
+
+check("docs/PROTOCOLO.md documenta todos los comandos de la app",
+      all(("`%s`" % n) in doc for n in names), "  sin documentar: %s" % [n for n in names if ("`%s`" % n) not in doc])
+
+# protocolo 1.3: USB serie
+if minor >= 3:
+    usb_kt = kt("UsbHandler.kt")
+    plugged = fa.usb_plug("cp2102")          # sin hilos propios (el modelo «echo»); se desenchufa al terminar
+    other = fa.usb_plug("cp2102")
+    try:
+        plugged["permission"] = True
+        sess_spec = fa.usb_open({"device": plugged["id"]}, None)
+        st_spec = fa.usb_status()
+        perm_spec = fa.usb_permission({"device": other["id"]})
+        same("usb.status", keys_in(body(usb_kt, r"fun status\(\): JSONObject \{")), st_spec.keys())
+        dev_spec = st_spec["devices"][0]
+        same("usb.status (cada dispositivo y cada interfaz)", keys_in(body(usb_kt, r"private fun view\(dev: UsbDevice\): JSONObject \{"), keep={"permission"}),
+             set(dev_spec.keys()) | set(dev_spec["interfaces"][0].keys()))
+        base_sess = set(st_spec["sessions"][0].keys())
+        same("usb (cada sesión, en usb.status y en los eventos «usb»)", keys_in(body(usb_kt, r"private fun sessionView\(s: UsbSession\): JSONObject \{")), base_sess)
+        same("usb.permission", keys_in(body(usb_kt, r"private fun permJson\(.*?\): JSONObject \{")), perm_spec.keys())
+        same("usb.open (además de los campos de la sesión)", keys_in(body(usb_kt, r"fun open\(req: JSONObject, owner: Any\?\): JSONObject \{")), set(sess_spec.keys()) - base_sess)
+        same("usb (cada paso de las órdenes al chip)", keys_in(body(usb_kt, r"private fun stepsJson\(steps: List<Step>\): JSONArray \{")), sess_spec["steps"][0].keys())
+        same("usb.setup (además de los campos de la sesión)", keys_in(body(usb_kt, r"fun setup\(req: JSONObject\): JSONObject \{")), set(fa.usb_setup({"session": sess_spec["session"]}).keys()) - base_sess)
+        same("usb.control (además de los campos de la sesión)", keys_in(body(usb_kt, r"fun control\(req: JSONObject\): JSONObject \{")), set(fa.usb_control({"session": sess_spec["session"]}).keys()) - base_sess)
+        same("usb.close", keys_in(body(usb_kt, r"fun close\(req: JSONObject\): JSONObject \{")), fa.usb_close({"session": sess_spec["session"]}).keys())
+        same("usb.attach (respuesta; después la conexión es de bytes)", keys_in(body(server_kt, r"private fun attachUsb\(.*?\): Boolean \{")), {"session", "raw"})
+    finally:
+        fa.usb_unplug("all")
+    check("docs/PROTOCOLO.md documenta el tema usb y sus campos", "`usb`" in doc and all(("`%s`" % k) in doc for k in ("serial_capable", "ep_in", "needs_permission")))
 
 # ---------------------------------------------------------------- errores y paneles documentados
 all_kt = "\n".join(kt(f) for f in sorted(os.listdir(KT)) if f.endswith(".kt"))
@@ -219,8 +250,8 @@ opens_fake |= set(re.findall(r'\n\s+"([a-z_]+_(?:settings|panel|enable))"\)', fa
 opens_doc = set(re.findall(r"`([a-z_]+)`", doc[doc.index("| `needs_user_action`"):].split("\n", 1)[0]))
 check("los paneles (`opens`) que abre la app están todos documentados", opens_kt and opens_kt <= opens_doc,
       "  app: %s\n  doc: %s" % (sorted(opens_kt), sorted(opens_doc)))
-if minor < 3:
-    opens_fake -= fa.V13_OPENS      # los paneles del protocolo 1.3 los traerá la app cuando llegue a la revisión 3
+if minor < 4:
+    opens_fake -= fa.V14_OPENS      # los paneles del protocolo 1.4 los traerá la app cuando llegue a la revisión 4
 check("…y los que usa la app falsa existen también en la app", opens_fake <= opens_kt, "  falsa: %s\n  app: %s" % (sorted(opens_fake), sorted(opens_kt)))
 
 # ---------------------------------------------------------------- manifiesto
@@ -229,6 +260,18 @@ check("el manifiesto declara el servicio de acceso a notificaciones con su permi
       "NexoNotificationListener" in man and "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" in man)
 check("el manifiesto declara StartActivity (nexo start) como exportada", re.search(r'\.StartActivity"\s+android:exported="true"', man) is not None)
 check("el servicio en primer plano es de tipo connectedDevice", 'android:foregroundServiceType="connectedDevice"' in man)
+if minor >= 3:
+    check("el manifiesto declara el modo anfitrión USB como no obligatorio (el móvil sin OTG sigue pudiendo instalar la app)",
+          re.search(r'<uses-feature android:name="android.hardware.usb.host" android:required="false"', man) is not None)
+    check("UsbAttachedActivity ofrece abrir Nexo al conectar un dispositivo (USB_DEVICE_ATTACHED + usb_device_filter), sin mostrar nada",
+          re.search(r'\.UsbAttachedActivity"[^>]*android:exported="true"', man, re.S) is not None
+          and "android.hardware.usb.action.USB_DEVICE_ATTACHED" in man and "@xml/usb_device_filter" in man
+          and "finish()" in kt("UsbAttachedActivity.kt"))
+    filt = rd("android/app/src/main/res/xml/usb_device_filter.xml")
+    ids = re.findall(r'(?:vendor|product)-id="([^"]*)"', filt)
+    check("res/xml/usb_device_filter.xml: hay dispositivos y los identificadores van en decimal", ids and all(i.isdigit() for i in ids), "  ids: %s" % ids)
+    check("la app NO pide permisos de almacenamiento ni de cámara/micrófono para el USB (el permiso USB es el de Android, por dispositivo)",
+          "android.permission.MANAGE_USB" not in man and "WRITE_EXTERNAL_STORAGE" not in man)
 check("la app NO pide acceso a internet de verdad ni permisos de SMS/contactos/micrófono",
       not re.search(r"READ_SMS|READ_CONTACTS|RECORD_AUDIO|CAMERA|ACCESS_BACKGROUND_LOCATION|READ_EXTERNAL_STORAGE", man))
 

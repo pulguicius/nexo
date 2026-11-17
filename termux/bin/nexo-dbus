@@ -35,7 +35,7 @@ import time
 import traceback
 from urllib.parse import quote, unquote_to_bytes
 
-VERSION = "0.4.0-beta2"
+VERSION = "0.4.1"
 CLIENT_NAME = "nexo-dbus/" + VERSION
 
 MPRIS_NAME = "org.mpris.MediaPlayer2.nexo"

@@ -21,12 +21,13 @@ jobs:
       # Aviso, no bloquea: sirve para ver los hallazgos de shellcheck sin que una observación tumbe la compilación.
       - name: shellcheck (solo errores)
         continue-on-error: true
-        run: shellcheck -S error termux/bin/nexo termux/bin/nexo-tools termux/install.sh tests/run_tests.sh tests/dbus_tests.sh tests/tools_tests.sh tests/playerctl_check.sh
+        run: shellcheck -S error termux/bin/nexo termux/bin/nexo-tools termux/install.sh tests/run_tests.sh tests/dbus_tests.sh tests/tools_tests.sh tests/usb_tests.sh tests/usb_hardware_check.sh tests/playerctl_check.sh
       - name: Pruebas contra la app simulada
         # Las pruebas con un bus D-Bus real dependen más del entorno: van en el trabajo «dbus» (que no bloquea).
         env:
           NEXO_TESTS_DBUS: skip
           NEXO_TESTS_TOOLS: skip
+          NEXO_TESTS_USB: skip
         run: bash tests/run_tests.sh
 
   tools:
@@ -61,6 +62,22 @@ jobs:
         run: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh
       - name: nexo-dbus con playerctl de verdad
         run: bash tests/playerctl_check.sh
+
+  usb:
+    name: Probar nexo usb (puentes PTY, RFC 2217 y TCP) contra la app simulada
+    runs-on: ubuntu-latest
+    # No bloquea: usa puertos locales, PTY y relojes (el reinicio del Arduino se mide en milisegundos) y en un ejecutor muy
+    # cargado puede dar un falso rojo. Ojo: lo que prueba es el protocolo y los puentes contra una app SIMULADA; con una
+    # placa y un móvil reales no se ha podido probar (para eso está tests/usb_hardware_check.sh).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar herramientas
+        run: sudo apt-get update && sudo apt-get install -y jq python3
+      - name: nexo usb contra la app simulada
+        run: NEXO_TESTS_ONLY=usb bash tests/run_tests.sh
+      - name: Las velocidades del test de Kotlin contra la referencia en Python
+        run: python3 tests/ref_baud.py --check android/app/src/test/java/org/nexo/bridge/UsbSerialTest.kt
 
   apk:
     name: Compilar el APK
@@ -97,6 +114,14 @@ jobs:
           else
             echo "Sin secretos de firma: se usará la clave de depuración."
           fi
+
+      # Las pruebas de JVM de los controladores USB (sin móvil). No bloquean: si alguna falla, el registro dice cuál.
+      - name: Pruebas de JVM (controladores USB)
+        continue-on-error: true
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon testDebugUnitTest
 
       - name: Compilar
         working-directory: android

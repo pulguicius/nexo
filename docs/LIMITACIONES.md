@@ -121,6 +121,19 @@ Esa emulación es **fiel solo en lo que Android permite**: estado, listas, event
 - **Segundo plano.** Con la pantalla apagada y el ahorro de batería de HyperOS, el móvil que comparte puede dejar de contestar: desactiva el ahorro para Termux y usa `termux-wake-lock`.
 - **Sin probar en móviles reales** (solo entre dos «dispositivos» simulados en una máquina): ver [NEXO-TOOLS](NEXO-TOOLS.md#qué-se-ha-probado-y-qué-no).
 
+## USB serie (`nexo usb`)
+
+- **Solo puertos serie.** Android deja a una app abrir un dispositivo USB con `UsbManager` y el permiso del usuario; una distro de proot no puede abrir `/dev/bus/usb`, no puede montar nada y no tiene `CAP_SYS_ADMIN`. Teclados, ratones, discos y hubs **salen en `nexo usb list`** pero no se pasan a la distro
+  (los discos: 0.4.2; Android ya usa el teclado y el ratón para el propio móvil).
+- **El puerto es un PTY, no un dispositivo USB.** `lsusb`, `udevadm` y los programas que buscan `/dev/ttyACM*` o `/dev/ttyUSB*` solos (Arduino IDE, `arduino-cli board list`) no lo ven: hay que darles la ruta (`nexo usb status`), o `--link /dev/ttyUSB0` si tu distro deja escribir en `/dev`.
+- **DTR y RTS no existen en un PTY de Linux.** `nexo usb bridge` emula el reinicio del Arduino al abrir el puerto y suelta las líneas al cerrar; `esptool` y pyserial deben usar el servidor RFC 2217 (`rfc2217://…`), que sí las lleva. Algo que mire DTR/RTS por otra vía no los verá.
+- **Chips:** CDC‑ACM, CP210x, FTDI y CH34x. **PL2303 no** (sale en la lista con una nota). Placas de USB nativo que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro) reaparecen con otro VID:PID y el puente no las sigue.
+  FTDI y CH34x calculan un divisor: la velocidad real puede diferir un poco de la pedida (≤ ~2 % en las normales). CP210x y CH34x no admiten 1,5 bits de parada.
+- **Un dispositivo, una sesión.** Mientras un puente (o un `monitor`) lo tiene abierto, otro comando responde «ocupado». El puente RFC 2217 y el TCP crudo admiten varios clientes, pero escriben todos al mismo chip.
+- **Seguridad:** el RFC 2217 y el TCP crudo **no tienen contraseña** (escuchan en `127.0.0.1`): cualquier programa del móvil que los abra puede escribir en tu placa. Ciérralos con `nexo usb stop`. Android pide el permiso por dispositivo, y puede volver a pedirlo al desenchufar y enchufar si no marcaste «Usar siempre».
+- **Energía.** El móvil da poca corriente por OTG: con varias placas o discos, un hub con alimentación. Algunos Xiaomi tienen un interruptor «OTG» que se apaga solo.
+- **Sin probar con hardware real** (solo con la app simulada y con pruebas de JVM): ver [USB](USB.md#probarlo-en-tu-móvil) y `tests/usb_hardware_check.sh`.
+
 ## La app se congela (código 12)
 
 Xiaomi/HyperOS/MIUI y otras capas **congelan** las apps en segundo plano aunque tengan un servicio en primer plano: el puerto acepta la conexión, pero nadie contesta.

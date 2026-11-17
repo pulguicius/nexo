@@ -16,6 +16,10 @@ Si solo quieres informar de un fallo, abre un *issue* con la salida de `nexo doc
 ```bash
 bash tests/run_tests.sh              # todo (necesita bash, python3 y jq; ~3 min)
 NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh   # solo nexo-dbus y setup-dbus
+NEXO_TESTS_ONLY=usb bash tests/run_tests.sh    # solo nexo usb (puentes PTY, RFC 2217, TCP, reinicio del Arduino…)
+(cd android && ./gradlew testDebugUnitTest)    # las pruebas de JVM de los controladores USB (UsbSerialTest.kt)
+python3 tests/ref_baud.py --check android/app/src/test/java/org/nexo/bridge/UsbSerialTest.kt   # las tablas de velocidad del test = las de la referencia en Python
+bash tests/usb_hardware_check.sh --help        # la prueba con una placa/adaptador REAL (en el móvil, no en CI)
 python3 -I tests/check_contract.py . # solo el contrato app ↔ app simulada ↔ protocolo
 python3 -I tests/ui_tests.py         # el gestor web de nexo-tools en un Chromium sin pantalla (pip install playwright; playwright install chromium); sale con 77 si no hay navegador
 ```
@@ -95,9 +99,9 @@ gh secret set NEXO_KEY_PASSWORD                 # la misma contraseña (con PKCS
 
 Guarda `nexo.jks` y su contraseña en un sitio seguro: sin ellos no podrás publicar actualizaciones que se instalen encima.
 Para compilar en local con tu clave, define `NEXO_KEYSTORE`, `NEXO_KEYSTORE_PASSWORD`, `NEXO_KEY_ALIAS` y `NEXO_KEY_PASSWORD`.
-Una etiqueta `v*` (`git tag v0.4.0-beta2 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar) hace que el workflow publique el APK en **Releases**.
+Una etiqueta `v*` (`git tag v0.4.1 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar) hace que el workflow publique el APK en **Releases**.
 
 ## Estructura
 
-Está en el README (sección «Desarrollo»). Lo más importante: `termux/bin/nexo` (cliente), `termux/bin/nexo-dbus` (servicios D‑Bus), `android/…/BridgeServer.kt` (servidor), `android/…/Commands.kt` (reparto de comandos),
+Está en el README (sección «Desarrollo»). Lo más importante: `termux/bin/nexo` (cliente), `termux/bin/nexo-dbus` (servicios D‑Bus), `termux/bin/nexo-usb` (USB serie), `android/…/UsbSerial.kt` y `UsbHandler.kt` (los controladores y el USB host), `android/…/BridgeServer.kt` (servidor), `android/…/Commands.kt` (reparto de comandos),
 `docs/PROTOCOLO.md` (contrato) y `tests/fake_app.py` (especificación ejecutable).

@@ -1,4 +1,4 @@
-# Protocolo Nexo (versión 1, revisión 2)
+# Protocolo Nexo (versión 1, revisión 3)
 
 Lo que hablan la app Android y los clientes (`nexo`, `nexo-dbus`, o el tuyo). Es deliberadamente simple para que se
 pueda usar desde bash, Python, Node, QML o lo que tengas dentro de una distro.
@@ -10,7 +10,8 @@ conozca, y una app nueva sigue atendiendo a los clientes viejos. La *revisión* 
 |---|---|---|
 | 1 | 0.1.x | WiFi, Bluetooth, eventos, bootstrap |
 | 2 | 0.2.x | audio, media, `wifi.saved/forget/reconnect`, `bt.forget/rename/info`, `logs`, `commands` en `hello`, `gateway/prefix/dns` en `wifi.status` |
-| 3 | 0.4.3 (previsto) | `net.status` (qué red usa el móvil) y el tema de eventos `net`; notificaciones: `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` |
+| 3 | 0.4.1 | USB serie (Arduino, ESP32, adaptadores USB↔serie): `usb.status`, `usb.permission`, `usb.open`, `usb.setup`, `usb.control`, `usb.close`, `usb.attach`, el tema de eventos `usb` y el campo `usb` en `hello`. Una conexión puede pasar a ser de **bytes** (`usb.attach`) |
+| 4 | 0.4.3 (previsto) | `net.status` (qué red usa el móvil) y el tema de eventos `net`; notificaciones: `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` |
 
 ## Transporte
 
@@ -28,11 +29,12 @@ Si el token es incorrecto, la app espera ~0,8 s, responde `unauthorized` y cierr
 {"id":"1","cmd":"hello","token":"<48 caracteres hex>","client":"mi-cliente/1.0"}
 ```
 ```json
-{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.0-beta2","proto":1,"minor":2,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
+{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.1","proto":1,"minor":3,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"usb":true,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
 ```
 
 - `wifi` y `bluetooth` dicen si el móvil tiene esa radio.
 - `listener` dice si Android le dio a Nexo «acceso a notificaciones» (hace falta para `media.*` y `notif`).
+- `usb` (revisión 3) dice si el móvil tiene modo anfitrión USB (OTG). Una app de la revisión 2 no lo envía.
 - `commands` es la lista de comandos que esta app entiende: úsala para detectar capacidades en vez de adivinar por la versión.
 
 El token se muestra en la app y se guarda con `nexo pair TOKEN` (archivo `config` con modo 600). Se invalida con «Token nuevo».
@@ -58,7 +60,8 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 | `needs_user_action` | Android no deja hacerlo solo. La app dejó una **notificación** que abre el panel adecuado: la respuesta trae `"action":"notification"` y `"opens"` = `wifi_panel`, `bluetooth_enable`, `bluetooth_settings`, `volume_panel` o `notification_listener_settings` |
 | `wifi_disabled` / `bluetooth_disabled` | El comando necesita la radio encendida |
 | `not_paired` | El dispositivo Bluetooth no está emparejado en Android |
-| `not_found` | Lo que pides no existe: red guardada, salida de audio, sesión de medios, carátula |
+| `not_found` | Lo que pides no existe: red guardada, salida de audio, sesión de medios, carátula, dispositivo o sesión USB |
+| `busy` | USB: el dispositivo ya está abierto (por otra sesión, por otra app, o Android no deja reclamar su interfaz) o la sesión ya tiene un flujo de datos conectado |
 | `unsupported` | Este móvil o esta versión de Android no tiene eso |
 | `failed` | Android rechazó la operación |
 | `timeout` | El comando tardó más de lo razonable (la app no se quedó colgada: contesta y sigue) |
@@ -72,7 +75,7 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 |---|---|---|
 | `hello` | `token`, `client?` | información de la app (arriba) |
 | `ping` | — | `{"pong":true,"t":<ms>}` |
-| `subscribe` | `topics?` = `["wifi","bt","audio","media"]` | `{"topics":[…]}`, y después un evento inicial por tema |
+| `subscribe` | `topics?` = `["wifi","bt","audio","media","usb"]` | `{"topics":[…]}`, y después un evento inicial por tema |
 | `unsubscribe` | — | — |
 | `logs` | `n?` (50; máx. 200) | `{"lines":[…],"count":N,"uptime_s":S}`: lo último que anotó la app. Nunca lleva el token ni claves |
 | `bootstrap` | — | **No es JSON**: ver más abajo. No necesita token |
@@ -141,6 +144,57 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 - `audio.switch`: Android no deja que una app normal redirija el audio del sistema a otra salida (`setPreferredDevice` solo afecta a las
   sesiones de la propia app). La app valida la salida y abre el panel de volumen para que la elijas con un toque.
 
+### USB serie
+Arduino, ESP32 y adaptadores USB↔serie (CDC‑ACM, CP210x, FTDI, CH34x) conectados al móvil por OTG o por un hub. Android **no deja** que una distro
+de proot abra `/dev/bus/usb` ni monte nada, así que la app abre el dispositivo con la API oficial (`UsbManager`, tras pedirle permiso al usuario) y le
+pasa a Linux **solo los bytes de la línea serie**. Pendrives, discos, teclados y ratones no son parte de esto (los discos llegan en la 0.4.2).
+
+| Comando | Parámetros | `data` |
+|---|---|---|
+| `usb.status` | — | `host` (¿tiene OTG?), `devices:[{id,path,bus,address,vid,pid,vendor,product,serial,class,kind,driver,serial_capable,permission,note,interfaces:[{id,class,subclass,protocol,endpoints}]}]`, `sessions:[…]` |
+| `usb.permission` | `device`, `wait_ms?` (0‑30000) | `{device,granted,requested,denied}` |
+| `usb.open` | `device`, y `baud?` (115200), `bits?` (5‑8; 8), `parity?` (`none`, `odd`, `even`, `mark`, `space`), `stop?` (1, 1.5 o 2), `dtr?` y `rts?` (ambas `true`) | la sesión (abajo) + `ep_in, ep_out, packet, steps` |
+| `usb.setup` | `session`, y los mismos `baud`, `bits`, `parity`, `stop` | la sesión + `steps` |
+| `usb.control` | `session`, y `dtr?`, `rts?`, `brk?` (señal de ruptura) | la sesión + `steps` |
+| `usb.close` | `session` | `{"closed":true}` |
+| `usb.attach` | `session` | `{"session":…,"raw":true}`, y la conexión **deja de ser JSON** (ver abajo) |
+
+**Orden de uso:** `usb.status` (elige el `id` de un dispositivo con `serial_capable:true`) → `usb.permission` → `usb.open` → una **segunda conexión** que se
+autentica con `hello` y manda `usb.attach` → bytes. La conexión de control (la que hizo `usb.open`) debe seguir abierta: **la sesión se cierra con ella**, con `usb.close`
+o al desenchufar el dispositivo.
+
+- **Permiso.** `usb.permission` hace que Android muestre su diálogo «¿Permitir que Nexo acceda al dispositivo USB?» en la pantalla del móvil. Si ya había permiso responde
+  `granted:true, requested:false`. Con `wait_ms` espera esa cantidad de milisegundos a que el usuario conteste; si no contesta a tiempo, responde `granted:false, requested:true, denied:false`
+  y el cliente vuelve a consultar (`usb.status` → `permission`). `denied:true` = el usuario dijo que no. `usb.open` sin permiso falla con `permission_denied` (y el campo `needs_permission` en `true`).
+- **Dispositivo.** `id` es el de Android (estable mientras esté enchufado). `vid`/`pid` van en hexadecimal de 4 cifras; `vendor`, `product` y `serial` pueden ser `null`.
+  `kind`: `serial`, `hub`, `storage`, `hid`, `audio`, `video`, `printer`, `net` u `other` (solo para mostrar). `driver`: `cdc-acm`, `cp210x`, `ftdi` o `ch34x`, o `null`.
+  `serial_capable` es `true` si Nexo tiene controlador para él; si es `false`, `note` puede explicar por qué (p. ej. PL2303) y `usb.open` responde `unsupported`.
+- **Sesión.** `session` (`s1`, `s2`…), `device`, `driver`, `baud`, `bits`, `parity`, `stop`, `dtr`, `rts`, `attached` (¿hay un flujo de datos conectado?) y los contadores `rx`/`tx`
+  (bytes recibidos del dispositivo y enviados a él). Cada dispositivo admite una sola sesión a la vez (`busy`).
+- **`usb.open` además devuelve** `ep_in` y `ep_out` (direcciones de los extremos bulk que usa) y `packet` (tamaño máximo de paquete de entrada). Son informativos.
+- **`steps`.** Las órdenes de control que se mandaron al chip: `{op, rc}`, con `rc` = lo que devolvió Android (bytes transferidos, o negativo si falló). Es información para diagnosticar.
+  Si falla una orden obligatoria del chip, el comando responde `failed` (con la lista de `steps` en la respuesta de error).
+- **`dtr` y `rts`.** Son las líneas de control. En un Arduino, activar `dtr` (el flanco) lo **reinicia**: es lo que hacen el IDE y `avrdude` para entrar en el cargador.
+  `brk:true` empieza una señal de ruptura y `brk:false` la termina. `stop:1.5` no lo admiten CP210x ni CH34x (`unsupported`).
+- **Velocidad.** FTDI y CH34x calculan un divisor: la velocidad real puede diferir un poco de la pedida (no más de ~2 % en las normales).
+- **Flujo de datos (`usb.attach`).** Tras la respuesta `{"ok":true,…,"raw":true}` (una línea JSON), esa conexión ya **no es JSON**: lo que llega del dispositivo se envía tal cual al cliente y lo
+  que el cliente escribe se envía al dispositivo, hasta que alguno se cierre. En esa conexión no hay eventos. Se cierra cuando termina la sesión.
+  Solo una conexión de datos por sesión (`busy` si ya hay otra). Si el cliente cierra la conexión de datos, la sesión **sigue abierta** (se puede volver a hacer `usb.attach`).
+
+Un cliente de bash puro (para ver lo que manda un Arduino a 9600):
+
+```bash
+exec 3<>/dev/tcp/127.0.0.1/8765                                  # conexión de control
+printf '%s\n' '{"id":"1","cmd":"hello","token":"TU_TOKEN"}' >&3; read -r -t 5 l <&3
+printf '%s\n' '{"id":"2","cmd":"usb.status"}' >&3;              read -r -t 5 l <&3; echo "$l"      # busca el "id" del Arduino
+printf '%s\n' '{"id":"3","cmd":"usb.permission","device":1002,"wait_ms":30000}' >&3; read -r -t 35 l <&3
+printf '%s\n' '{"id":"4","cmd":"usb.open","device":1002,"baud":9600}' >&3;           read -r -t 10 l <&3; echo "$l"   # anota la "session"
+exec 4<>/dev/tcp/127.0.0.1/8765                                  # conexión de datos
+printf '%s\n' '{"id":"1","cmd":"hello","token":"TU_TOKEN"}' >&4; read -r -t 5 l <&4
+printf '%s\n' '{"id":"2","cmd":"usb.attach","session":"s1"}' >&4; read -r -t 5 l <&4
+cat <&4                                                           # …y aquí salen los bytes del Arduino (Ctrl‑C para salir)
+```
+
 ### Media
 Necesita que el usuario conceda a Nexo el **acceso a notificaciones** (Ajustes › Notificaciones › Acceso a notificaciones). Sin él,
 `media.status` responde con `listener:false` (no es un error) y los demás comandos responden `needs_user_action` con `opens:"notification_listener_settings"`.
@@ -167,11 +221,13 @@ Tras `subscribe`, la app envía líneas **sin `id`**:
 {"event":"bt","data":{ …igual que bt.status… }}
 {"event":"audio","data":{ …igual que audio.status… }}
 {"event":"media","data":{ …igual que media.status… }}
+{"event":"usb","data":{ …igual que usb.status… }}
 ```
 
 Se juntan las ráfagas (300 ms) y no se emiten cambios de intensidad de señal ni de posición de la canción
-(quien la necesite la extrapola con `position_ms` y `speed`, o la pide con `media.status`).
-Sin `topics`, se suscribe a `wifi`, `bt`, `audio` y `media`. El cliente `nexo watch` envía un `ping` cada 30 s sin actividad
+(quien la necesite la extrapola con `position_ms` y `speed`, o la pide con `media.status`). El tema `usb` avisa cuando se enchufa o desenchufa un dispositivo, cambia un permiso o
+se abre o se cierra una sesión (no por cada byte: los contadores `rx` y `tx` de un evento son los del momento del aviso).
+Sin `topics`, se suscribe a `wifi`, `bt`, `audio`, `media` y `usb`. El cliente `nexo watch` envía un `ping` cada 30 s sin actividad
 y reconecta solo (con espera creciente) si se corta.
 
 ## `bootstrap`: instalar el cliente sin internet
@@ -180,7 +236,7 @@ y reconecta solo (con espera creciente) si se corta.
 {"cmd":"bootstrap"}
 ```
 
-La app responde con **un script de bash en texto plano** (no JSON) y cierra la conexión. Contiene el cliente y `nexo-dbus` (cada uno en base64, en las variables de shell `NEXO_CLIENT_B64` y `NEXO_DBUS_B64`, sin `export`) y el instalador,
+La app responde con **un script de bash en texto plano** (no JSON) y cierra la conexión. Contiene el cliente, `nexo-dbus`, `nexo-tools` y `nexo-usb` (cada uno en base64, en las variables de shell `NEXO_CLIENT_B64`, `NEXO_DBUS_B64`, `NEXO_TOOLS_B64` y `NEXO_USB_B64`, sin `export`) y el instalador,
 **nunca el token**. El comando de una línea que copia la app comprueba el **SHA‑256** del script antes de ejecutarlo; así, otra app que
 se hubiera adelantado a ocupar el puerto no puede colarte código. La app limita la entrega (una cada 2 s, diez por minuto en total).
 

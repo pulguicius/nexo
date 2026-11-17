@@ -2,6 +2,23 @@
 
 Solo lo que cambia para quien usa Nexo. Qué está probado y qué no, en el [README](README.md#estado-y-lo-que-falta).
 
+## 0.4.1
+
+- **Nuevo: `nexo usb`** — Arduino, ESP32 y adaptadores USB↔serie (CH340, CP210x, FTDI) **dentro de tu distro**. Los conectas al móvil (cable OTG o hub) y salen como un puerto serie:
+  `nexo usb list` (todo lo que Android ve por USB, también teclados, ratones, discos y hubs, aunque solo se usan los puertos serie), `permit` (el permiso de Android), `monitor` (monitor serie),
+  `bridge` (un puerto PTY para `avrdude`, `arduino-cli`, PlatformIO, `minicom` y `screen`; un servidor RFC 2217 para `esptool` y pyserial; TCP crudo para `avrdude -P net:`), `status`, `stop` y `reset`.
+  Emula el **reinicio automático del Arduino** al abrir el puerto, y si desenchufas el cable el puerto se queda donde está y se recupera al volver a enchufar. Controladores propios, sin librerías:
+  CDC‑ACM, CP210x, FTDI y CH34x (el PL2303 se enseña pero no se usa). Guía: [`docs/USB.md`](docs/USB.md).
+  **Probado contra la app simulada y con pruebas de los controladores en una JVM; todavía no con un móvil ni una placa de verdad.** `tests/usb_hardware_check.sh` es la prueba para hacerlo (eco TX↔RX, cargador STK500 del Arduino, `esptool`, desenchufar) y da un informe para pegar.
+- **Programa nuevo `nexo-usb`** (Python 3.7+, sin dependencias): el comando de instalación de la app instala ahora cuatro archivos; `nexo setup-guests --with-usb` y `nexo update` lo llevan a las distros (`--with-usb` también en `update`);
+  `--uninstall` lo quita y `--purge` borra sus registros. `nexo doctor` lo muestra y dice si el móvil tiene USB host; `nexo usb list` funciona hasta sin Python.
+- **App Android:** `UsbSerial.kt`, `UsbHandler.kt` y `UsbAttachedActivity.kt` (el aviso «abrir Nexo cuando se conecte»); `android.hardware.usb.host` se declara como no obligatorio (el APK se instala igual en móviles sin OTG).
+- **Protocolo 1.3** (revisión 3): `usb.status`, `usb.permission`, `usb.open`, `usb.setup`, `usb.control`, `usb.close`, `usb.attach` (una segunda conexión que pasa a bytes crudos), el tema de eventos `usb` y el campo `usb` en `hello`.
+  Una app anterior y un cliente nuevo (o al revés) se entienden: `nexo usb` dice «instala el APK nuevo». El estado de la red móvil y las notificaciones pasan a la 1.4 (0.4.3).
+- Pruebas y CI: 370 comprobaciones más (de 1255 a 1625) sobre `nexo usb` (monitor, puentes PTY/RFC 2217/TCP, reinicio del Arduino, desenchufar y volver a enchufar, instalador, `setup-guests`, `update`, `doctor`),
+  37 pruebas de JVM de los controladores (`./gradlew testDebugUnitTest`), `tests/ref_baud.py` (las velocidades de FTDI y CH34x contra una transcripción independiente de libftdi y del kernel) y `tests/usb_hardware_check.sh`;
+  trabajo `usb` en GitHub Actions (no bloquea).
+
 ## 0.4.0‑beta2
 
 - **Nuevo: `nexo tools`** — enviar y explorar archivos entre móviles (y PC con Linux) por la red local: `send`/`fetch` con un código de un solo uso, `server`, `discover` (detecta móviles con Nexo en la red), `pair`/`connect` (emparejamiento por código con certificado fijado por huella),
@@ -14,7 +31,7 @@ Solo lo que cambia para quien usa Nexo. Qué está probado y qué no, en el [REA
 - **Instalador:** el comando de la app instala también `nexo-tools`; `install.sh --uninstall` lo quita y, con `--purge`, borra lo que guarda (certificado y dispositivos emparejados).
 - **`nexo doctor`** muestra `nexo-tools`. **`nexo dbus restart`** (ya existía en `nexo-dbus`) aparece en la ayuda.
 - Pruebas y CI: pruebas de `nexo tools`, `setup-guests` (con un `proot-distro` simulado) y `nexo update`; `tests/ui_tests.py` maneja el gestor web en un Chromium sin pantalla; trabajo `tools` en GitHub Actions (no bloquea).
-- Protocolo: sin cambios (1.2). El estado de la red móvil y las notificaciones (protocolo 1.3) pasan a la 0.4.3.
+- Protocolo: sin cambios (1.2). El estado de la red móvil y las notificaciones (protocolo 1.4) pasan a la 0.4.3.
 
 ## 0.4.0‑beta1
 

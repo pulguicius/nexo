@@ -81,6 +81,12 @@ Con `nexo tools`: en el que envía, `nexo tools send foto.jpg` (te da una IP y u
 y luego `nexo tools browse NOMBRE` (terminal) o `nexo tools web NOMBRE` (navegador). Es independiente del puente (no necesita la app Nexo), va por la red WiFi local y cifrado, y **solo ve lo que el otro comparte y permite**. Guía: [NEXO-TOOLS](NEXO-TOOLS.md).
 `nexo tools discover` no encuentra el móvil: muchos routers aíslan a los clientes WiFi o bloquean la difusión UDP; usa `nexo tools connect IP --code CÓDIGO` (la IP la da `nexo tools status` en el otro).
 
+## ¿Puedo conectar un Arduino, un ESP32 o un adaptador USB al móvil y usarlo desde la distro?
+
+Con `nexo usb` (desde la 0.4.1): cable OTG (o un hub), `nexo usb list`, `nexo usb permit` y `nexo usb bridge` dan un puerto serie para `avrdude`, `arduino-cli`, `esptool`, PlatformIO, `screen`…; `nexo usb monitor` es un monitor serie.
+Una distro de proot no puede abrir `/dev/bus/usb` ni montar nada, así que lo abre la app Nexo (con tu permiso) y le pasa a la distro **solo los bytes de la línea serie**: por eso el puerto es un PTY y no `/dev/ttyACM0`.
+Teclados, ratones y discos salen en la lista pero no se pasan a la distro (los discos llegan en la 0.4.2). **Todavía no se ha probado con una placa real**; `tests/usb_hardware_check.sh` lo prueba y da un informe. Guía y solución de problemas: [USB](USB.md).
+
 ## ¿Puedo usar Nexo con `nmcli`, `bluetoothctl` o `playerctl`?
 
 - **`playerctl` y todo lo que lee MPRIS** (el módulo `mpris` de Waybar, Quickshell, GNOME, KDE…): **sí, desde la v0.3.** `nexo setup-dbus` activa `nexo-dbus`, que publica la música del móvil como un reproductor más
@@ -118,11 +124,11 @@ Ninguno. El puente solo escucha en `127.0.0.1`; la app no se conecta a ningún s
 ## ¿Cómo actualizo la app?
 
 Instala el APK nuevo encima (mientras esté firmado con la misma clave no hace falta desinstalar). Después, en Termux: `nexo version --check` te dice si cliente y app son compatibles;
-si el cliente es antiguo, copia otra vez el comando de instalación desde la app o, si tienes la carpeta del repositorio (o el `.zip`) en el móvil, `nexo update` (actualiza `nexo`, `nexo-dbus`, `nexo-tools` y tus distros).
+si el cliente es antiguo, copia otra vez el comando de instalación desde la app o, si tienes la carpeta del repositorio (o el `.zip`) en el móvil, `nexo update` (actualiza `nexo`, `nexo-dbus`, `nexo-tools`, `nexo-usb` y tus distros).
 
 ## ¿Cómo desinstalo todo?
 
-- Cliente: `nexo unpair && rm "$(command -v nexo)"` (o `bash install.sh --uninstall`, que quita también `nexo-dbus`, `nexo-tools` y el arranque automático; lo que guarda `nexo-tools` —certificado y dispositivos emparejados— lo deja salvo que añadas `--purge`).
+- Cliente: `nexo unpair && rm "$(command -v nexo)"` (o `bash install.sh --uninstall`, que quita también `nexo-dbus`, `nexo-tools`, `nexo-usb` y el arranque automático; lo que guarda `nexo-tools` —certificado y dispositivos emparejados— lo deja salvo que añadas `--purge`).
 - Si activaste `nexo-dbus`: `nexo setup-dbus --uninstall` (lo para y quita el arranque automático; hazlo dentro de cada distro donde lo activaste).
 - Distros: `nexo setup-guests --uninstall` (antes de borrar el cliente).
 - App: desinstálala como cualquier otra.
