@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicLong
  * La sesión muere con la conexión de control que la abrió, o al desenchufar el dispositivo.
  *
  * Los chips (CDC-ACM, CP210x, FTDI, CH34x) están en UsbSerial.kt; no se han probado con hardware real (docs/USB.md).
- * Esta clase no toca el almacenamiento USB (pendrives, discos): eso es de la 0.4.2 y usa otros mecanismos.
+ * Esta clase no toca el almacenamiento USB (pendrives, discos): eso es de StorageHandler (0.4.2) y usa otros mecanismos.
  */
 class UsbHandler(context: Context) {
     private val ctx: Context = context.applicationContext

@@ -55,7 +55,7 @@ for need in python3 jq; do
 done
 
 echo "== Sintaxis"
-for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/bin/nexo-tools" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh" "$ROOT/tests/tools_tests.sh" "$ROOT/tests/usb_tests.sh" "$ROOT/tests/usb_hardware_check.sh"; do
+for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/bin/nexo-tools" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh" "$ROOT/tests/tools_tests.sh" "$ROOT/tests/usb_tests.sh" "$ROOT/tests/usb_storage_tests.sh" "$ROOT/tests/usb_hardware_check.sh" "$ROOT/tests/usb_storage_hardware_check.sh"; do
     if bash -n "$f" 2>"$T/err"; then ok "bash -n $(basename "$f")"; else bad "bash -n $(basename "$f")" "$(cat "$T/err")"; fi
 done
 for f in "$ROOT"/tests/*.py "$ROOT/termux/bin/nexo-dbus" "$ROOT/termux/bin/nexo-usb"; do
@@ -100,11 +100,13 @@ unset XDG_CONFIG_HOME XDG_CACHE_HOME PREFIX NEXO_TOKEN NEXO_CONFIG NEXO_TRANSPOR
 export NEXO_PORT=$PORT
 export NEXO_CACHE_TTL=0     # sin caché salvo en las pruebas que la quieren
 
-# Para iterar rápido: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh  (solo nexo-dbus), =tools (solo nexo-tools) o =usb (solo nexo-usb)
-if [ "${NEXO_TESTS_ONLY:-}" = dbus ] || [ "${NEXO_TESTS_ONLY:-}" = tools ] || [ "${NEXO_TESTS_ONLY:-}" = usb ]; then
-    . "$ROOT/tests/${NEXO_TESTS_ONLY}_tests.sh"
-    finish
-fi
+# Para iterar rápido: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh  (solo nexo-dbus), =tools (solo nexo-tools), =usb (todo nexo-usb:
+# serie y discos) o =storage (solo los discos USB de nexo-usb)
+case "${NEXO_TESTS_ONLY:-}" in
+    dbus|tools) . "$ROOT/tests/${NEXO_TESTS_ONLY}_tests.sh"; finish ;;
+    usb) . "$ROOT/tests/usb_tests.sh"; . "$ROOT/tests/usb_storage_tests.sh"; finish ;;
+    storage) . "$ROOT/tests/usb_storage_tests.sh"; finish ;;
+esac
 
 echo "== Enlace y token"
 run "$NEXO" wifi status;                 rc_is "sin token falla con código 11" 11
@@ -954,12 +956,14 @@ run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri2/bin" NEXO_NO_DEPS
 # nexo-dbus (necesita dbus-daemon, busctl y gdbus; si faltan, esas pruebas se omiten con un aviso)
 . "$ROOT/tests/dbus_tests.sh"
 
-# nexo-usb: monitor serie, puente (PTY, RFC2217, TCP), permisos y desenchufar/volver a enchufar, contra la app falsa
+# nexo-usb: monitor serie, puente (PTY, RFC2217, TCP), permisos y desenchufar/volver a enchufar, y los discos USB (mounts, ls, get,
+# put…), contra la app falsa
 # (NEXO_TESTS_USB=skip las omite: en la integración continua van en su propio trabajo, que no bloquea)
 if [ "${NEXO_TESTS_USB:-}" = skip ]; then
     echo "== nexo-usb (omitido: NEXO_TESTS_USB=skip)"
 else
     . "$ROOT/tests/usb_tests.sh"
+    . "$ROOT/tests/usb_storage_tests.sh"
 fi
 
 # nexo-tools: servidor HTTPS, emparejamiento, explorador, escritura, send/fetch (necesita openssl)

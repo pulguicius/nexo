@@ -2,6 +2,26 @@
 
 Solo lo que cambia para quien usa Nexo. Qué está probado y qué no, en el [README](README.md#estado-y-lo-que-falta).
 
+## 0.4.2
+
+- **Nuevo: almacenamiento USB (los discos en `nexo usb`)** — pendrives, discos duros y SSD externos **dentro de tu distro**. Android los monta y los enseña; Nexo entra solo en lo que tú autorizas en el selector de carpetas del sistema
+  (sin «acceso a todos los archivos» y sin root): `nexo usb mounts` (qué discos hay y si Nexo puede entrar), `access` (el selector; una vez por disco), `ls`, `stat`, `cat`, `get` y `put` (copiar en los dos sentidos: carpetas con `-r`,
+  `-f` para sustituir, `-n` para saltar, `--verify` con SHA‑256, `ORIGEN/` para copiar el contenido), `mkdir`, `rm`, `mv`, `df` y `eject`. Un archivo se escribe con un nombre provisional y se renombra al terminar, así que nunca queda uno a medias con su nombre;
+  los nombres que los discos no admiten se rechazan antes (o `put --fix-names` los cambia por `_`); FAT32 no admite archivos de 4 GiB (el mensaje lo dice). Guía: [`docs/USB-ALMACENAMIENTO.md`](docs/USB-ALMACENAMIENTO.md).
+  **Probado contra la app simulada (cada disco es una carpeta), con pruebas de las reglas en una JVM y con la compilación contra Android; todavía no con un móvil ni un disco de verdad.** `tests/usb_storage_hardware_check.sh` es la prueba para hacerlo y da un informe para pegar.
+- **Nuevo: `nexo watch storage`** (y `nexo watch usb`, que faltaba): avisa cuando se monta, se expulsa o se quita un disco, cambia su estado o Nexo gana o pierde el acceso (`--pretty`: «disco → MI DISCO (montado)»; `--event`: un evento con nombre por cambio).
+  Los temas `usb` y `storage` se piden por su nombre: sin tema, `nexo watch` sigue mirando `wifi bt audio media`.
+- **Cambia: `nexo usb ls`** ya no es otro nombre de `nexo usb list`: ahora lista una carpeta de un disco. Para ver los dispositivos USB, `nexo usb list`.
+- **Acceso directo opcional:** si el proceso donde ejecutas `nexo usb` ya ve la carpeta del disco (`/storage/UUID`: con root, con Shizuku/`rish`, o en un Android que lo permita), `--via direct`/`--via auto` trabaja sobre esa ruta sin pasar por la app, con las mismas reglas y mensajes.
+  En un Termux normal no se ve y se usa la app. Nexo no integra Shizuku por su cuenta (todavía).
+- **App Android:** `StorageLogic.kt`, `StorageSaf.kt`, `StorageVolumes.kt`, `StorageGrantActivity.kt` y `StorageHandler.kt`; un botón «Dar acceso a un disco USB» en la pantalla de Nexo y una notificación que abre el selector cuando un comando lo necesita.
+  **Sin permisos nuevos** en el manifiesto: solo el acceso por carpeta que concede el usuario y Android recuerda.
+- **Protocolo 1.4** (revisión 4): `storage.status`, `storage.access`, `storage.revoke`, `storage.list`, `storage.stat`, `storage.open`, `storage.read`, `storage.write`, `storage.sync`, `storage.close`, `storage.mkdir`, `storage.delete`, `storage.rename`, `storage.eject`,
+  el tema de eventos `storage` (también en la suscripción por omisión) y el campo `storage` en `hello`; los datos viajan en trozos de base64 por la conexión JSON. Códigos de error nuevos: `no_access`, `unavailable`, `bad_path`, `exists`, `not_dir`, `is_dir`, `not_empty`, `read_only`,
+  `no_space`, `too_big`, `io_error` y `limit`. Una app anterior y un cliente nuevo (o al revés) se entienden: `nexo usb` dice «actualiza la app». El estado de la red móvil y las notificaciones pasan a la 1.5 (0.4.3).
+- Pruebas y CI: 587 comprobaciones más (de 1625 a 2212) sobre los discos (el cliente por los dos caminos comparando resultados, copias de todos los tamaños, nombres raros, 4500 archivos paginados, discos de solo lectura, llenos o expulsados, desenchufar y caerse la app a media copia, `watch storage`, `nexo usb` desde el cliente `nexo`),
+  35 pruebas de JVM de las reglas de los discos (`StorageLogicTest.kt`), `tests/usb_storage_hardware_check.sh` y la comprobación de contrato ampliada (comandos, campos, errores y revisión del protocolo entre la app, la app simulada y la documentación).
+
 ## 0.4.1
 
 - **Nuevo: `nexo usb`** — Arduino, ESP32 y adaptadores USB↔serie (CH340, CP210x, FTDI) **dentro de tu distro**. Los conectas al móvil (cable OTG o hub) y salen como un puerto serie:
@@ -14,7 +34,7 @@ Solo lo que cambia para quien usa Nexo. Qué está probado y qué no, en el [REA
   `--uninstall` lo quita y `--purge` borra sus registros. `nexo doctor` lo muestra y dice si el móvil tiene USB host; `nexo usb list` funciona hasta sin Python.
 - **App Android:** `UsbSerial.kt`, `UsbHandler.kt` y `UsbAttachedActivity.kt` (el aviso «abrir Nexo cuando se conecte»); `android.hardware.usb.host` se declara como no obligatorio (el APK se instala igual en móviles sin OTG).
 - **Protocolo 1.3** (revisión 3): `usb.status`, `usb.permission`, `usb.open`, `usb.setup`, `usb.control`, `usb.close`, `usb.attach` (una segunda conexión que pasa a bytes crudos), el tema de eventos `usb` y el campo `usb` en `hello`.
-  Una app anterior y un cliente nuevo (o al revés) se entienden: `nexo usb` dice «instala el APK nuevo». El estado de la red móvil y las notificaciones pasan a la 1.4 (0.4.3).
+  Una app anterior y un cliente nuevo (o al revés) se entienden: `nexo usb` dice «instala el APK nuevo». El estado de la red móvil y las notificaciones pasan a una revisión posterior (0.4.3).
 - Pruebas y CI: 370 comprobaciones más (de 1255 a 1625) sobre `nexo usb` (monitor, puentes PTY/RFC 2217/TCP, reinicio del Arduino, desenchufar y volver a enchufar, instalador, `setup-guests`, `update`, `doctor`),
   37 pruebas de JVM de los controladores (`./gradlew testDebugUnitTest`), `tests/ref_baud.py` (las velocidades de FTDI y CH34x contra una transcripción independiente de libftdi y del kernel) y `tests/usb_hardware_check.sh`;
   trabajo `usb` en GitHub Actions (no bloquea).

@@ -10,7 +10,7 @@ PlatformIO, `minicom` o `screen`.
 > contra el SDK de Android. **No se ha probado todavía con un móvil ni con una placa de verdad.** Para eso está
 > [`tests/usb_hardware_check.sh`](../tests/usb_hardware_check.sh) (al final de esta página): lo ejecutas con tu placa conectada y me pasas el informe.
 >
-> Teclados, ratones, discos y hubs **salen en la lista**, pero esta versión solo usa los puertos serie. Los discos llegan en la 0.4.2.
+> Teclados, ratones y hubs **salen en la lista**, pero esta guía solo trata los puertos serie. Los **discos** (pendrives, discos duros, SSD) tienen su propia guía: [`USB-ALMACENAMIENTO.md`](USB-ALMACENAMIENTO.md).
 
 ## En un minuto
 
@@ -47,7 +47,7 @@ $ nexo usb bridge 2341:0043 --rfc2217 0 --detach
 
 - Un móvil con **USB host (OTG)** y un cable OTG (o un hub; si cuelgan varias cosas, mejor con alimentación propia: el móvil da poca corriente).
   `nexo doctor` dice si Android declara USB host.
-- La app Nexo 0.4.1 (protocolo 1.3) y el cliente 0.4.1 en Termux. Para usarlo **dentro de una distro**: `nexo setup-guests --with-usb`
+- La app Nexo 0.4.1 o posterior (protocolo 1.3 o más) y el cliente en Termux. Para usarlo **dentro de una distro**: `nexo setup-guests --with-usb`
   (copia `nexo-usb` y necesita `python3` en la distro; `nexo usb list` funciona hasta sin Python).
 - En algunos Xiaomi/HyperOS hay un interruptor «OTG» en Ajustes → Ajustes adicionales que se apaga solo si no hay nada conectado: si el móvil no ve el
   dispositivo, mira ahí primero.

@@ -182,6 +182,11 @@ class BridgeServer(
         "bt.paired", "bt.info", "bt.forget" -> 10000L
         "usb.permission" -> req.optLong("wait_ms", 0).coerceIn(0L, 30000L) + 6000L
         "usb.open" -> 15000L
+        "storage.access" -> req.optLong("wait_ms", 0).coerceIn(0L, 30000L) + 6000L
+        "storage.list" -> 30000L
+        "storage.eject" -> 15000L
+        "storage.open", "storage.read", "storage.write", "storage.sync", "storage.close", "storage.stat", "storage.mkdir",
+        "storage.delete", "storage.rename", "storage.revoke" -> 25000L
         else -> 8000L
     }
 
@@ -226,6 +231,10 @@ class BridgeServer(
             }
             try {
                 commands.usb.ownerGone(this)
+            } catch (_: Exception) {
+            }
+            try {
+                commands.storage.ownerGone(this)
             } catch (_: Exception) {
             }
             if (clients.remove(this) && !silent) refreshCount()
@@ -363,7 +372,8 @@ class BridgeServer(
             send(resp)
             val ms = SystemClock.elapsedRealtime() - t0
             if (resp.optBoolean("ok", false)) {
-                BridgeState.log("> " + describe(cmd, req) + if (ms >= 300) " ($ms ms)" else "")
+                // Los trozos de archivos de un disco USB no se anotan: serían miles de líneas (y los nombres de tus archivos no salen del móvil).
+                if (cmd != "storage.read" && cmd != "storage.write") BridgeState.log("> " + describe(cmd, req) + if (ms >= 300) " ($ms ms)" else "")
             } else {
                 BridgeState.log("x " + cmd + ": " + resp.optString("error", "error") + if (ms >= 300) " ($ms ms)" else "")
             }

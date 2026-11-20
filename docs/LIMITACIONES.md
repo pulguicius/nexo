@@ -123,8 +123,8 @@ Esa emulación es **fiel solo en lo que Android permite**: estado, listas, event
 
 ## USB serie (`nexo usb`)
 
-- **Solo puertos serie.** Android deja a una app abrir un dispositivo USB con `UsbManager` y el permiso del usuario; una distro de proot no puede abrir `/dev/bus/usb`, no puede montar nada y no tiene `CAP_SYS_ADMIN`. Teclados, ratones, discos y hubs **salen en `nexo usb list`** pero no se pasan a la distro
-  (los discos: 0.4.2; Android ya usa el teclado y el ratón para el propio móvil).
+- **Solo puertos serie (y discos, más abajo).** Android deja a una app abrir un dispositivo USB con `UsbManager` y el permiso del usuario; una distro de proot no puede abrir `/dev/bus/usb`, no puede montar nada y no tiene `CAP_SYS_ADMIN`. Teclados, ratones, discos y hubs **salen en `nexo usb list`** pero no se pasan a la distro
+  (los discos tienen su sección, más abajo; Android ya usa el teclado y el ratón para el propio móvil).
 - **El puerto es un PTY, no un dispositivo USB.** `lsusb`, `udevadm` y los programas que buscan `/dev/ttyACM*` o `/dev/ttyUSB*` solos (Arduino IDE, `arduino-cli board list`) no lo ven: hay que darles la ruta (`nexo usb status`), o `--link /dev/ttyUSB0` si tu distro deja escribir en `/dev`.
 - **DTR y RTS no existen en un PTY de Linux.** `nexo usb bridge` emula el reinicio del Arduino al abrir el puerto y suelta las líneas al cerrar; `esptool` y pyserial deben usar el servidor RFC 2217 (`rfc2217://…`), que sí las lleva. Algo que mire DTR/RTS por otra vía no los verá.
 - **Chips:** CDC‑ACM, CP210x, FTDI y CH34x. **PL2303 no** (sale en la lista con una nota). Placas de USB nativo que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro) reaparecen con otro VID:PID y el puente no las sigue.
@@ -133,6 +133,27 @@ Esa emulación es **fiel solo en lo que Android permite**: estado, listas, event
 - **Seguridad:** el RFC 2217 y el TCP crudo **no tienen contraseña** (escuchan en `127.0.0.1`): cualquier programa del móvil que los abra puede escribir en tu placa. Ciérralos con `nexo usb stop`. Android pide el permiso por dispositivo, y puede volver a pedirlo al desenchufar y enchufar si no marcaste «Usar siempre».
 - **Energía.** El móvil da poca corriente por OTG: con varias placas o discos, un hub con alimentación. Algunos Xiaomi tienen un interruptor «OTG» que se apaga solo.
 - **Sin probar con hardware real** (solo con la app simulada y con pruebas de JVM): ver [USB](USB.md#probarlo-en-tu-móvil) y `tests/usb_hardware_check.sh`.
+
+## Discos USB (`nexo usb mounts`, `ls`, `get`, `put`…)
+
+- **En la distro no hay `mount`, ni `/dev/sda`, ni `lsblk`.** Una distro de proot no es root y el kernel es el de Android. A un disco se llega con `nexo usb ls`, `get`, `put`, `cat`…; lo que espera una carpeta o un dispositivo
+  (gestores de archivos de Linux, `udisksctl`, `rsync` o `tar` directos sobre el disco) no lo ve. Una tubería (`nexo usb cat /copia.tar | tar xf -`) o copiar primero a la distro (`get`) lo resuelve; un explorador interactivo y la emulación de UDisks2 están en la [hoja de ruta](ROADMAP.md).
+- **Android decide qué se monta.** Nexo solo ve lo que Android montó: FAT32 y exFAT casi siempre; NTFS y ext4 dependen del móvil (muchos no los montan). De un disco con varias particiones salen las que Android monte. Android no dice qué sistema de archivos tiene un disco ni si es USB o tarjeta SD, así que `nexo usb mounts` tampoco lo dice.
+- **Hay que elegir el disco una vez en el selector de carpetas de Android** (`nexo usb access`). No se puede evitar: es la forma que ofrece Android a una app normal de escribir en un disco USB **sin** «acceso a todos los archivos». Si el selector de tu móvil no deja elegir el disco entero, se elige una carpeta y esa es la raíz para Nexo.
+- **FAT32 no admite archivos de 4 GiB o más** (`too_big`); exFAT, NTFS y ext4 no tienen ese límite. Las rutas, hasta 4096 caracteres; cada nombre, hasta 255 bytes.
+- **Nombres.** Los nombres **nuevos** no pueden llevar `" * : < > ? \` ni la barra vertical, ni acabar en punto o espacio: Android los cambiaría por `_` sin avisar y el archivo acabaría con otro nombre; Nexo lo rechaza (o `put --fix-names` los cambia por `_` y te lo cuenta).
+  FAT y exFAT no distinguen mayúsculas: `Foto.jpg` y `foto.jpg` son el mismo archivo. Lo que ya existe en el disco con esos nombres se puede leer, mover y borrar. Cambiar **solo las mayúsculas** de un nombre (`Foto.jpg` → `foto.jpg`) depende de Android y del disco: si se niega,
+  renómbralo en dos pasos (primero a otro nombre y luego al que quieres).
+- **Fechas, permisos y enlaces.** `put` **no puede poner la fecha de modificación** (el Storage Access Framework no tiene forma de hacerlo): el archivo queda con la hora de la copia; `get` sí la conserva. No hay permisos de Unix, propietarios ni enlaces simbólicos (`put` omite los enlaces y lo dice).
+- **Expulsar.** `nexo usb eject` le pide a Android que expulse el disco, pero una app normal puede no tener permiso y Android lo ignora **sin avisar**: Nexo mira el estado y, si no se expulsó, dice cómo hacerlo a mano (el botón «Expulsar» de Android) y sale con 1. En Android 8 y 9 (antes de la API 29) la app ni siquiera puede pedirlo: solo cierra los archivos y te lo explica.
+  Desenchufar con una copia en marcha deja un `.nexo-part-…` en el disco (se borra con `nexo usb rm`) y puede dejar el disco «sucio» (Android o un PC te pedirán repararlo).
+- **Mover.** `nexo usb mv` solo mueve **dentro del mismo disco**; entre discos, `get` y `put`. Mover a otra carpeta **y** cambiar el nombre a la vez lo hace Android en dos pasos: si en esa carpeta ya hay algo con el nombre de origen, responde `ya existe`.
+- **Borrar.** `rm -r` recorre el árbol y borra elemento a elemento (no hay un «borrar carpeta entera» en una sola orden: Android la borraría sin avisar). En una carpeta enorme tarda lo que tarden cientos de miles de órdenes.
+- **Velocidad.** Los datos pasan por el TCP local en base64, en trozos de 48 KiB (leer) y 32 KiB (escribir): es más lento que un disco directo. **No se ha medido en un móvil**; `tests/usb_storage_hardware_check.sh --speed 64` lo mide.
+- **Acceso directo.** `--via direct` solo funciona si el proceso ya ve la carpeta del disco (root, Shizuku/`rish`, o un Android que lo permita); se probó únicamente con carpetas normales. Nexo no integra Shizuku por su cuenta.
+- **Seguridad.** Quien conozca el token del puente puede hacer con los discos autorizados lo mismo que tú (es el único candado, como en el resto del protocolo). Quita el acceso (`nexo usb access --revoke`) de los discos que no uses.
+- **Teclados, ratones y hubs** siguen sin pasarse a la distro.
+- **Sin probar con hardware real** (solo con la app simulada, donde cada disco es una carpeta, y con pruebas de JVM): ver [USB-ALMACENAMIENTO](USB-ALMACENAMIENTO.md#probarlo-en-tu-móvil) y `tests/usb_storage_hardware_check.sh`.
 
 ## La app se congela (código 12)
 

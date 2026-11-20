@@ -65,6 +65,7 @@ class MainActivity : Activity() {
     private lateinit var tvLog: TextView
     private lateinit var tvAudio: TextView
     private lateinit var tvMedia: TextView
+    private lateinit var tvStorage: TextView
     private lateinit var etPort: EditText
     private var tokenShown = false
     private var probing = false
@@ -144,6 +145,22 @@ class MainActivity : Activity() {
                 ),
                 button("Dar acceso a notificaciones") { openListenerSettings() },
                 button("Probar sonido") { playTestTone() }
+            ),
+            lp(bottom = 12)
+        )
+
+        // Discos USB
+        tvStorage = text("", 13f, TEXT)
+        col.addView(
+            card(
+                "DISCOS USB",
+                tvStorage,
+                text(
+                    "Un pendrive o un disco duro conectado por OTG se ve desde Linux con «nexo usb mounts». Android pide que elijas " +
+                        "tú el disco una vez (selector de carpetas): Nexo no pide «acceso a todos los archivos».",
+                    12f, MUTED
+                ),
+                button("Dar acceso a un disco USB") { startActivity(StorageGrantActivity.intent(this, null)) }
             ),
             lp(bottom = 12)
         )
@@ -248,6 +265,7 @@ class MainActivity : Activity() {
         Thread {
             var audioLine: String
             var mediaLine: String
+            var storageLine: String
             try {
                 val a = audioProbe.status()
                 audioLine = if (a.optBoolean("available")) {
@@ -275,10 +293,30 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 mediaLine = "Música: " + e.javaClass.simpleName
             }
+            try {
+                val vols = StorageVolumes.list(this).filter { it.removable }
+                storageLine = if (vols.isEmpty()) {
+                    "No hay ningún disco USB montado"
+                } else {
+                    vols.joinToString("\n") { v ->
+                        val g = StorageVolumes.grantFor(this, v.uuid)
+                        val mark = if (!v.mounted) "✘ " else if (g != null) "✔ " else "• "
+                        mark + v.label + " · " + when {
+                            !v.mounted -> "no montado (" + v.state + ")"
+                            g == null -> "Nexo aún no tiene acceso"
+                            g.scope.isEmpty() -> "con acceso"
+                            else -> "con acceso a «" + g.scope + "»"
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                storageLine = "Discos USB: " + e.javaClass.simpleName
+            }
             ui.post {
                 probing = false
                 tvAudio.text = audioLine
                 tvMedia.text = mediaLine
+                tvStorage.text = storageLine
             }
         }.start()
     }

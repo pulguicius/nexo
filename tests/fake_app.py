@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """App Nexo FALSA, para probar el cliente (y nexo-dbus) sin un móvil, y en CI.
 
-Imita el protocolo de docs/PROTOCOLO.md (versión 1, revisión 3): JSON por línea sobre TCP en 127.0.0.1,
+Imita el protocolo de docs/PROTOCOLO.md (versión 1, revisión 4): JSON por línea sobre TCP en 127.0.0.1,
 con token, eventos en vivo y el comando `bootstrap` que entrega el instalador (igual que Bootstrap.kt).
 Es la «especificación ejecutable» del protocolo: si la app real y este archivo difieren, uno de los dos tiene un fallo.
 
@@ -16,14 +16,19 @@ Uso:  fake_app.py --token HEX --termux-dir ../termux --portfile /tmp/p [--record
       fake_app.py --reqlog FILE       anota cada comando recibido (un JSON por línea; sin token)
       fake_app.py --drop-after-hello N  las N primeras conexiones contestan el hello y se cortan al recibir el primer comando
       fake_app.py --leak-token        mete el token en el registro (para probar que el cliente lo oculta)
+      fake_app.py --storage-dir DIR   carpeta donde viven los discos USB simulados (uno por subcarpeta «UUID»); por omisión, una temporal
+      fake_app.py --minor2|--minor3|--minor4|--minor5   fuerza una revisión del protocolo (por omisión, la de la app real: la 1.4)
 """
 import argparse
 import base64
 import collections
 import json
+import mimetypes
 import os
 import socketserver
+import stat
 import sys
+import tempfile
 import threading
 import time
 
@@ -71,19 +76,22 @@ MEDIA = {"idx": 0, "state": "playing", "pos0": 30000, "t0": time.monotonic(), "s
 TINY_JPEG = ("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
              "wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=")
 
-V14_COMMANDS = {"net.status", "notif.status", "notif.list", "notif.dismiss"}     # protocolo 1.4 (red del móvil y notificaciones: la app real los traerá en la 0.4.3)
-V14_OPENS = {"nexo_app"}                                                         # paneles (`opens`) que solo existen desde el 1.4
+V14_COMMANDS = {"storage.status", "storage.access", "storage.revoke", "storage.list", "storage.stat", "storage.open", "storage.read",
+                "storage.write", "storage.sync", "storage.close", "storage.mkdir", "storage.delete", "storage.rename", "storage.eject"}   # protocolo 1.4 (almacenamiento USB: 0.4.2)
+V15_COMMANDS = {"net.status", "notif.status", "notif.list", "notif.dismiss"}     # protocolo 1.5 (red del móvil y notificaciones: la app real los traerá en la 0.4.3)
+V15_OPENS = {"nexo_app"}                                                         # paneles (`opens`) que solo existen desde el 1.5
 
 
-APP_MINOR = 3          # revisión del protocolo que habla la app REAL (Protocol.MINOR en Kotlin): 1.3 = USB serie (0.4.1); súbela a 4 cuando llegue net/notif a la app
+APP_MINOR = 4          # revisión del protocolo que habla la app REAL (Protocol.MINOR en Kotlin): 1.3 = USB serie (0.4.1), 1.4 = almacenamiento (0.4.2); súbela a 5 cuando llegue net/notif a la app
 
 
 def level():
     """Revisión del protocolo que habla esta app falsa. Por defecto, la de la app real (APP_MINOR).
-    --old = 0.1.x · --minor2 = 1.2 (0.4.0-beta2: sin usb.*) · --minor3 = 1.3 (con USB) · --minor4 = 1.4 (con USB, net.status y notif.*)."""
+    --old = 0.1.x · --minor2 = 1.2 (0.4.0-beta2: sin usb.*) · --minor3 = 1.3 (con USB serie) · --minor4 = 1.4 (con almacenamiento USB) ·
+    --minor5 = 1.5 (con net.status y notif.*)."""
     if getattr(ARGS, "old", False):
         return 1
-    for n in (2, 3, 4):
+    for n in (2, 3, 4, 5):
         if getattr(ARGS, "minor%d" % n, False):
             return n
     return APP_MINOR
@@ -95,8 +103,13 @@ def v13():
 
 
 def v14():
-    """¿Habla el protocolo 1.4 (net.status, notif.*, temas net y notif)?"""
+    """¿Habla el protocolo 1.4 (storage.*, tema storage)?"""
     return level() >= 4
+
+
+def v15():
+    """¿Habla el protocolo 1.5 (net.status, notif.*, temas net y notif)?"""
+    return level() >= 5
 
 
 NEW_COMMANDS = {"wifi.saved", "wifi.forget", "wifi.reconnect", "bt.forget", "bt.rename", "bt.info", "audio.status", "audio.volume",
@@ -195,7 +208,7 @@ def notif_status():
 
 def status_for(topic):
     return {"wifi": wifi_status, "bt": bt_status, "audio": audio_status, "media": media_status,
-            "net": net_status, "usb": usb_status}[topic]()
+            "net": net_status, "usb": usb_status, "storage": storage_status}[topic]()
 
 
 class Err(Exception):
@@ -289,8 +302,18 @@ def audio_volume(req):
 
 def dispatch(cmd, req, owner=None):
     old = ARGS.old
-    if (old and cmd not in OLD_COMMANDS) or (cmd in V13_COMMANDS and not v13()) or (cmd in V14_COMMANDS and not v14()):
+    if (old and cmd not in OLD_COMMANDS) or (cmd in V13_COMMANDS and not v13()) or (cmd in V14_COMMANDS and not v14()) \
+            or (cmd in V15_COMMANDS and not v15()):
         raise Err("unknown_command", "Comando desconocido: " + cmd)
+
+    if cmd.startswith("storage."):
+        return {"storage.status": lambda: storage_status(), "storage.access": lambda: storage_access(req),
+                "storage.revoke": lambda: storage_revoke(req), "storage.list": lambda: storage_list(req),
+                "storage.stat": lambda: storage_stat(req), "storage.open": lambda: storage_open(req, owner),
+                "storage.read": lambda: storage_read(req), "storage.write": lambda: storage_write(req),
+                "storage.sync": lambda: storage_sync(req), "storage.close": lambda: storage_close(req),
+                "storage.mkdir": lambda: storage_mkdir(req), "storage.delete": lambda: storage_delete(req),
+                "storage.rename": lambda: storage_rename(req), "storage.eject": lambda: storage_eject(req)}[cmd]()
 
     if cmd == "usb.status":
         return usb_status()
@@ -816,6 +839,840 @@ def usb_pump(h, s):
         broadcast("usb")
 
 
+# ---------------------------------------------------------------- almacenamiento USB (protocolo 1.4)
+#
+# Discos simulados: cada «disco» es una carpeta REAL (--storage-dir/UUID) y esta app falsa hace de Android. Aplica las mismas reglas, en el
+# mismo orden y con los mismos códigos de error que StorageOps (StorageLogic.kt), así que lo que una prueba ve aquí es lo que verá con la
+# app real, salvo lo que solo hace Android de verdad (el selector de carpetas, vold, la expulsión…). Las pruebas leen y escriben esas
+# carpetas por su cuenta para comprobar, sin pasar por el protocolo, lo que hizo el cliente.
+# Los enlaces simbólicos no existen para este «Android» (FAT y exFAT no los tienen): no se siguen ni se listan.
+
+STORAGE_READ_MAX = 49152                 # = StorageLimits.READ_MAX (lo máximo que devuelve un storage.read, en bytes crudos)
+STORAGE_WRITE_MAX = 32768                # = StorageLimits.WRITE_MAX (lo máximo que admite un storage.write)
+STORAGE_LIST_DEFAULT = 500
+STORAGE_LIST_MAX = 2000
+STORAGE_MAX_HANDLES = 64
+STORAGE_MAX_HANDLES_PER_OWNER = 16
+STORAGE_MAX_PATH = 4096
+STORAGE_MAX_NAME_BYTES = 255
+
+ST = {"dir": None, "vols": [], "grants": {}, "handles": {}, "next_handle": 1, "seq": 0,
+      "auto": "grant", "delay_ms": 0, "auto_scope": ""}
+ST_LOCK = threading.RLock()
+ST_MOUNTED = ("mounted", "mounted_ro")
+ST_STATES = ("mounted", "mounted_ro", "unmounted", "checking", "ejecting", "removed", "bad_removal", "unmountable", "nofs")
+
+
+def st_str(req, key):
+    v = req.get(key)
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def st_int(req, key, default):
+    v = req.get(key)
+    if isinstance(v, bool) or v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(v.strip())
+        except ValueError:
+            return default
+    return default
+
+
+def st_bool(req, key, default):
+    v = req.get(key)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    return default
+
+
+def st_check_name(name):
+    if not name:
+        raise Err("bad_path", "Un nombre está vacío")
+    if name in (".", ".."):
+        raise Err("bad_path", "«%s» no se permite en una ruta" % name)
+    for ch in name:
+        if ch < " " or ch == "\x7f":
+            raise Err("bad_path", "Un nombre lleva un carácter de control")
+        if ch == "/":
+            raise Err("bad_path", "Un nombre no puede llevar «/»")
+    if len(name.encode("utf-8", "surrogatepass")) > STORAGE_MAX_NAME_BYTES:
+        raise Err("bad_path", "Un nombre pasa de %d bytes" % STORAGE_MAX_NAME_BYTES)
+
+
+def st_check_new_name(name):
+    """El nombre de algo NUEVO: Android cambiaría estos caracteres por «_» sin avisar, así que se rechazan antes (StoragePath.checkNewName)."""
+    for ch in name:
+        if ch in '"*:<>?\\|':
+            raise Err("bad_path", "Los discos USB no admiten el carácter «%s» en un nombre nuevo: «%s» (usa otro nombre)" % (ch, name))
+    if name.endswith(".") or name.endswith(" "):
+        raise Err("bad_path", "Un nombre nuevo no puede acabar en punto ni en espacio: «%s»" % name)
+
+
+def st_parse(path):
+    """«/Música/rock/» → ["Música", "rock"]. Rechaza «..», caracteres de control y nombres larguísimos (StoragePath.parse)."""
+    if path is None:
+        raise Err("bad_request", "Falta la ruta (path)")
+    if len(path) > STORAGE_MAX_PATH:
+        raise Err("bad_path", "La ruta es demasiado larga")
+    out = []
+    for seg in path.split("/"):
+        if seg == "" or seg == ".":
+            continue
+        st_check_name(seg)
+        out.append(seg)
+    return out
+
+
+def st_join(parts):
+    return "/" + "/".join(parts)
+
+
+def st_entry_json(e):
+    o = {"name": e["name"], "type": "dir" if e["dir"] else "file", "size": e["size"], "mtime_ms": e["mtime_ms"]}
+    if e["mime"] is not None:
+        o["mime"] = e["mime"]
+    o["writable"] = e["writable"]
+    return o
+
+
+def st_dir(v):
+    return os.path.join(ST["dir"], v["uuid"])
+
+
+def st_used(v):
+    """Bytes que ocupan los archivos del disco: de ahí salen el espacio libre y el no_space."""
+    total = 0
+    stack = [st_dir(v)]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total
+
+
+def st_vol_view(v):
+    key = v["uuid"].lower()
+    grant = ST["grants"].get(key)
+    total = v["total"]
+    return {"id": v["uuid"], "uuid": v["uuid"], "label": v["label"], "state": v["state"], "mounted": v["state"] in ST_MOUNTED,
+            "readonly": v["state"] == "mounted_ro", "removable": v["removable"], "primary": v["primary"],
+            "path": st_dir(v) if v["direct"] else "/storage/" + v["uuid"],
+            "granted": grant is not None, "scope": grant,
+            "open_files": sum(1 for h in ST["handles"].values() if h["uuid"].lower() == key),
+            "total": total, "free": None if total is None else max(0, total - st_used(v))}
+
+
+def storage_status():
+    with ST_LOCK:
+        vols = [st_vol_view(v) for v in ST["vols"]]
+        nfiles = len(ST["handles"])
+    with USB_LOCK:
+        mass = sum(1 for d in USB["devices"] if d["kind"] == "storage")
+    return {"available": True, "volumes": vols, "mass_storage_devices": mass, "open_files": nfiles}
+
+
+def st_pick(req):
+    """Qué volumen quiere decir el cliente: su UUID (sin distinguir mayúsculas) o, si es único, su etiqueta (StorageSelect.pick)."""
+    key = (st_str(req, "volume") or "").strip()
+    if not key:
+        raise Err("bad_request", "Falta el volumen (volume)")
+    with ST_LOCK:
+        vols = list(ST["vols"])
+    for v in vols:
+        if v["uuid"].lower() == key.lower():
+            return v
+    by = [v for v in vols if v["label"].lower() == key.lower()]
+    if len(by) == 1:
+        return by[0]
+    if len(by) > 1:
+        raise Err("bad_request", "Hay varios discos que se llaman «%s»: usa su UUID" % key)
+    raise Err("not_found", "No hay ningún disco «%s»" % key)
+
+
+def st_mounted(req):
+    v = st_pick(req)
+    if v["state"] not in ST_MOUNTED:
+        raise Err("unavailable", "El disco «%s» no está montado (estado: %s)" % (v["label"], v["state"]),
+                  {"volume": v["uuid"], "state": v["state"]})
+    return v
+
+
+def st_scope_root(v, scope):
+    return os.path.join(st_dir(v), *[s for s in scope.split("/") if s])
+
+
+def st_ops(v):
+    with ST_LOCK:
+        scope = ST["grants"].get(v["uuid"].lower())
+    if scope is None:
+        raise Err("no_access", "Nexo todavía no tiene acceso al disco «%s»: pídelo con storage.access (nexo usb access) y elige el disco en el móvil" % v["label"],
+                  {"volume": v["uuid"]})
+    root = st_scope_root(v, scope)
+    if not os.path.isdir(root):
+        raise Err("no_access", "Android ya no deja a Nexo entrar en ese disco: vuelve a darle acceso (nexo usb access)")
+    return StOps(StFs(v, root))
+
+
+class StFile(object):
+    """Un archivo abierto (DocFile): lecturas y escrituras en una posición dada, sobre un descriptor real."""
+
+    def __init__(self, fd, fs):
+        self.fd, self.fs, self.closed = fd, fs, False
+
+    def size(self):
+        self.fs.fail()
+        return os.fstat(self.fd).st_size
+
+    def read(self, pos, n):
+        self.fs.fail()
+        return os.pread(self.fd, n, pos)
+
+    def write(self, pos, data):
+        self.fs.fail()
+        v = self.fs.v
+        end = pos + len(data)
+        if v["maxfile"] is not None and end > v["maxfile"]:
+            raise Err("too_big", "El sistema de archivos del disco no admite un archivo tan grande (FAT32: máximo 4 GB)")
+        grow = end - os.fstat(self.fd).st_size
+        if grow > 0 and v["total"] is not None and grow > v["total"] - st_used(v):
+            raise Err("no_space", "El disco está lleno")
+        done = 0
+        while done < len(data):
+            n = os.pwrite(self.fd, data[done:], pos + done)
+            if n <= 0:
+                raise Err("io_error", "El disco no aceptó más datos")
+            done += n
+        return done
+
+    def truncate(self, n):
+        self.fs.fail()
+        os.ftruncate(self.fd, n)
+
+    def sync(self):
+        self.fs.fail()
+        os.fsync(self.fd)
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            os.close(self.fd)
+
+
+class StFs(object):
+    """El disco visto a través de Android (DocFs): una carpeta real, con la raíz en la carpeta que el usuario autorizó."""
+
+    def __init__(self, v, root):
+        self.v, self.root = v, root
+        self.read_only = v["state"] == "mounted_ro"
+
+    def fail(self):
+        if self.v["fail"]:
+            raise Err("io_error", "El disco da errores de lectura/escritura (simulado)")
+
+    def _p(self, parts):
+        p = self.root
+        for seg in parts:
+            p = os.path.join(p, seg)
+            try:
+                if stat.S_ISLNK(os.lstat(p).st_mode):
+                    return None
+            except OSError:
+                return None
+        return p
+
+    def _entry(self, p, name):
+        try:
+            s = os.lstat(p)
+        except OSError:
+            return None
+        if stat.S_ISDIR(s.st_mode):
+            isdir = True
+        elif stat.S_ISREG(s.st_mode):
+            isdir = False
+        else:
+            return None
+        writable = (not self.read_only) and (isdir or s.st_mode & 0o222 != 0)
+        mime = None if isdir else (mimetypes.guess_type(name)[0] or "application/octet-stream")
+        return {"name": name, "dir": isdir, "size": 0 if isdir else s.st_size, "mtime_ms": int(s.st_mtime * 1000), "mime": mime,
+                "writable": writable}
+
+    def stat(self, parts):
+        self.fail()
+        p = self._p(parts)
+        return None if p is None else self._entry(p, parts[-1])
+
+    def list(self, parts):
+        self.fail()
+        p = self._p(parts)
+        if p is None or not os.path.isdir(p):
+            return None
+        out = []
+        for name in os.listdir(p):
+            e = self._entry(os.path.join(p, name), name)
+            if e is not None:
+                out.append(e)
+        return out
+
+    def _create(self, parent, name, mk):
+        self.fail()
+        pp = self._p(parent)
+        if pp is None:
+            raise Err("io_error", "Android no dejó crear «%s»" % name)
+        p = os.path.join(pp, name)
+        try:
+            mk(p)
+        except OSError as e:
+            raise Err("io_error", "Android no dejó crear «%s»: %s" % (name, e.strerror or e))
+        return self._entry(p, name)
+
+    def create_file(self, parent, name):
+        def mk(p):
+            os.close(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+        return self._create(parent, name, mk)
+
+    def create_dir(self, parent, name):
+        return self._create(parent, name, lambda p: os.mkdir(p, 0o755))
+
+    def delete(self, parts):
+        self.fail()
+        p = self._p(parts)
+        if p is None:
+            return False
+        try:
+            if os.path.isdir(p):
+                os.rmdir(p)
+            else:
+                os.unlink(p)
+            return True
+        except OSError:
+            return False
+
+    def _move(self, parts, new_parent, name):
+        self.fail()
+        src, dp = self._p(parts), self._p(new_parent)
+        if src is None or dp is None:
+            raise Err("io_error", "Android no dejó mover «%s»" % parts[-1])
+        dst = os.path.join(dp, name)
+        try:
+            os.rename(src, dst)
+        except OSError as e:
+            raise Err("io_error", "Android no dejó mover «%s»: %s" % (parts[-1], e.strerror or e))
+        return self._entry(dst, name)
+
+    def rename(self, parts, new_name):
+        return self._move(parts, parts[:-1], new_name)
+
+    def move(self, parts, new_parent):
+        return self._move(parts, new_parent, parts[-1])
+
+    def open(self, parts, writable):
+        self.fail()
+        p = self._p(parts)
+        if p is None:
+            raise Err("not_found", "No existe: " + st_join(parts))
+        try:
+            fd = os.open(p, os.O_RDWR if writable else os.O_RDONLY)
+        except FileNotFoundError:
+            raise Err("not_found", "No existe: " + st_join(parts))
+        except OSError as e:
+            raise Err("io_error", "Android no dejó abrir el archivo: %s" % (e.strerror or e))
+        return StFile(fd, self)
+
+
+class StOps(object):
+    """StorageOps (StorageLogic.kt) línea por línea: mismas comprobaciones, en el mismo orden, con los mismos códigos."""
+
+    def __init__(self, fs):
+        self.fs = fs
+
+    @staticmethod
+    def _nf(parts):
+        return Err("not_found", "No existe: " + st_join(parts))
+
+    def _need_writable(self):
+        if self.fs.read_only:
+            raise Err("read_only", "El disco está en solo lectura")
+
+    def _check_parent_dir(self, parent):
+        if not parent:
+            return
+        e = self.fs.stat(parent)
+        if e is None:
+            raise self._nf(parent)
+        if not e["dir"]:
+            raise Err("not_dir", "No es una carpeta: " + st_join(parent))
+
+    def stat(self, parts):
+        if not parts:
+            return {"name": "", "dir": True, "size": 0, "mtime_ms": 0, "mime": None, "writable": not self.fs.read_only}
+        e = self.fs.stat(parts)
+        if e is None:
+            raise self._nf(parts)
+        return e
+
+    def list(self, parts, offset, limit):
+        if parts:
+            e = self.fs.stat(parts)
+            if e is None:
+                raise self._nf(parts)
+            if not e["dir"]:
+                raise Err("not_dir", "No es una carpeta: " + st_join(parts))
+        kids = self.fs.list(parts)
+        if kids is None:
+            raise self._nf(parts)
+        kids.sort(key=lambda e: (not e["dir"], e["name"].lower(), e["name"]))
+        off = max(offset, 0)
+        lim = min(max(limit, 1), STORAGE_LIST_MAX)
+        return kids[off:off + lim], len(kids), off
+
+    def open(self, parts, write, create, truncate, exclusive):
+        if not parts:
+            raise Err("is_dir", "La raíz del disco es una carpeta")
+        if write:
+            self._need_writable()
+        e = self.fs.stat(parts)
+        if e is not None and e["dir"]:
+            raise Err("is_dir", "Es una carpeta: " + st_join(parts))
+        if e is not None and write and exclusive:
+            raise Err("exists", "Ya existe: " + st_join(parts))
+        if e is None:
+            if not write or not create:
+                raise self._nf(parts)
+            parent = parts[:-1]
+            self._check_parent_dir(parent)
+            st_check_new_name(parts[-1])
+            self.fs.create_file(parent, parts[-1])
+        elif write and not e["writable"]:
+            raise Err("read_only", "No se puede escribir en: " + st_join(parts))
+        f = self.fs.open(parts, write)
+        if write and truncate:
+            try:
+                f.truncate(0)
+            except BaseException:
+                f.close()
+                raise
+        return f
+
+    def mkdir(self, parts, parents):
+        self._need_writable()
+        if not parts:
+            if parents:
+                return
+            raise Err("exists", "La raíz del disco ya existe")
+        e = self.fs.stat(parts)
+        if e is not None:
+            if e["dir"] and parents:
+                return
+            raise Err("exists", "Ya existe: " + st_join(parts))
+        parent = parts[:-1]
+        if parent:
+            pe = self.fs.stat(parent)
+            if pe is None:
+                if not parents:
+                    raise self._nf(parent)
+                first = len(parts) - 1                 # antes de crear nada, ningún nivel nuevo puede llevar un nombre que el disco no admita
+                while first > 0 and self.fs.stat(parts[:first]) is None:
+                    first -= 1
+                for seg in parts[first:]:
+                    st_check_new_name(seg)
+                self.mkdir(parent, True)
+            elif not pe["dir"]:
+                raise Err("not_dir", "No es una carpeta: " + st_join(parent))
+        st_check_new_name(parts[-1])
+        self.fs.create_dir(parent, parts[-1])
+
+    def delete(self, parts):
+        self._need_writable()
+        if not parts:
+            raise Err("bad_path", "La raíz del disco no se borra")
+        e = self.fs.stat(parts)
+        if e is None:
+            raise self._nf(parts)
+        if e["dir"]:
+            kids = self.fs.list(parts)
+            if kids is None:
+                raise Err("io_error", "No se pudo leer la carpeta: " + st_join(parts))
+            if kids:
+                raise Err("not_empty", "La carpeta no está vacía: " + st_join(parts))
+        if not self.fs.delete(parts):
+            raise Err("io_error", "Android no pudo borrar: " + st_join(parts))
+
+    def rename(self, src_parts, dst_parts, overwrite):
+        self._need_writable()
+        if not src_parts or not dst_parts:
+            raise Err("bad_path", "La raíz del disco no se mueve ni se sustituye")
+        if src_parts == dst_parts:
+            return
+        if len(dst_parts) > len(src_parts) and dst_parts[:len(src_parts)] == src_parts:
+            raise Err("bad_path", "No se puede mover una carpeta dentro de sí misma")
+        st_check_new_name(dst_parts[-1])
+        src = self.fs.stat(src_parts)
+        if src is None:
+            raise self._nf(src_parts)
+        dst = self.fs.stat(dst_parts)
+        if dst is not None:
+            same = src_parts[:-1] == dst_parts[:-1] and src_parts[-1].lower() == dst_parts[-1].lower()
+            if not same:
+                if not overwrite:
+                    raise Err("exists", "Ya existe: " + st_join(dst_parts))
+                if dst["dir"] and not src["dir"]:
+                    raise Err("is_dir", "El destino es una carpeta: " + st_join(dst_parts))
+                if not dst["dir"] and src["dir"]:
+                    raise Err("not_dir", "El destino es un archivo: " + st_join(dst_parts))
+                self.delete(dst_parts)
+        to_parent = dst_parts[:-1]
+        self._check_parent_dir(to_parent)
+        if src_parts[:-1] == to_parent:
+            self.fs.rename(src_parts, dst_parts[-1])
+        else:
+            self._move_and_rename(src_parts, to_parent, dst_parts[-1])
+
+    def _move_and_rename(self, src_parts, to_parent, name):
+        """Mover a otra carpeta Y cambiar el nombre, en el orden que no choca con nada (StorageOps.moveAndRename)."""
+        old, from_parent = src_parts[-1], src_parts[:-1]
+        if old == name:
+            self.fs.move(src_parts, to_parent)
+        elif self.fs.stat(from_parent + [name]) is None:
+            self.fs.rename(src_parts, name)
+            try:
+                self.fs.move(from_parent + [name], to_parent)
+            except BaseException:
+                try:
+                    self.fs.rename(from_parent + [name], old)
+                except Exception:
+                    pass
+                raise
+        elif self.fs.stat(to_parent + [old]) is None:
+            m = self.fs.move(src_parts, to_parent)
+            try:
+                self.fs.rename(to_parent + [m["name"]], name)
+            except BaseException:
+                try:
+                    self.fs.move(to_parent + [m["name"]], from_parent)
+                except Exception:
+                    pass
+                raise
+        else:
+            raise Err("exists", "Hay otro «%s» en la carpeta de origen y otro «%s» en la de destino: renombra primero uno de los dos" % (name, old))
+
+
+# --- la tabla de archivos abiertos (HandleTable): con tope total y por conexión
+
+def st_handle_add(v, path, f, writable, owner):
+    with ST_LOCK:
+        full = len(ST["handles"]) >= STORAGE_MAX_HANDLES or (
+            owner is not None and sum(1 for h in ST["handles"].values() if h["owner"] is owner) >= STORAGE_MAX_HANDLES_PER_OWNER)
+        if not full:
+            h = {"id": "h%d" % ST["next_handle"], "uuid": v["uuid"], "path": path, "file": f, "writable": writable, "owner": owner,
+                 "rx": 0, "tx": 0}
+            ST["next_handle"] += 1
+            ST["handles"][h["id"]] = h
+            return h
+    try:
+        f.close()
+    except Exception:
+        pass
+    raise Err("limit", "Demasiados archivos abiertos a la vez")
+
+
+def st_handle_get(hid):
+    with ST_LOCK:
+        h = ST["handles"].get(hid)
+    if h is None:
+        raise Err("not_found", "Ese archivo ya no está abierto")
+    return h
+
+
+def st_handle_finish(h):
+    try:
+        if h["writable"]:
+            h["file"].sync()
+    finally:
+        h["file"].close()
+
+
+def st_handles_close_where(pred):
+    with ST_LOCK:
+        gone = [h for h in ST["handles"].values() if pred(h)]
+        for h in gone:
+            del ST["handles"][h["id"]]
+    for h in gone:
+        try:
+            st_handle_finish(h)
+        except Exception:
+            pass
+    return len(gone)
+
+
+def storage_owner_gone(owner):
+    st_handles_close_where(lambda h: h["owner"] is owner)
+
+
+# --- los comandos
+
+def storage_access(req):
+    v = st_mounted(req)
+    key = v["uuid"].lower()
+    with ST_LOCK:
+        if key in ST["grants"]:
+            return {"volume": v["uuid"], "granted": True, "requested": False, "denied": False}
+    wait = max(0, min(st_int(req, "wait_ms", 0), 30000)) / 1000.0
+    mode, delay, scope = ST["auto"], ST["delay_ms"] / 1000.0, ST["auto_scope"]
+
+    def grant():
+        os.makedirs(st_scope_root(v, scope), exist_ok=True)
+        with ST_LOCK:
+            ST["grants"][key] = scope
+        broadcast("storage")
+    if mode == "ignore":
+        time.sleep(wait)
+        return {"volume": v["uuid"], "granted": False, "requested": True, "denied": False}
+    if wait >= delay:
+        time.sleep(delay)
+        if mode == "grant":
+            grant()
+            return {"volume": v["uuid"], "granted": True, "requested": True, "denied": False}
+        return {"volume": v["uuid"], "granted": False, "requested": True, "denied": True}
+    if mode == "grant":
+        threading.Timer(delay, grant).start()
+    return {"volume": v["uuid"], "granted": False, "requested": True, "denied": False}
+
+
+def storage_revoke(req):
+    v = st_pick(req)
+    key = v["uuid"].lower()
+    st_handles_close_where(lambda h: h["uuid"].lower() == key)
+    with ST_LOCK:
+        n = 1 if ST["grants"].pop(key, None) is not None else 0
+    broadcast("storage")
+    return {"volume": v["uuid"], "released": n}
+
+
+def storage_list(req):
+    v = st_mounted(req)
+    parts = st_parse(st_str(req, "path") if st_str(req, "path") is not None else "/")
+    entries, total, off = st_ops(v).list(parts, st_int(req, "offset", 0), st_int(req, "limit", STORAGE_LIST_DEFAULT))
+    return {"path": st_join(parts), "entries": [st_entry_json(e) for e in entries], "total": total, "offset": off}
+
+
+def storage_stat(req):
+    v = st_mounted(req)
+    parts = st_parse(st_str(req, "path") if st_str(req, "path") is not None else "/")
+    o = st_entry_json(st_ops(v).stat(parts))
+    o["path"] = st_join(parts)
+    return o
+
+
+def storage_open(req, owner):
+    v = st_mounted(req)
+    parts = st_parse(st_str(req, "path"))
+    mode = st_str(req, "mode") or "r"
+    if mode not in ("r", "w", "a", "rw"):
+        raise Err("bad_request", "mode debe ser r, w, a o rw")
+    write = mode != "r"
+    def_create, def_truncate = mode in ("w", "a"), mode == "w"
+    f = st_ops(v).open(parts, write, st_bool(req, "create", def_create), st_bool(req, "truncate", def_truncate),
+                       st_bool(req, "exclusive", False))
+    h = st_handle_add(v, st_join(parts), f, write, owner)
+    try:
+        size = f.size()
+    except Err:
+        st_handles_close_where(lambda x: x is h)
+        raise
+    return {"handle": h["id"], "size": size, "writable": write}
+
+
+def storage_read(req):
+    h = st_handle_get(st_str(req, "handle"))
+    off = st_int(req, "offset", -1)
+    if off < 0:
+        raise Err("bad_request", "Falta offset (0 o más)")
+    want = min(max(st_int(req, "len", STORAGE_READ_MAX), 1), STORAGE_READ_MAX)
+    data = h["file"].read(off, want)
+    h["rx"] += len(data)
+    eof = len(data) < want or off + len(data) >= h["file"].size()
+    return {"n": len(data), "eof": eof, "data": base64.b64encode(data).decode("ascii")}
+
+
+def storage_write(req):
+    h = st_handle_get(st_str(req, "handle"))
+    if not h["writable"]:
+        raise Err("read_only", "Ese archivo está abierto solo para leer")
+    off = st_int(req, "offset", -1)
+    if off < 0:
+        raise Err("bad_request", "Falta offset (0 o más)")
+    try:
+        data = base64.b64decode((st_str(req, "data") or "").encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        raise Err("bad_request", "data no es base64 válido")
+    if len(data) > STORAGE_WRITE_MAX:
+        raise Err("bad_request", "Cada storage.write admite como mucho %d bytes" % STORAGE_WRITE_MAX)
+    n = h["file"].write(off, data)
+    h["tx"] += n
+    return {"n": n}
+
+
+def storage_sync(req):
+    hid = st_str(req, "handle")
+    if hid is not None:
+        h = st_handle_get(hid)
+        if h["writable"]:
+            h["file"].sync()
+        return {"synced": 1 if h["writable"] else 0}
+    v = st_pick(req)
+    with ST_LOCK:
+        mine = [h for h in ST["handles"].values() if h["writable"] and h["uuid"].lower() == v["uuid"].lower()]
+    for h in mine:
+        h["file"].sync()
+    return {"synced": len(mine)}
+
+
+def storage_close(req):
+    hid = st_str(req, "handle")
+    with ST_LOCK:
+        h = ST["handles"].pop(hid, None)
+    if h is None:
+        return {"closed": False}
+    st_handle_finish(h)
+    return {"closed": True}
+
+
+def storage_mkdir(req):
+    v = st_mounted(req)
+    parts = st_parse(st_str(req, "path"))
+    st_ops(v).mkdir(parts, st_bool(req, "parents", False))
+    return {"created": True}
+
+
+def storage_delete(req):
+    v = st_mounted(req)
+    parts = st_parse(st_str(req, "path"))
+    st_ops(v).delete(parts)
+    return {"deleted": True}
+
+
+def storage_rename(req):
+    v = st_mounted(req)
+    src, dst = st_parse(st_str(req, "from")), st_parse(st_str(req, "to"))
+    st_ops(v).rename(src, dst, st_bool(req, "overwrite", False))
+    return {"renamed": True}
+
+
+def storage_eject(req):
+    """Cierra los archivos del disco y «le pide a Android» que lo expulse. Según `storage eject UUID ok|silent|throw`:
+    ok = Android lo expulsa · silent = ejectRoot no hace nada y no avisa (lo normal en muchos móviles) · throw = ejectRoot lanza una excepción."""
+    v = st_pick(req)
+    key = v["uuid"].lower()
+    closed = st_handles_close_where(lambda h: h["uuid"].lower() == key)
+    attempted = False
+    if v["state"] in ST_MOUNTED:
+        attempted = v["eject"] != "throw"
+        if v["eject"] == "ok":
+            v["state"] = "unmounted"
+    gone = v["state"] not in ST_MOUNTED
+    out = {"volume": v["uuid"], "closed_files": closed, "attempted": attempted, "ejected": gone, "state": v["state"]}
+    if not gone:
+        out["hint"] = ("Android no dejó expulsarlo desde Nexo: usa «Expulsar» en la notificación del disco o en Ajustes › Almacenamiento, "
+                       "y desenchúfalo después")
+    broadcast("storage")
+    return out
+
+
+# --- órdenes de prueba (ctl) para este apartado
+
+def storage_add(label, uuid=None, flags=()):
+    with ST_LOCK:
+        if uuid is None:
+            ST["seq"] += 1
+            uuid = "%04X-%04X" % (0xA000 + ST["seq"], 0xB000 + ST["seq"])
+        v = {"uuid": uuid, "label": label, "state": "mounted_ro" if "ro" in flags else "mounted", "removable": "primary" not in flags,
+             "primary": "primary" in flags,
+             "direct": "direct" in flags, "total": None if "nocap" in flags else 8 << 30, "maxfile": None, "fail": False, "eject": "ok"}
+        ST["vols"] = [x for x in ST["vols"] if x["uuid"].lower() != uuid.lower()] + [v]
+        if "noaccess" not in flags and uuid.lower() not in ST["grants"]:
+            ST["grants"][uuid.lower()] = ""
+        os.makedirs(st_dir(v), exist_ok=True)
+    broadcast("storage")
+
+
+def storage_ctl(w):
+    """storage add ETIQUETA [UUID] [ro] [direct] [noaccess] [nocap] [primary] (en la etiqueta, «_» vale por un espacio) · storage remove UUID
+       storage state UUID ESTADO · storage ro UUID on|off · storage grant UUID on|off [CARPETA] · storage auto grant|deny|ignore [MS] [CARPETA]
+       storage eject UUID ok|silent|throw · storage size UUID BYTES|none · storage maxfile UUID BYTES|none · storage fail UUID on|off"""
+    c = w[1]
+    if c == "add" and len(w) >= 3:
+        flags = set(x for x in w[3:] if x in ("ro", "direct", "noaccess", "nocap", "primary"))
+        rest = [x for x in w[3:] if x not in flags]
+        storage_add(w[2].replace("_", " "), rest[0] if rest else None, flags)
+        return
+    if c == "auto" and len(w) >= 3:
+        ST["auto"] = w[2]
+        ST["delay_ms"] = int(w[3]) if len(w) > 3 else 0
+        ST["auto_scope"] = w[4] if len(w) > 4 else ""
+        return
+    if len(w) < 3:
+        return
+    with ST_LOCK:
+        v = next((x for x in ST["vols"] if x["uuid"].lower() == w[2].lower()), None)
+        if c == "remove":
+            ST["vols"] = [x for x in ST["vols"] if x is not v]
+        elif c == "grant":
+            if len(w) >= 4 and w[3] == "on":
+                scope = w[4] if len(w) > 4 else ""
+                ST["grants"][w[2].lower()] = scope
+                if v is not None:
+                    os.makedirs(st_scope_root(v, scope), exist_ok=True)
+            else:
+                ST["grants"].pop(w[2].lower(), None)
+    if v is None:
+        if c == "grant":
+            broadcast("storage")
+        return
+    if c == "remove":
+        st_handles_close_where(lambda h: h["uuid"].lower() == v["uuid"].lower())
+    elif c == "state" and len(w) >= 4 and w[3] in ST_STATES:
+        v["state"] = w[3]
+        if w[3] not in ST_MOUNTED:
+            st_handles_close_where(lambda h: h["uuid"].lower() == v["uuid"].lower())
+    elif c == "ro" and len(w) >= 4:
+        v["state"] = "mounted_ro" if w[3] == "on" else "mounted"
+    elif c == "eject" and len(w) >= 4:
+        v["eject"] = w[3]
+        return
+    elif c == "size" and len(w) >= 4:
+        v["total"] = None if w[3] == "none" else int(w[3])
+    elif c == "maxfile" and len(w) >= 4:
+        v["maxfile"] = None if w[3] == "none" else int(w[3])
+    elif c == "fail" and len(w) >= 4:
+        v["fail"] = w[3] == "on"
+        return
+    broadcast("storage")
+
+
 def ctl_apply(line):
     """Órdenes de prueba (--ctl ARCHIVO): cambian el estado del «móvil» y avisan a los suscritos, como haría Android.
        bt connect|disconnect|remove DIRECCIÓN · bt add NOMBRE DIRECCIÓN [clase] [tipo] · bt battery DIRECCIÓN N|none
@@ -823,6 +1680,7 @@ def ctl_apply(line):
        net wifi|cellular|ethernet|none|auto
        usb plug arduino|ch340|cp2102|ftdi|esp32s3|pl2303|keyboard|mouse|disk|hub [echo|arduino|silent] · usb unplug ID|all
        usb perm ID on|off · usb auto grant|deny|ignore [MS] · usb dump ID ARCHIVO
+       storage …  (discos USB: ver storage_ctl)
        notif post CLAVE APP TÍTULO|TEXTO · notif remove CLAVE · notif forwarding on|off · notif access on|off"""
     w = line.split()
     if not w:
@@ -869,6 +1727,9 @@ def ctl_apply(line):
                     with open(tmp, "w", encoding="utf-8") as f:
                         json.dump(d["chip"].dump(), f)
                     os.replace(tmp, w[3])
+        return
+    if w[0] == "storage" and len(w) >= 2:
+        storage_ctl(w)
         return
     if w[0] == "net" and len(w) >= 2:
         if w[1] in ("vpn", "captive") and len(w) >= 3:
@@ -952,10 +1813,11 @@ def hello_data():
     if ARGS.old:
         return {"app": "nexo", "version": "0.1.0", "proto": 1, "android_sdk": 35, "target_sdk": 28, "device": "Fake Phone",
                 "wifi": True, "bluetooth": True}
-    return {"app": "nexo", "version": "0.4.1", "proto": 1, "minor": level(), "android_sdk": 35, "target_sdk": 28,
+    return {"app": "nexo", "version": "0.4.2", "proto": 1, "minor": level(), "android_sdk": 35, "target_sdk": 28,
             "device": "Fake Phone", "wifi": True, "bluetooth": True, "listener": ARGS.listener, "uptime_s": uptime(),
-            **({"usb": True} if v13() else {}),
-            "commands": sorted((OLD_COMMANDS | NEW_COMMANDS) | (V13_COMMANDS if v13() else set()) | (V14_COMMANDS if v14() else set()))}
+            **({"usb": True} if v13() else {}), **({"storage": True} if v14() else {}),
+            "commands": sorted((OLD_COMMANDS | NEW_COMMANDS) | (V13_COMMANDS if v13() else set()) | (V14_COMMANDS if v14() else set())
+                               | (V15_COMMANDS if v15() else set()))}
 
 
 def bundle():
@@ -1049,8 +1911,8 @@ class Handler(socketserver.StreamRequestHandler):
                         SUBS[:] = [s for s in SUBS if s[0] is not self]
                     self.send({"id": rid, "ok": True})
                 elif cmd == "subscribe":
-                    default = {"wifi", "bt"} if ARGS.old else {"wifi", "bt", "audio", "media"} | ({"usb"} if v13() else set())
-                    allowed = default | {"net", "notif"} if v14() and not ARGS.old else default
+                    default = {"wifi", "bt"} if ARGS.old else {"wifi", "bt", "audio", "media"} | ({"usb"} if v13() else set()) | ({"storage"} if v14() else set())
+                    allowed = default | {"net", "notif"} if v15() and not ARGS.old else default
                     topics = {t for t in (req.get("topics") or sorted(default)) if t in allowed}
                     with LOCK:
                         SUBS.append((self, topics))
@@ -1058,7 +1920,8 @@ class Handler(socketserver.StreamRequestHandler):
                     for t in sorted(topics - {"notif"}):         # «notif» no tiene estado inicial: solo avisa de lo que pasa
                         self.send({"event": t, "data": status_for(t)})
                 else:
-                    self.note("> " + cmd)
+                    if cmd not in ("storage.read", "storage.write"):      # como la app real: sin una línea de registro por cada trozo de un archivo
+                        self.note("> " + cmd)
                     try:
                         self.send({"id": rid, "ok": True, "data": dispatch(cmd, req, self)})
                     except Err as e:
@@ -1070,6 +1933,7 @@ class Handler(socketserver.StreamRequestHandler):
             with LOCK:
                 SUBS[:] = [s for s in SUBS if s[0] is not self]
             usb_owner_gone(self)
+            storage_owner_gone(self)
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -1089,8 +1953,10 @@ def main():
     ap.add_argument("--evil", action="store_true")
     ap.add_argument("--old", action="store_true")
     ap.add_argument("--minor2", action="store_true", help="protocolo 1.2 (como la 0.4.0-beta2): sin usb.*, net.status ni notif.*")
-    ap.add_argument("--minor3", action="store_true", help="fuerza el protocolo 1.3: con USB, sin net.status ni notif.*")
-    ap.add_argument("--minor4", action="store_true", help="fuerza el protocolo 1.4: USB, net.status, notif.* y los temas net y notif")
+    ap.add_argument("--minor3", action="store_true", help="fuerza el protocolo 1.3: USB serie, sin almacenamiento ni net.status ni notif.*")
+    ap.add_argument("--minor4", action="store_true", help="fuerza el protocolo 1.4: USB serie y almacenamiento, sin net.status ni notif.*")
+    ap.add_argument("--minor5", action="store_true", help="fuerza el protocolo 1.5: todo lo anterior, net.status, notif.* y los temas net y notif")
+    ap.add_argument("--storage-dir", help="carpeta de los discos USB simulados (una subcarpeta por UUID); por omisión, una temporal")
     ap.add_argument("--freeze", action="store_true")
     ap.add_argument("--drop-first", type=int, default=0)
     ap.add_argument("--drop-after-hello", type=int, default=0)
@@ -1105,6 +1971,8 @@ def main():
         import hashlib
         print(hashlib.sha256(bundle()).hexdigest())
         return
+    ST["dir"] = os.path.abspath(ARGS.storage_dir) if ARGS.storage_dir else tempfile.mkdtemp(prefix="nexo-fake-discos-")
+    os.makedirs(ST["dir"], exist_ok=True)
     srv = Server(("127.0.0.1", ARGS.port), Handler)
     if ARGS.ctl:
         threading.Thread(target=ctl_watch, args=(ARGS.ctl,), daemon=True).start()

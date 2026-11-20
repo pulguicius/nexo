@@ -49,16 +49,17 @@ ID   TIPO             NOMBRE                       ACTIVA
 $ nexo media next          # y también: play, pause, playpause, stop, prev, seek +10s
 ```
 
-> **Estado: versión 0.4.1** (la última versión cerrada es la 0.3.0). De la 0.1 (WiFi y Bluetooth) hay un APK compilado, firmado y probado en un móvil real
+> **Estado: versión 0.4.2** (la última versión cerrada es la 0.3.0). De la 0.1 (WiFi y Bluetooth) hay un APK compilado, firmado y probado en un móvil real
 > (Xiaomi 25078RA3EL, Android 16 / SDK 36, con Termux Monet y Arch Linux en proot-distro).
 > La 0.2 añadió audio, música, redes guardadas, olvidar/renombrar Bluetooth, formatos para barras de estado y auto-recuperación;
 > la 0.3 añadió `nexo-dbus` con la música del móvil como reproductor MPRIS (`playerctl`, Waybar, Quickshell, GNOME, KDE);
 > la 0.4.0‑beta1 añadió a `nexo-dbus` el Bluetooth (`org.bluez`) y el WiFi (`org.freedesktop.NetworkManager`) del móvil para `bluetoothctl`, `nmcli` y los applets;
 > la **0.4.0‑beta2 añade `nexo tools`** (enviar y explorar archivos entre móviles: detección en la red, emparejamiento por código, explorador de terminal y gestor en el navegador, escritura opcional),
 > **`nexo update`** (lo que antes era copiar a mano) y un **`setup-guests` corregido** (distros en `containers/NOMBRE/rootfs`, todas las copias de `nexo`, comprobación de cuál ejecuta cada distro);
-> la **0.4.1 añade `nexo usb`**: un Arduino, un ESP32 o un adaptador USB↔serie conectado al móvil con un cable OTG (o un hub) sale en la distro como un puerto serie para `avrdude`, `arduino-cli`, `esptool`, PlatformIO, `screen`…
-> El cliente, `nexo-dbus`, `nexo-tools` y `nexo-usb` pasan **1625 pruebas** (`nexo-dbus` contra un bus D‑Bus real, visto con `busctl` y `gdbus`; `nexo-tools` entre dos «dispositivos» simulados y en un Chromium sin pantalla) y el código de Android compila y coincide con la app simulada y con el protocolo,
-> pero **el código nuevo de la app (0.2) todavía no se ha ejecutado en un móvil**, `nexo-dbus` **no se ha probado con `bluetoothctl`, `nmcli`, `playerctl`, Waybar, etc.** `nexo tools` **no se ha probado entre dos móviles reales** y `nexo usb` **no se ha probado con una placa ni un móvil reales** (hay un script para hacerlo: [`docs/USB.md`](docs/USB.md#probarlo-en-tu-móvil)). Lee [Estado y lo que falta](#estado-y-lo-que-falta).
+> la **0.4.1 añade `nexo usb`**: un Arduino, un ESP32 o un adaptador USB↔serie conectado al móvil con un cable OTG (o un hub) sale en la distro como un puerto serie para `avrdude`, `arduino-cli`, `esptool`, PlatformIO, `screen`…;
+> la **0.4.2 añade los discos USB** a `nexo usb`: un pendrive, un disco duro o un SSD conectado al móvil se explora y se copia desde la distro (`nexo usb mounts`, `ls`, `get`, `put`, `eject`…), sin root y sin «acceso a todos los archivos»: lo monta Android y tú le das acceso a Nexo en el selector de carpetas del sistema.
+> El cliente, `nexo-dbus`, `nexo-tools` y `nexo-usb` pasan **2212 pruebas** (`nexo-dbus` contra un bus D‑Bus real, visto con `busctl` y `gdbus`; `nexo-tools` entre dos «dispositivos» simulados y en un Chromium sin pantalla) y el código de Android compila y coincide con la app simulada y con el protocolo,
+> pero **el código nuevo de la app (0.2) todavía no se ha ejecutado en un móvil**, `nexo-dbus` **no se ha probado con `bluetoothctl`, `nmcli`, `playerctl`, Waybar, etc.** `nexo tools` **no se ha probado entre dos móviles reales** y `nexo usb` **no se ha probado con una placa, un disco ni un móvil reales** (hay un script para cada cosa: [placas](docs/USB.md#probarlo-en-tu-móvil) y [discos](docs/USB-ALMACENAMIENTO.md#probarlo-en-tu-móvil)). Lee [Estado y lo que falta](#estado-y-lo-que-falta).
 
 ---
 
@@ -106,6 +107,7 @@ Después ejecuta `nexo version` **dentro de cada distro** (con `proot-distro log
 dentro de la distro, `nexo setup-dbus --own-bus`. Guía completa: [`docs/INTEGRACION-ESCRITORIO.md`](docs/INTEGRACION-ESCRITORIO.md).
 **¿Quieres pasar archivos entre móviles desde la distro?** `nexo setup-guests --with-tools` (necesita `python3` y `openssl` en la distro). Guía: [`docs/NEXO-TOOLS.md`](docs/NEXO-TOOLS.md).
 **¿Quieres un Arduino, un ESP32 o un adaptador USB↔serie dentro de la distro?** Conéctalo al móvil con un cable OTG, copia `nexo-usb` con `nexo setup-guests --with-usb` (necesita `python3` en la distro) y, dentro de ella, `nexo usb list`. Guía: [`docs/USB.md`](docs/USB.md).
+**¿Quieres explorar un pendrive o un disco duro desde la distro?** Conéctalo al móvil con un cable OTG (o un hub), copia `nexo-usb` como arriba y, dentro de la distro, `nexo usb mounts` y `nexo usb access` (eliges el disco una vez en el selector de carpetas de Android); después `nexo usb ls`, `get`, `put`… Guía: [`docs/USB-ALMACENAMIENTO.md`](docs/USB-ALMACENAMIENTO.md).
 
 Dependiendo de la distro, necesitarás instalar `bash` y `jq`:
 
@@ -136,13 +138,14 @@ Dependiendo de la distro, necesitarás instalar `bash` y `jq`:
 | `nexo audio outputs` · `nexo audio switch SALIDA` | Salidas de audio y cuál suena. Cambiarla pide un toque (Android no deja a una app normal) |
 | `nexo media play\|pause\|playpause\|stop\|next\|prev` | Controla la música que suena en el móvil (Spotify, YouTube Music, VLC…) |
 | `nexo media seek +10s\|-10s\|90s\|1:30` · `nexo media art [ARCHIVO]` | Adelantar o ir a un punto; guardar la carátula (JPEG) |
-| `nexo watch [wifi\|bt\|audio\|media]` | Cambios en vivo, un JSON por línea (`--pretty` para leerlos mejor). Reconecta solo |
+| `nexo watch [wifi\|bt\|audio\|media\|usb\|storage]` | Cambios en vivo, un JSON por línea (`--pretty` para leerlos mejor; `usb` y `storage` se piden por su nombre; `storage --event` da un evento con nombre por cambio). Reconecta solo |
 | `nexo pair [TOKEN] [PUERTO]` · `nexo unpair` | Guarda o borra el enlace a mano (`--token-stdin`: el token no queda en el historial) |
 | `nexo rekey [TOKEN]` | Cambia el token tras «Token nuevo» en la app y actualiza tus distros |
 | `nexo setup-guests [DISTRO…]` | (Termux) copia cliente y enlace a tus distros de proot-distro (`containers/…/rootfs` e `installed-rootfs`), actualiza TODAS las copias de `nexo` que tengan y comprueba cuál ejecuta cada una (`--list`, `--uninstall`, `--private`, `--with-dbus`, `--with-tools`, `--with-usb`, `--no-verify`) |
 | `nexo update [RUTA\|ARCHIVO.zip]` | Pone al día `nexo`, `nexo-dbus`, `nexo-tools` y `nexo-usb` desde la carpeta del repositorio (o un `.zip`) y luego tus distros (`--check` solo mira, `--no-guests`) |
 | `nexo tools [COMANDO…]` | Archivos entre móviles: `send`, `fetch`, `server`, `discover`, `pair`, `connect`, `browse`, `ls`, `get`, `put`, `web`… ([guía](docs/NEXO-TOOLS.md)) |
 | `nexo usb list\|permit\|monitor\|bridge\|status\|stop\|reset` | Arduino, ESP32 y adaptadores USB↔serie conectados al móvil: ver qué ve Android, pedir el permiso, un monitor serie y un puerto serie para `avrdude`, `esptool`, PlatformIO… ([guía](docs/USB.md)). Necesita python3 salvo `list` |
+| `nexo usb mounts\|access\|ls\|stat\|cat\|get\|put\|mkdir\|rm\|mv\|df\|eject` | Pendrives, discos duros y SSD que monta Android: ver los discos, dar acceso, listar, copiar en los dos sentidos, crear, borrar, mover, espacio libre y expulsar ([guía](docs/USB-ALMACENAMIENTO.md)). Necesita python3 salvo `mounts` |
 | `nexo setup-dbus [--uninstall]` | Activa `nexo-dbus` (música MPRIS, Bluetooth BlueZ y WiFi NetworkManager del móvil), con arranque automático (`--no-start`, `--own-bus`, `--launcher ARCHIVO`, `--system-policy` para un bus del sistema de verdad). Necesita python3 |
 | `nexo dbus start\|stop\|restart\|status\|env\|run` | Atajo a `nexo-dbus` (`status` dice qué servicio está activo y por qué no) |
 | `nexo start` | (Termux) abre la app Nexo para despertar el puente |
@@ -188,12 +191,12 @@ nunca sirve `~/.ssh`, `~/.gnupg` ni lo que guarda Nexo. **Todo está probado ent
 
 ---
 
-## USB: Arduino, ESP32 y adaptadores serie (`nexo usb`)
+## USB: Arduino, ESP32, adaptadores serie y discos (`nexo usb`)
 
 Conecta una placa o un adaptador USB↔serie al móvil (cable OTG o hub) y úsalo **desde la distro** como si fuera un `/dev/ttyACM0`:
 
 ```bash
-nexo usb list                      # lo que Android ve por USB (también teclados, ratones, discos y hubs; solo los puertos serie se pueden usar)
+nexo usb list                      # lo que Android ve por USB (también teclados, ratones, discos y hubs; los puertos serie se usan aquí, los discos más abajo)
 nexo usb permit                    # Android pregunta «¿permitir?» en la pantalla del móvil
 nexo usb monitor -b 9600           # monitor serie en la terminal (salir: Ctrl+])
 nexo usb bridge --rfc2217 0 --detach   # un puerto serie para avrdude, arduino-cli, PlatformIO, screen…, y un servidor RFC 2217 para esptool
@@ -204,6 +207,21 @@ serie. Controladores propios para CDC‑ACM (Arduino Uno/Mega/Leonardo, ESP32 co
 al abrir el puerto, y si desenchufas el cable **el puerto se queda donde está** y se recupera al volver a enchufarlo. El puerto de la distro es un PTY, no un dispositivo USB: `lsusb` y los IDE que buscan puertos
 solos no lo ven (hay que darles la ruta). **Probado contra una app simulada, con pruebas de los controladores en una JVM y con la compilación contra Android; no con una placa ni un móvil reales:**
 [`tests/usb_hardware_check.sh`](tests/usb_hardware_check.sh) es la prueba para hacerlo (eco, cargador del Arduino, `esptool`, desenchufar) y da un informe para pegar. Guía, herramientas, límites y solución de problemas: [`docs/USB.md`](docs/USB.md).
+
+### Discos: pendrives, discos duros y SSD
+
+Conecta un disco al móvil (cable OTG o hub): **Android lo monta** y Nexo te deja explorarlo y copiar sus archivos **desde la distro**, sin root:
+
+```bash
+nexo usb mounts                              # qué discos montó Android y si Nexo ya puede entrar
+nexo usb access                              # solo la primera vez: eliges el disco en el selector de Android → «Usar esta carpeta»
+nexo usb ls -l /                             # mira dentro
+nexo usb put -r proyecto /Copias/            # de tu distro al disco
+nexo usb get -r /Documentos ~/documentos     # del disco a tu distro
+nexo usb eject                               # antes de desenchufar
+```
+
+No hay `mount` ni `/dev/sda` en la distro (no es root y el kernel es el de Android): la **app** entra en el disco con el *Storage Access Framework* —el selector de carpetas del sistema, **sin pedir «acceso a todos los archivos»**— y le pasa a Linux las operaciones sobre los archivos que tú autorizaste (leer, escribir, crear, borrar, mover, expulsar). Un archivo se escribe con un nombre provisional y se renombra al terminar, así que nunca aparece a medias; `--verify` compara SHA‑256; FAT32 no admite archivos de 4 GiB o más y Android decide qué sistemas de archivos monta (casi siempre FAT32 y exFAT; NTFS y ext4 según el móvil). **Probado contra una app simulada (cada disco es una carpeta), con pruebas de las reglas en una JVM y con la compilación contra Android; no con un móvil ni un disco reales:** [`tests/usb_storage_hardware_check.sh`](tests/usb_storage_hardware_check.sh) es la prueba para hacerlo y da un informe para pegar. Guía, reglas del disco, expulsión y solución de problemas: [`docs/USB-ALMACENAMIENTO.md`](docs/USB-ALMACENAMIENTO.md).
 
 ---
 
@@ -333,15 +351,7 @@ Nexo **controla** el WiFi, el Bluetooth, el audio y la música de Android; no se
 - **Escaneos de WiFi limitados.** Android admite unos 4 cada 2 minutos; pasado el límite, `wifi scan` devuelve la última lista (`fresh:false`).
   En Opciones de desarrollador existe el interruptor «Wi‑Fi scan throttling» si quieres quitar el límite.
 - **El nombre de la red** necesita el permiso de ubicación **y** la ubicación del sistema encendida; si no, sale «(red oculta: falta permiso de ubicación)».
-- **USB: solo puertos serie, y como puerto de red/PTY.** Una distro de proot no puede abrir `/dev/bus/usb` ni montar nada: llegan los puertos serie que la app abre con tu permiso (`nexo usb`). Teclados, ratones, discos y hubs salen en `nexo usb list`
-  pero no se pasan a la distro (los discos llegan en la 0.4.2). El puerto es un PTY, no `/dev/ttyACM0`: `lsusb` y los IDE que buscan puertos solos (Arduino IDE) no lo ven. Las placas de USB nativo que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro) no están cubiertas.
-- **El puente necesita la app en marcha** (servicio en primer plano). Si Android la cierra o congela, `nexo` dice que no puede conectar (código 12).
-- **No hay BlueZ ni NetworkManager *de verdad* dentro de la distro.** Las apps de Linux no ven un adaptador WiFi ni Bluetooth reales, y no hay audio Bluetooth para ellas.
-  Para los programas que leen el estado por D‑Bus, `nexo-dbus` los finge: la música (`playerctl`, MPRIS) desde la 0.3, y el Bluetooth y el WiFi (`bluetoothctl`, `nmcli`, applets) desde la 0.4.0‑beta1
-  (`nexo setup-dbus`); con los límites de [LIMITACIONES](docs/LIMITACIONES.md) (no se conectan dispositivos Bluetooth, no se leen las claves WiFi). Ver [Integración universal](#integración-universal).
-- **API 28.** Android 14 empezó a bloquear la instalación de apps con un `targetSdk` demasiado antiguo: mínimo 23 en Android 14 y 24 de Android 15 en adelante
-  ([fuente](https://bayton.org/android/android-minimum-targetsdk-matrix/)). 28 queda por encima, pero si algún día Android sube ese mínimo, Termux tendría el mismo problema
-  y Nexo tendría que subir su `targetSdk` (y perder parte del control directo). No se publica en Google Play.
+- **USB: puertos serie y discos, no «USB de verdad».** Una distro de proot no puede abrir `/dev/bus/usb` ni montar nada: llegan los puertos serie que la app abre con tu permiso y los archivos de los discos que Android monta y tú autorizas (`nexo usb`). En la distro no hay `/dev/sda`, `lsblk` ni `mount`: a un disco se llega con `nexo usb ls`, `get` y `put`. Teclados, ratones y hubs salen en `nexo usb list` pero no se pasan a la distro. El puerto serie es un PTY, no `/dev/ttyACM0`: `lsusb` y los IDE que buscan puertos solos (Arduino IDE) no lo ven. Las placas de USB nativo que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro) no están cubiertas. Un disco que Android no monta (NTFS o ext4 en muchos móviles) no se puede usar, y la expulsión desde Nexo puede ser rechazada por Android (entonces `nexo usb eject` te lo dice).
 
 ---
 
@@ -364,7 +374,8 @@ Nexo **controla** el WiFi, el Bluetooth, el audio y la música de Android; no se
 - `nexo raw` (peticiones sin filtrar) está apagado salvo que pongas `NEXO_ALLOW_RAW=1`. No es una barrera de seguridad (quien tiene el token puede hablar con la app a mano), sino un freno a los errores.
 - El «acceso a notificaciones» (para la música) lo concedes tú y se puede quitar en cualquier momento en los ajustes de Android. En esta versión Nexo no lee ni guarda ninguna notificación.
 - El permiso `INTERNET` solo sirve para abrir el socket local: la app no se conecta a ningún servidor. Sin anuncios, sin telemetría.
-- **`nexo usb`**: Android pide el permiso **por dispositivo** y solo la app Nexo lo tiene. El servidor RFC 2217 y el TCP crudo de `nexo usb bridge` **no tienen contraseña** y escuchan solo en `127.0.0.1` (cualquier programa del móvil puede escribir en tu placa mientras estén abiertos: ciérralos con `nexo usb stop`).
+- **Discos USB** (`nexo usb ls`, `get`, `put`…): Nexo **no pide «acceso a todos los archivos»**. El acceso lo concedes **disco por disco** en el selector de carpetas de Android (solo se acepta una carpeta del propio disco; si eliges una subcarpeta, esa es la raíz y Nexo no sale de ella) y se quita con `nexo usb access --revoke`. Las rutas se validan en la app, nunca borra recursivamente de una vez, no abre ningún puerto nuevo y cada operación pasa por la conexión autenticada con el token.
+- **Puertos serie** (`nexo usb list`, `monitor`, `bridge`): Android pide el permiso **por dispositivo** y solo la app Nexo lo tiene. El servidor RFC 2217 y el TCP crudo de `nexo usb bridge` **no tienen contraseña** y escuchan solo en `127.0.0.1` (cualquier programa del móvil puede escribir en tu placa mientras estén abiertos: ciérralos con `nexo usb stop`).
 - **`nexo tools`** (archivos entre móviles) es aparte del puente y no usa su token: su modelo de seguridad (certificado fijado por huella, códigos de un solo uso con prueba HMAC, tokens por dispositivo, solo lectura por omisión, papelera en vez de borrar, rutas prohibidas, límite de intentos) está en [`docs/NEXO-TOOLS.md`](docs/NEXO-TOOLS.md#emparejamiento-y-seguridad).
 - El protocolo completo está en [`docs/PROTOCOLO.md`](docs/PROTOCOLO.md), por si quieres escribir otro cliente.
 
@@ -420,12 +431,13 @@ export ANDROID_HOME=/ruta/al/sdk
 ```
 
 El workflow `.github/workflows/build.yml` compila automáticamente y firma el APK usando los secretos del repositorio, publicándolo en Releases al crear una etiqueta
-(`git tag v0.4.1 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar). Cómo preparar la firma y cómo colaborar: [`docs/CONTRIBUIR.md`](docs/CONTRIBUIR.md).
+(`git tag v0.4.2 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar). Cómo preparar la firma y cómo colaborar: [`docs/CONTRIBUIR.md`](docs/CONTRIBUIR.md).
 
 ```bash
-bash tests/run_tests.sh      # 1625 pruebas: cliente, instalador, nexo-dbus, nexo-tools y nexo-usb contra una app simulada (bash, python3 y jq; las de D-Bus piden además dbus-daemon, busctl y gdbus; las de nexo-tools, openssl)
-NEXO_TESTS_ONLY=usb bash tests/run_tests.sh   # solo nexo usb
-cd android && ./gradlew testDebugUnitTest      # 37 pruebas de JVM de los controladores USB (sin móvil)
+bash tests/run_tests.sh      # 2212 pruebas: cliente, instalador, nexo-dbus, nexo-tools y nexo-usb (puertos serie y discos) contra una app simulada (bash, python3 y jq; las de D-Bus piden además dbus-daemon, busctl y gdbus; las de nexo-tools, openssl)
+NEXO_TESTS_ONLY=usb bash tests/run_tests.sh   # solo nexo usb (puertos serie)
+NEXO_TESTS_ONLY=storage bash tests/run_tests.sh   # solo los discos USB
+cd android && ./gradlew testDebugUnitTest      # 72 pruebas de JVM: controladores USB serie y reglas de los discos (sin móvil)
 ```
 
 Las pruebas incluyen una comprobación de **contrato** (`tests/check_contract.py`): compara el código Kotlin de la app con la app simulada y con `docs/PROTOCOLO.md`
@@ -443,6 +455,11 @@ android/                       Proyecto de Android (Gradle, Kotlin 2.0, AGP 8.7,
     UsbSerial.kt               Controladores USB serie (CDC-ACM, CP210x, FTDI, CH34x): lógica pura, sin Android, probada en JVM
     UsbHandler.kt              USB host: dispositivos, permisos, sesiones y flujo de datos (UsbManager)
     UsbAttachedActivity.kt     El aviso «abrir Nexo cuando se conecte»
+    StorageLogic.kt            Discos USB: rutas, reglas de crear/borrar/renombrar y tabla de archivos abiertos (sin Android, probada en JVM)
+    StorageSaf.kt              Discos USB: lo que toca el disco (Storage Access Framework: DocumentsContract y lectura/escritura por posición)
+    StorageVolumes.kt          Discos USB: qué discos hay (StorageManager) y a cuáles tiene acceso Nexo
+    StorageGrantActivity.kt    Discos USB: el selector de carpetas de Android donde das el acceso
+    StorageHandler.kt          Discos USB: los comandos storage.* y la expulsión
     AudioHandler.kt            Volumen de música y salidas de audio (AudioManager)
     MediaHandler.kt            Sesiones de medios: qué suena, controles, carátula (MediaSessionManager)
     NexoNotificationListener.kt  El «acceso a notificaciones» que Android exige para ver la música de otras apps
@@ -454,13 +471,13 @@ termux/
   bin/nexo                     El cliente
   bin/nexo-dbus                Servicios D-Bus (MPRIS, BlueZ, NetworkManager); un solo archivo de Python 3, sin librerías
   bin/nexo-tools               Archivos entre móviles (servidor HTTPS, descubrimiento, emparejamiento, explorador, gestor web); bash con Python 3 embebido
-  bin/nexo-usb                 Arduino, ESP32 y adaptadores USB↔serie (monitor, puerto PTY, RFC 2217, TCP); un solo archivo de Python 3, sin librerías
+  bin/nexo-usb                 Arduino, ESP32, adaptadores USB↔serie (monitor, puerto PTY, RFC 2217, TCP) y discos USB (mounts, ls, get, put…); un solo archivo de Python 3, sin librerías
   install.sh                   El instalador (también --uninstall)
   oneliner.tpl                 Plantilla del comando de una línea que copia la app
-tests/                         App simulada (fake_app.py), pruebas (run_tests.sh, dbus_tests.sh, dbus_system_tests.sh, tools_tests.sh, usb_tests.sh, ui_tests.py, dbus_probe.py, dbus_hold.py, tools_probe.py, usb_client.py),
-                               la prueba con hardware real (usb_hardware_check.sh), la referencia de velocidades (ref_baud.py) y la comprobación de contrato (check_contract.py)
-android/app/src/test/          Pruebas de JVM de los controladores USB (UsbSerialTest.kt)
-docs/                          PROTOCOLO · LIMITACIONES · ANDROID-VERSIONES · FAQ · CONTRIBUIR · ROADMAP · INTEGRACION-ESCRITORIO · NEXO-TOOLS · USB
+tests/                         App simulada (fake_app.py), pruebas (run_tests.sh, dbus_tests.sh, dbus_system_tests.sh, tools_tests.sh, usb_tests.sh, usb_storage_tests.sh, ui_tests.py, dbus_probe.py, dbus_hold.py, tools_probe.py, usb_client.py),
+                               las pruebas con hardware real (usb_hardware_check.sh y usb_storage_hardware_check.sh), la referencia de velocidades (ref_baud.py) y la comprobación de contrato (check_contract.py)
+android/app/src/test/          Pruebas de JVM de los controladores USB (UsbSerialTest.kt) y de las reglas de los discos (StorageLogicTest.kt)
+docs/                          PROTOCOLO · LIMITACIONES · ANDROID-VERSIONES · FAQ · CONTRIBUIR · ROADMAP · INTEGRACION-ESCRITORIO · NEXO-TOOLS · USB · USB-ALMACENAMIENTO
 .github/workflows/build.yml    Pruebas del cliente + compilación del APK
 ```
 
@@ -470,7 +487,7 @@ El cliente, `nexo-dbus`, `nexo-tools`, `nexo-usb` y el instalador viajan dentro 
 
 ## Estado y lo que falta
 
-**Versión 0.4.1.**
+**Versión 0.4.2.**
 
 - ✅ **Comprobado en móvil real (v0.1):** Xiaomi 25078RA3EL (Android 16 / SDK 36). El APK compila y se firma automáticamente con un Keystore propio a través de GitHub Actions.
   El cliente lee el WiFi/Bluetooth reales y se comunica sin problemas desde Termux Monet y desde proot-distro (probado en Arch Linux). Se corrigió un bloqueo del hilo de red
@@ -490,6 +507,8 @@ El cliente, `nexo-dbus`, `nexo-tools`, `nexo-usb` y el instalador viajan dentro 
   **`setup-guests`** con las dos disposiciones de proot-distro, copias viejas repetidas, un `proot-distro` simulado que dice qué copia gana, enlaces propios de usuarios con el token viejo, `--with-tools`/`--uninstall`; **`nexo update`** desde carpeta, `termux/`, `.zip` y `NEXO_REPO`, con un script roto rechazado sin tocar nada y sin dejar temporales.
 - ✅ **Comprobado aquí (0.4.1):** **`nexo usb`** contra la app simulada (`tests/fake_app.py`, con «chips» que imitan un CDC‑ACM, un CP210x, un FTDI, un CH340, un Arduino con su cargador STK500 y un eco): `list`, `permit` (concedido, denegado, sin contestar), `monitor`, `bridge` con el puerto PTY (todos los valores de byte, en los dos sentidos, velocidad y formato que cambia el programa, DTR/RTS), el reinicio automático del Arduino (con `inotify`, con `/proc` y sin vigilar), el servidor RFC 2217 y el TCP crudo (reinicio al primer cliente), desenchufar y volver a enchufar (el puerto se queda donde está), varios puentes a la vez, `--detach`/`status`/`stop`/`reset`, estados viejos y procesos ajenos, app caída, token malo y app anterior sin USB;
   el instalador, `setup-guests --with-usb` y `nexo update` con `nexo-usb`; **37 pruebas de JVM** de los controladores (las órdenes de control de cada chip y sus cuentas de velocidad, que además se comparan con una transcripción independiente de libftdi y de `ch341.c`: `tests/ref_baud.py`); el código de Kotlin compila contra la API real de Android; y `tests/usb_hardware_check.sh` (la prueba con hardware real) funciona contra la app simulada.
+- ✅ **Comprobado aquí (0.4.2):** **los discos de `nexo usb`** contra la app simulada (cada disco es una carpeta de verdad, con su etiqueta, UUID, estado, espacio y acceso concedido o no): `mounts` (uno, varios, expulsado, sin acceso, solo lectura), `access` (concedido, denegado, sin contestar, `--revoke`), `ls` (`-lahR`, `--json`, miles de archivos paginados, nombres con acentos, espacios, emojis y `:`), `stat`, `cat` (también con la tubería cerrada), `get` y `put` (archivos de todos los tamaños, de 0 bytes a varios MiB, árboles, `-f`/`-n`, `ORIGEN/`, `--verify`, `--fix-names`, enlaces, sin espacio, disco lleno, solo lectura, desenchufar a media copia, app caída, nada a medias bajo su nombre), `mkdir`, `rm`, `mv`, `df` y `eject` (expulsado, rechazado, con error); **cada orden por los dos caminos** (por la app y directa por la ruta) **comparando resultados en ~75 casos**; `nexo watch storage` y sus eventos; que no queden archivos abiertos ni restos `.nexo-part-*`; y **35 pruebas de JVM** de las reglas de los discos (`StorageLogicTest.kt`). El código de Kotlin compila contra la API real de Android y coincide con la app simulada y con el protocolo 1.4. `tests/usb_storage_hardware_check.sh` (la prueba con un disco real) funciona contra la app simulada (también con `--unplug`, `--eject`, `--speed` y `--big`, con discos de solo lectura, casi llenos, con errores o con el límite de FAT32, y al pararlo con una señal borra su carpeta del disco).
+- ⚠️ **Sin comprobar (0.4.2): TODO lo que necesita un móvil y un disco de verdad.** El código nuevo de la app (`StorageManager`, el selector de carpetas, el permiso que Android recuerda, la lectura y escritura por `DocumentsContract`, los avisos de montaje, la expulsión con `ejectRoot`), la velocidad real, qué sistemas de archivos monta tu móvil (FAT32, exFAT, NTFS, ext4), el selector de HyperOS/Android 16 con un disco USB, discos de varios cientos de miles de archivos, hubs y la batería. La copia directa por ruta (`--via direct`) solo se probó con carpetas normales. Para probarlo: [`tests/usb_storage_hardware_check.sh`](tests/usb_storage_hardware_check.sh) (ver [`docs/USB-ALMACENAMIENTO.md`](docs/USB-ALMACENAMIENTO.md#probarlo-en-tu-móvil)).
 - ⚠️ **Sin comprobar (0.4.1): TODO lo que necesita un móvil o una placa de verdad.** El código nuevo de la app (`UsbManager`, el permiso, las transferencias bulk y de control), los controladores con chips reales (ATmega16U2 de un Uno, CH340, CP2102, FT232, ESP32‑S3 por USB nativo), un `avrdude`, `arduino-cli`, `esptool` o PlatformIO reales contra los puertos que ofrece `nexo usb bridge`, hubs, el aviso de permiso en HyperOS/Android 16 y la duración de la batería.
   Para probarlo: [`tests/usb_hardware_check.sh`](tests/usb_hardware_check.sh) (ver [`docs/USB.md`](docs/USB.md#probarlo-en-tu-móvil)).
 - ⚠️ **Sin comprobar (0.4.0‑beta2):** `nexo tools` **entre dos móviles reales**, con el router de tu casa (difusión UDP, aislamiento de clientes), con los navegadores de Android, con archivos de varios GB, con tarjetas SD en FAT/exFAT y con el ahorro de batería de HyperOS;
@@ -501,8 +520,8 @@ El cliente, `nexo-dbus`, `nexo-tools`, `nexo-usb` y el instalador viajan dentro 
 - ⚠️ **Limitaciones del entorno:** El encendido/apagado directo de WiFi/Bluetooth depende de las restricciones de cada fabricante (HyperOS puede pedir un toque manual).
   Las redes con señal muy débil (ej. -87 dBm) pueden hacer que Android reporte un `connected: false` momentáneo mientras re-negocia la conexión.
   HyperOS puede congelar la app: se mitiga, no se puede evitar desde dentro de la app (ver [Que Android no cierre la app](#que-android-no-cierre-la-app)).
-- ❌ **Sin hacer:** las notificaciones del móvil en tu escritorio y la red móvil en NetworkManager (0.4.3, protocolo 1.4: el código de la app aún no lo trae),
-  el almacenamiento USB (0.4.2), teclados y ratones USB en la distro, el PL2303 y las placas que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro), los paquetes (AUR, `.deb`, `.rpm`, `APKBUILD`) y F‑Droid (ver [ROADMAP](docs/ROADMAP.md)).
+- ❌ **Sin hacer:** las notificaciones del móvil en tu escritorio y la red móvil en NetworkManager (0.4.3, protocolo 1.5: el código de la app aún no lo trae),
+  un explorador interactivo de discos y la emulación de UDisks2 para los gestores de archivos de Linux, Shizuku/`rish` integrado (solo hay acceso directo por ruta si el proceso ya la ve), teclados y ratones USB en la distro, el PL2303 y las placas que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro), los paquetes (AUR, `.deb`, `.rpm`, `APKBUILD`) y F‑Droid (ver [ROADMAP](docs/ROADMAP.md)).
 
 Ideas sin explorar: un azulejo de Ajustes rápidos para encender y apagar el puente; conectar dispositivos Bluetooth de verdad mediante ADB inalámbrico o Shizuku.
 

@@ -85,7 +85,11 @@ y luego `nexo tools browse NOMBRE` (terminal) o `nexo tools web NOMBRE` (navegad
 
 Con `nexo usb` (desde la 0.4.1): cable OTG (o un hub), `nexo usb list`, `nexo usb permit` y `nexo usb bridge` dan un puerto serie para `avrdude`, `arduino-cli`, `esptool`, PlatformIO, `screen`…; `nexo usb monitor` es un monitor serie.
 Una distro de proot no puede abrir `/dev/bus/usb` ni montar nada, así que lo abre la app Nexo (con tu permiso) y le pasa a la distro **solo los bytes de la línea serie**: por eso el puerto es un PTY y no `/dev/ttyACM0`.
-Teclados, ratones y discos salen en la lista pero no se pasan a la distro (los discos llegan en la 0.4.2). **Todavía no se ha probado con una placa real**; `tests/usb_hardware_check.sh` lo prueba y da un informe. Guía y solución de problemas: [USB](USB.md).
+Teclados, ratones y hubs salen en la lista pero no se pasan a la distro (los discos tienen su propia respuesta, justo debajo). **Todavía no se ha probado con una placa real**; `tests/usb_hardware_check.sh` lo prueba y da un informe. Guía y solución de problemas: [USB](USB.md).
+
+## ¿Puedo ver y copiar los archivos de un pendrive o un disco duro desde la distro?
+
+Con `nexo usb` (desde la 0.4.2): cable OTG (o un hub), `nexo usb mounts` (Android monta el disco y Nexo lo lista), `nexo usb access` (eliges el disco **una vez** en el selector de carpetas de Android) y después `nexo usb ls`, `get`, `put`, `cat`, `mkdir`, `rm`, `mv`, `df` y `eject`. No hace falta root ni «acceso a todos los archivos». Dentro de la distro **no hay `mount` ni `/dev/sda`** (no es root y el kernel es el de Android): se llega con esos comandos, y `nexo usb cat /copia.tar | tar xf -` sirve para tuberías. Android decide qué sistemas de archivos monta (FAT32 y exFAT casi siempre; NTFS y ext4 según el móvil) y FAT32 no admite archivos de 4 GiB. **Todavía no se ha probado con un disco real**; `tests/usb_storage_hardware_check.sh` lo prueba y da un informe. Guía y solución de problemas: [USB-ALMACENAMIENTO](USB-ALMACENAMIENTO.md).
 
 ## ¿Puedo usar Nexo con `nmcli`, `bluetoothctl` o `playerctl`?
 

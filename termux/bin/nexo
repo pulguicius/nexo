@@ -4,8 +4,8 @@
 # y da la salida con formato. No depende de qué Termux uses (F-Droid, GitHub, Monet, forks...).
 # Licencia: GPL-3.0-or-later
 
-NEXO_VERSION="0.4.1"
-CLIENT_MINOR=3          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
+NEXO_VERSION="0.4.2"
+CLIENT_MINOR=4          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
 export LC_ALL=C
 
 NEXO_HOST=${NEXO_HOST:-127.0.0.1}
@@ -71,7 +71,8 @@ Música (hace falta darle a Nexo «acceso a notificaciones» en Android)
   media seek +10s|-10s|90s|1:30 Adelanta, atrasa o va a un punto
   media art [ARCHIVO]           Guarda la carátula y muestra dónde quedó
 Eventos
-  watch [wifi|bt|audio|media]   Cambios en vivo, un JSON por línea (--pretty para leerlos; --event para eventos sueltos)
+  watch [wifi|bt|audio|media|usb|storage]  Cambios en vivo, un JSON por línea (--pretty para leerlos; --event para eventos sueltos;
+                                 «storage» avisa al enchufar, montar, expulsar o quitar un disco USB; por omisión van los cuatro primeros)
 Escritorio (el móvil como MPRIS, BlueZ y NetworkManager: playerctl, bluetoothctl, nmcli, Waybar, Quickshell, GNOME, KDE…)
   setup-dbus [--uninstall]      Deja nexo-dbus funcionando y con arranque automático (hace falta python3)
                                 (--no-start no lo arranca ahora, --own-bus crea los buses de D-Bus que falten,
@@ -88,13 +89,18 @@ Archivos entre móviles (nexo-tools: no hace falta el puente; solo la misma red 
                                   tools connect IP --code C  se empareja con uno (guarda su huella)
                                   tools browse|ls|get|put|web  explora, baja y sube; web = gestor en el navegador
                                   tools help                 todo lo demás
-Arduino, ESP32 y adaptadores serie USB (nexo-usb: cable OTG, la app con el permiso de Android y python3)
+USB: Arduino, ESP32, adaptadores serie y discos (nexo-usb: cable OTG, la app con el permiso de Android y python3)
   usb list                      Lo que Android ve por USB y cuáles sirven como puerto serie (--json, --lsusb, --all)
   usb permit [DISPOSITIVO]      Pide el permiso a Android (sale un aviso en la pantalla del móvil)
   usb monitor [DISPOSITIVO]     Monitor serie en la terminal, como el del IDE de Arduino (salir: Ctrl+])
   usb bridge [DISPOSITIVO]      Crea un puerto serie en tu distro para avrdude, arduino-cli, PlatformIO, minicom, screen…
                                  (--rfc2217 PUERTO: servidor para esptool con DTR y RTS; -d lo deja en segundo plano)
   usb status|stop|reset         Los puentes en marcha: verlos, cerrarlos o reiniciar la placa
+  usb mounts                    Pendrives y discos que Android montó, y si Nexo puede entrar (--json, --all, --wait S)
+  usb access [DISCO]            Android te enseña su selector de carpetas: elige el disco (una sola vez)
+  usb ls|stat|cat [RUTA…]       Mira un disco: carpetas (-l -a -h -R), tamaños y fechas, o el contenido de un archivo
+  usb get|put ORIGEN… DESTINO   Copia del disco a tu distro (get) o de tu distro al disco (put): -r carpetas, -f, -n, --verify
+  usb mkdir|rm|mv|df|eject      Crea, borra o mueve dentro del disco, mira su espacio, o lo expulsa antes de desenchufarlo
                                  (todo lo que sigue a «usb» es de nexo-usb: opciones --baud, --json… y «nexo usb help»)
 Enlace e instalación
   pair [TOKEN] [PUERTO]         Guarda el token de la app (--token-stdin lo lee de la entrada: no queda en el historial)
@@ -645,6 +651,13 @@ JQ_EVENT='if .event == "wifi" then
   elif .event == "media" then
     "media → " + (.data | if .listener == false then "sin acceso a notificaciones" elif .available != true then "nada en reproducción"
                           else "\(.state): \(.title // "?")" + (if (.artist // "") != "" then " — " + .artist else "" end) end)
+  elif .event == "usb" then
+    "usb   → " + (.data | if .available == false then "sin USB host" else "\((.devices // []) | length) dispositivo(s)" end)
+  elif .event == "storage" then
+    "disco → " + (.data | if .available == false then "no disponible"
+                          else ((.volumes // []) | map(select(.primary | not))) as $v
+                               | if ($v | length) == 0 then "ningún disco"
+                                 else ($v | map("\(.label // .uuid) (" + ({"mounted": "montado", "mounted_ro": "solo lectura", "unmounted": "expulsado", "unmountable": "no se puede montar", "checking": "comprobando", "removed": "quitado", "bad_removal": "quitado sin expulsar", "ejecting": "expulsando", "nofs": "sin sistema de archivos", "shared": "compartido"}[.state] // .state) + ")") | join(", ")) end end)
   else tostring end'
 
 # Eventos sueltos (nexo watch --event): se comparan estados sucesivos y se emite solo lo que cambió.
@@ -681,6 +694,20 @@ def evs($t; $p; $c):
          (if $p == null or $p.track_id != $c.track_id or $p.title != $c.title then [mk("track"; {title: $c.title, artist: $c.artist, album: $c.album, app: $c.app})] else [] end)
          + (if $p == null or $p.state != $c.state then [mk("state"; {state: $c.state})] else [] end)
        end)
+  elif $t == "storage" then
+    def vols($s): (($s // {}).volumes // []) | map(select(.primary | not));
+    def vinfo($v): {volume: $v.uuid, label: $v.label, state: $v.state, readonly: $v.readonly};
+    vols($p) as $a | vols($c) as $b
+    | if $c.available == false then [mk("unavailable"; {})]
+      elif $p == null then [$b[] | . as $v | mk(if $v.mounted then "mounted" else "present" end; vinfo($v))]
+      else
+        [$b[] | . as $v | select(([$a[] | select(.uuid == $v.uuid)] | length) == 0) | mk(if $v.mounted then "mounted" else "present" end; vinfo($v))]
+        + [$a[] | . as $v | select(([$b[] | select(.uuid == $v.uuid)] | length) == 0) | mk("removed"; {volume: $v.uuid, label: $v.label})]
+        + [$b[] | . as $v | ($a[] | select(.uuid == $v.uuid)) as $o | select($o.state != $v.state)
+           | mk(if $v.mounted then "mounted" elif $o.mounted then "unmounted" else "state" end; vinfo($v))]
+        + [$b[] | . as $v | ($a[] | select(.uuid == $v.uuid)) as $o | select($o.state == $v.state and $o.granted != $v.granted)
+           | mk(if $v.granted then "access_granted" else "access_revoked" end; {volume: $v.uuid, label: $v.label})]
+      end
   else [mk("changed"; {data: $c})] end;
 foreach (inputs | select(.event != null)) as $e ({prev: {}, out: []};
   .prev as $pv | ($e.event) as $t | ($pv[$t]) as $p | ($e.data) as $c
@@ -1179,9 +1206,9 @@ cmd_watch() {
     local topics=() ev=0 a list="" sep=""
     for a in "$@"; do
         case $a in
-            wifi|bt|audio|media) topics+=("$a") ;;
+            wifi|bt|audio|media|usb|storage) topics+=("$a") ;;
             --event|--events) ev=1 ;;
-            *) die 2 "watch: argumento desconocido «$a» (wifi, bt, audio, media, --event, --pretty)" ;;
+            *) die 2 "watch: argumento desconocido «$a» (wifi, bt, audio, media, usb, storage, --event, --pretty)" ;;
         esac
     done
     [ "${#topics[@]}" -gt 0 ] || topics=(wifi bt audio media)
@@ -1460,7 +1487,7 @@ install_in_guest() {
                 fi ;;
             nexo-usb)
                 if guest_has "$r" python3; then
-                    echo "   ↳ nexo-usb copiado. Dentro de $name:  nexo usb list"
+                    echo "   ↳ nexo-usb copiado. Dentro de $name:  nexo usb list  (Arduino, ESP32…)  ·  nexo usb mounts  (pendrives y discos)"
                 else
                     echo "   ↳ nexo-usb copiado, pero a $name le falta python3 (en Debian/Ubuntu: apt install python3)"
                 fi ;;
@@ -1582,6 +1609,7 @@ cmd_setup_guests() {
     fi
     if [ "$WITH_USB" = 1 ]; then
         echo "Para un Arduino o un ESP32 por USB (cable OTG), dentro de la distro:  nexo usb list"
+        echo "Para un pendrive o un disco duro por USB (cable OTG), dentro de la distro:  nexo usb mounts"
     fi
     if [ "$VERIFY" = 1 ] && [ "$VERIFY_SKIPPED" = 1 ]; then
         echo "• No comprobé qué copia de nexo ejecuta cada distro: no encuentro proot-distro en el PATH."
@@ -1772,13 +1800,14 @@ cmd_tools() {
 
 # ------------------------------------------------------------------ nexo usb (Arduino, ESP32 y adaptadores serie USB → nexo-usb)
 
-# Sin python3 solo se puede mirar qué ve Android: «nexo usb list». Lo demás (monitor, bridge…) es de nexo-usb y lo necesita.
+# Sin python3 solo se puede mirar qué ve Android: «nexo usb list» y «nexo usb mounts». Lo demás (monitor, bridge, ls, get, put…) es de
+# nexo-usb y lo necesita.
 usb_list_bash() {
     local a json=0 n
     for a in "$@"; do
         case $a in
             --json) json=1 ;;
-            *) die 1 "usb: sin python3 solo funciona «nexo usb list [--json]». Instálalo y vuelve a probar (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3)" ;;
+            *) die 1 "usb: sin python3 solo funciona «nexo usb list [--json]» y «nexo usb mounts [--json]». Instálalo y vuelve a probar (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3)" ;;
         esac
     done
     need usb.status
@@ -1801,6 +1830,31 @@ usb_list_bash() {
     return 0
 }
 
+# «nexo usb mounts» sin python3: los discos que Android montó (lo mismo que nexo-usb, sin la ayuda de «qué hacer ahora»).
+usb_mounts_bash() {
+    local a json=0 all=0 n
+    for a in "$@"; do
+        case $a in
+            --json) json=1 ;;
+            --all|-a) all=1 ;;
+            *) die 1 "usb: sin python3 solo funciona «nexo usb list [--json]» y «nexo usb mounts [--all] [--json]». Instálalo y vuelve a probar (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3)" ;;
+        esac
+    done
+    need storage.status
+    have_jq || { printf '%s\n' "$RESP"; return 0; }
+    if [ "$json" = 1 ]; then printf '%s' "$RESP" | jq '.data'; return 0; fi
+    n=$(printf '%s' "$RESP" | jq -r --argjson all "$all" '[(.data.volumes // [])[] | select($all == 1 or (.primary | not))] | length')
+    if [ "${n:-0}" = 0 ]; then
+        echo "No hay ningún disco USB. Enchúfalo con un cable OTG (en Xiaomi/HyperOS: Ajustes → Ajustes adicionales → OTG) y mira: nexo usb mounts"
+        return 0
+    fi
+    printf '%-10s %-16s %-14s %-9s %s\n' ID NOMBRE ESTADO ACCESO RUTA
+    printf '%s' "$RESP" | jq -r --argjson all "$all" '(.data.volumes // [])[] | select($all == 1 or (.primary | not)) | [(.uuid // "?"), ((.label // .uuid // "?") + (if .primary then " (interno)" else "" end)), (.state // "?"), (if .granted then "sí" else "no" end), (.path // "—")] | join("\t")' |
+        while IFS=$'\t' read -r id name state acc path; do printf '%-10s %-16s %-14s %-9s %s\n' "$id" "$name" "$state" "$acc" "$path"; done
+    echo "(Sin python3 no puedo copiar archivos ni pedir el acceso al disco: instálalo para usar «nexo usb access», «ls», «get» y «put».)"
+    return 0
+}
+
 # nexo usb … → nexo-usb. Todo lo que sigue es suyo, incluidas opciones como --json, --baud o --rfc2217.
 cmd_usb() {
     local bin
@@ -1809,15 +1863,18 @@ cmd_usb() {
     fi
     if ! have python3; then
         [ -n "$NEXO_TIMEOUT" ] || NEXO_TIMEOUT=8        # (este camino no pasa por el resto de main(), que es donde se fija)
-        case ${1:-} in list|ls) shift; usb_list_bash "$@"; exit $? ;; esac
-        die 1 "usb: «nexo usb ${1:-help}» necesita python3 (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3). Sin él solo funciona «nexo usb list»."
+        case ${1:-} in
+            list) shift; usb_list_bash "$@"; exit $? ;;
+            mounts) shift; usb_mounts_bash "$@"; exit $? ;;
+        esac
+        die 1 "usb: «nexo usb ${1:-help}» necesita python3 (Termux: pkg install python · Debian/Ubuntu: apt install python3 · Arch: pacman -S python · Alpine: apk add python3). Sin él solo funcionan «nexo usb list» y «nexo usb mounts»."
     fi
     # nexo-usb lee el mismo enlace que este cliente: se le dice cuál fue (y dónde está la app, si pasaste --host o --port).
     [ -n "$CONFIG_FILE" ] && [ -z "${NEXO_CONFIG:-}" ] && export NEXO_CONFIG=$CONFIG_FILE
     export NEXO_HOST NEXO_PORT
     # «nexo --json usb list»: el --json lo recogió este cliente; se lo pasamos a quien lo entiende.
     if [ "$FMT" = json ]; then
-        case ${1:-} in list|ls|status) set -- "$@" --json ;; esac
+        case ${1:-} in list|status|mounts|access|ls|stat|df|eject|get|put) set -- "$@" --json ;; esac
     fi
     exec python3 "$bin" "$@"
 }
@@ -2272,12 +2329,12 @@ cmd_doctor() {
     if ubin=$(find_usb_bin); then
         uver=$(copy_version "$ubin" usb)
         printf 'nexo-usb   %s %s\n' "$ubin" "${uver:-?}"
-        have python3 || echo "           ⚠ sin python3 solo funciona «nexo usb list» (en Termux: pkg install python)"
+        have python3 || echo "           ⚠ sin python3 solo funcionan «nexo usb list» y «nexo usb mounts» (en Termux: pkg install python)"
         if [ -n "$uver" ] && [ "$uver" != "$NEXO_VERSION" ]; then
             echo "           ⚠ es de otra versión que el cliente ($NEXO_VERSION): reinstala con el comando de la app (o: nexo update)"
         fi
     else
-        printf 'nexo-usb   no instalado (opcional: Arduino, ESP32 y adaptadores serie USB; se instala con el comando de la app)\n'
+        printf 'nexo-usb   no instalado (opcional: Arduino, ESP32, adaptadores serie y discos USB; se instala con el comando de la app)\n'
     fi
     if devtcp_ok; then echo "/dev/tcp   sí"; else echo "/dev/tcp   no (se usará python3)"; fi
 
@@ -2317,7 +2374,7 @@ cmd_doctor() {
     if have_jq && call_try hello; then
         h=$RESP
         printf '%s' "$h" | jq -r '.data | "app        \(.version) · protocolo \(.proto).\(.minor // 1) · \(.device) · Android \(.android_sdk)"'
-        printf '%s' "$h" | jq -r '.data | if has("usb") then "usb        este móvil \(if .usb then "tiene" else "NO tiene" end) USB host (OTG)\(if .usb then ": nexo usb list" else "" end)" else empty end'
+        printf '%s' "$h" | jq -r '.data | if has("usb") then "usb        este móvil \(if .usb then "tiene" else "NO tiene" end) USB host (OTG)\(if .usb then ": nexo usb list · nexo usb mounts" else "" end)" else empty end'
         printf '%s' "$h" | jq -r '.data | if has("listener") then "medios     acceso a notificaciones: \(if .listener then "sí" else "NO (Nexo → Permisos → Acceso a notificaciones; hace falta para «nexo media»)" end)" else empty end'
     fi
     if have_jq && call_try wifi.status; then
@@ -2341,7 +2398,7 @@ cmd_version() {
         return 1
     fi
     if [ "$minor" -lt "$CLIENT_MINOR" ]; then
-        for c in audio media wifi.saved bt.info logs usb; do
+        for c in audio media wifi.saved bt.info logs usb storage; do
             if printf '%s' "$RESP" | jq -e --arg c "$c" '(.data.commands // []) | any(.[]; startswith($c))' >/dev/null 2>&1; then :; else missing+="$c "; fi
         done
         echo "✘ La app es más antigua que el cliente: faltan ${missing:-funciones nuevas}. Instala el APK nuevo (se actualiza encima, sin perder el enlace)."

@@ -86,6 +86,17 @@
         </activity>
 
         <!--
+            Almacenamiento USB (pendrives, discos): el usuario elige el disco en el selector de carpetas de Android y Nexo conserva ese permiso.
+            Se abre desde la notificación «Nexo: acceso al disco…» o el botón de la pantalla; no pide permisos de almacenamiento amplios.
+        -->
+        <activity
+            android:name=".StorageGrantActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Nexo.Transparent" />
+
+        <!--
             Android solo deja ver la música de otras apps (título, botones, carátula) a quien tenga concedido el
             «acceso a notificaciones». En esta versión Nexo NO lee ni guarda notificaciones: solo usa esa llave
             para las sesiones de medios. El usuario lo concede una vez en los ajustes de Android.

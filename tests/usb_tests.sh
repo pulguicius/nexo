@@ -1,4 +1,5 @@
-# Pruebas de nexo-usb 0.4.1 (monitor serie, puente con PTY / RFC 2217 / TCP crudo, permisos, desenchufar y volver a enchufar).
+# Pruebas de la parte SERIE de nexo-usb (la 0.4.1): monitor serie, puente con PTY / RFC 2217 / TCP crudo, permisos, desenchufar y volver a enchufar.
+# (Los discos USB de la 0.4.2 están en tests/usb_storage_tests.sh.)
 # No se ejecuta solo: lo carga tests/run_tests.sh (usa sus ok/bad/run/has/…). Necesita: bash, python3, jq.
 #   NEXO_TESTS_ONLY=usb bash tests/run_tests.sh      ← solo estas (más rápido para trabajar en ellas)
 #

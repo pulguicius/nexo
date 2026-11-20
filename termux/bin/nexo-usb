@@ -1,49 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""nexo-usb: los adaptadores serie USB del móvil (Arduino, ESP32, CH340, CP210x, FTDI…) como puertos serie de tu distro.
+"""nexo-usb: los dispositivos USB del móvil dentro de tu distro: adaptadores serie (Arduino, ESP32, CH340, CP210x, FTDI…) y discos
+(pendrives, discos duros y SSD).
 
 Es el cuarto programa de Nexo (los otros: el cliente `nexo`, `nexo-dbus` y `nexo-tools`). Una distro de proot no puede abrir
-/dev/bus/usb ni montar nada: el USB es de Android. La app Nexo abre el adaptador con la API oficial USB Host (UsbManager,
-con el permiso que tú das en el aviso de Android) y este programa se lo enseña a tu distro de tres maneras:
+/dev/bus/usb ni montar nada: el USB es de Android. La app Nexo trabaja con las APIs oficiales y este programa se lo enseña a tu distro.
 
+SERIE (la app abre el adaptador con UsbManager, con el permiso que tú das en el aviso de Android):
   · monitor  → un monitor serie en la terminal (como el de Arduino IDE, miniterm o picocom).
   · bridge   → un puerto serie falso (un PTY) para avrdude, arduino-cli, PlatformIO, minicom, screen, pyserial…
                y, si quieres, un servidor RFC2217 (esptool, pyserial: llevan DTR y RTS de verdad)
                y un TCP crudo (avrdude con «net:»).
   · list, permit, status, stop, reset
 
-Solo necesita python3 (3.7 o más) y la biblioteca estándar. Habla con la app por el mismo protocolo que el cliente
-(docs/PROTOCOLO.md, revisión 1.3): 127.0.0.1, JSON por línea y token.
+DISCOS (Android monta el disco por su cuenta; la app entra en él con el Storage Access Framework, en la carpeta que TÚ eliges en el
+selector del sistema, y este programa le pide cada operación; si este proceso ya ve la ruta del disco —root, Shizuku—, trabaja directo):
+  · mounts, access, ls, stat, cat, get, put, mkdir, rm, mv, df, eject
 
-Uso:  nexo-usb list|permit|monitor|bridge|status|stop|reset|version|help        (también:  nexo usb …)
+Solo necesita python3 (3.7 o más) y la biblioteca estándar. Habla con la app por el mismo protocolo que el cliente
+(docs/PROTOCOLO.md, revisión 1.4): 127.0.0.1, JSON por línea y token.
+
+Uso:  nexo-usb COMANDO …        (también:  nexo usb COMANDO …; la lista está en «nexo usb help»)
 """
 
+import base64
 import collections
 import ctypes
 import errno
 import fcntl
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import select
+import shutil
 import signal
 import socket
+import stat as stat_mod
 import struct
 import sys
 import termios
 import threading
 import time
 
-NEXO_USB_VERSION = "0.4.1"
+NEXO_USB_VERSION = "0.4.2"
 CLIENT_NAME = "nexo-usb/" + NEXO_USB_VERSION
 
 EXIT_ERR, EXIT_USAGE, EXIT_TOUCH, EXIT_NODEV, EXIT_GONE = 1, 2, 3, 4, 5
 EXIT_NOAPP, EXIT_TOKEN, EXIT_TIMEOUT = 10, 11, 12
 
-HELP = """nexo usb — los adaptadores serie USB del móvil (Arduino, ESP32, CH340, CP210x, FTDI…) dentro de tu distro
+HELP = """nexo usb — los dispositivos USB del móvil dentro de tu distro: adaptadores serie (Arduino, ESP32, CH340, CP210x, FTDI…) y discos
 
-Uso: nexo usb COMANDO [DISPOSITIVO] [opciones]
+Uso: nexo usb COMANDO [DISPOSITIVO|RUTA…] [opciones]
 
+SERIE (Arduino, ESP32, adaptadores):
   list [--json|--lsusb|--all]    Lo que Android ve por USB y qué sirve como puerto serie
   permit [DISPOSITIVO]           Pide a Android el permiso para usarlo (sale un aviso en la pantalla del móvil)
   monitor [DISPOSITIVO]          Monitor serie en la terminal (salir: Ctrl+])
@@ -51,6 +62,16 @@ Uso: nexo usb COMANDO [DISPOSITIVO] [opciones]
   status [--json]                Puentes que están en marcha
   stop [NOMBRE…|--all]           Cierra puentes
   reset [NOMBRE]                 Reinicia la placa (pulso en DTR) de un puente en marcha
+
+DISCOS (pendrives, discos duros, SSD):
+  mounts [--all] [--json] [--wait S]  Los discos que Android montó y si Nexo puede entrar (--all: también el almacenamiento interno)
+  access [DISCO] [--revoke]      Android te enseña su selector de carpetas: elige el disco (se pregunta una sola vez)
+  ls [-lahR] [RUTA…]             Lista una carpeta del disco        stat RUTA…      Tipo, tamaño y fecha
+  cat RUTA…                      Escribe archivos del disco en la salida estándar
+  get [-rfn] ORIGEN… DESTINO     Copia del disco a tu distro        put [-rfn] ORIGEN… DESTINO     Copia de tu distro al disco
+  mkdir [-p] RUTA…               rm [-rf] RUTA…                     mv [-f] ORIGEN… DESTINO        (todo dentro del mismo disco)
+  df [DISCO]                     Espacio total, usado y libre
+  eject [DISCO]                  Cierra los archivos abiertos y pide a Android que lo expulse
   version | help
 
 DISPOSITIVO: el id de «nexo usb list», un VID:PID (2341:0043) o parte del nombre o del número de serie.
@@ -69,7 +90,19 @@ bridge:   --link RUTA (dónde dejar el puerto; por omisión en ~/.local/state/ne
           --name NOMBRE  -d|--detach (segundo plano)  --no-reconnect (salir si desenchufas)  --wait
           --dtr on|off --rts on|off (estado inicial)  --perm-timeout S (60)  --log ARCHIVO
 
-Códigos de salida: 0 bien · 1 error · 2 uso · 3 hace falta un toque en el móvil (permiso) · 4 no hay dispositivo
+Discos: una RUTA es de la raíz del disco: «/Música/rock», o con el disco delante: «PENDRIVE:/Música». Sin disco se usa el único
+montado (si hay varios: --vol NOMBRE|UUID, o el prefijo NOMBRE:). El DISCO es su UUID, su nombre o el principio de cualquiera.
+  Todas:      --vol DISCO  --via app|direct|auto (app = por Nexo; direct = por su ruta, si este proceso la ve; auto lo decide)
+              --no-ask (no abrir el selector de Android si falta el acceso)  --timeout S (espera al selector: 120)
+  ls:         -l detalle  -a ocultos  -h tamaños legibles  -R recursivo  --json
+  get / put:  -r carpetas enteras (un ORIGEN que es carpeta y acaba en «/» copia lo de dentro, no la carpeta: como rsync)
+              -f sustituye lo que ya existe  -n salta lo que ya existe  --verify (relee y compara SHA-256)
+              -q sin avisos  --json  put además: --fix-names (cambia por «_» lo que el disco no admite: " * : < > ? \\ |)
+              Sin -f ni -n, algo que ya existe es un fallo (y se sigue con lo demás). Se escribe a «.nexo-part-…» y se renombra al final.
+  rm:         -r carpetas con todo lo que llevan  -f ignora lo que no existe  -v      mv: -f sustituye  -v      mkdir: -p
+  eject:      sale con 0 solo si Android lo expulsó: si no, dice cómo hacerlo a mano antes de desenchufar
+
+Códigos de salida: 0 bien · 1 error · 2 uso · 3 hace falta un toque en el móvil (permiso o selector) · 4 no hay dispositivo o disco
                    5 se desenchufó · 10 sin conexión con la app · 11 token · 12 sin respuesta a tiempo
 """
 
@@ -215,6 +248,7 @@ def parse_args(argv, spec, hint="Prueba: nexo usb help"):
     """spec: {"--baud": ("baud", int), "-b": ("baud", int), "--no-reset": ("no_reset", True)} → (opciones, posicionales).
     Un True en lugar de un tipo marca una opción sin valor. Acepta --opción=valor y -b9600."""
     opts, pos = {}, []
+    argv = list(argv)
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -234,6 +268,9 @@ def parse_args(argv, spec, hint="Prueba: nexo usb help"):
             name = a[:2]
             if len(a) > 2:
                 val = a[2:]
+                if name in spec and spec[name][1] is True:       # «-la» = «-l -a»
+                    argv.insert(i, "-" + val)
+                    val = None
         if name not in spec:
             raise UsbError("opción desconocida «%s». %s" % (a, hint), EXIT_USAGE)
         key, kind = spec[name]
@@ -545,7 +582,8 @@ class Link(object):
             except OSError as e:
                 raise BridgeError("no_connection", "No pude escribir a la app Nexo: %s" % e)
 
-    def call(self, cmd, timeout=8.0, **params):
+    def call_async(self, cmd, **params):
+        """Envía la petición y devuelve ya un Pending: así se pueden tener varias en vuelo (la app las contesta una a una, en orden)."""
         with self._ilock:
             self._ids += 1
             rid = "c%d" % self._ids
@@ -556,13 +594,31 @@ class Link(object):
         req["cmd"] = cmd
         try:
             self._send(req)
+        except BaseException:
+            self._waiters.pop(rid, None)
+            raise
+        return Pending(self, rid, w)
+
+    def call(self, cmd, timeout=8.0, **params):
+        return self.call_async(cmd, **params).result(timeout)
+
+
+class Pending(object):
+    """Una petición ya enviada cuya respuesta aún no llegó."""
+
+    def __init__(self, link, rid, waiter):
+        self.link, self.rid, self.waiter = link, rid, waiter
+
+    def result(self, timeout=8.0):
+        w = self.waiter
+        try:
             if not w[0].wait(timeout):
                 raise BridgeError("timeout", "La app no contestó a tiempo (¿la congeló Android?)")
         finally:
-            self._waiters.pop(rid, None)
+            self.link._waiters.pop(self.rid, None)
         r = w[1]
         if r is None:
-            raise BridgeError("no_connection", "Se perdió la conexión con la app Nexo (%s)" % (self.reason or "?"))
+            raise BridgeError("no_connection", "Se perdió la conexión con la app Nexo (%s)" % (self.link.reason or "?"))
         if r.get("ok"):
             return r.get("data") or {}
         extra = dict((k, v) for k, v in r.items() if k not in ("id", "ok", "error", "message"))
@@ -612,7 +668,7 @@ def explain(e):
     return UsbError("%s (%s)" % (m, c), EXIT_ERR)
 
 
-def connect_app(on_event=None):
+def connect_app(on_event=None, need="usb"):
     cfg = load_config()
     if not cfg["NEXO_TOKEN"]:
         raise UsbError("No hay token. Pega en Termux el comando de instalación que copia la app Nexo, o usa: nexo pair TOKEN", EXIT_TOKEN)
@@ -620,7 +676,12 @@ def connect_app(on_event=None):
         raise UsbError("Puerto inválido: %s" % cfg["NEXO_PORT"], EXIT_USAGE)
     link = Link(cfg, on_event)
     link.connect()
-    if not usb_capable(link.info):
+    if need == "storage":
+        if not storage_capable(link.info):
+            link.close()
+            raise UsbError("Esta versión de la app Nexo (%s) no sabe de discos USB. Instala el APK de la 0.4.2 o más nuevo "
+                           "(se actualiza encima, sin perder el enlace)." % link.info.get("version", "?"), EXIT_ERR)
+    elif not usb_capable(link.info):
         link.close()
         raise UsbError("Esta versión de la app Nexo (%s) no sabe de USB. Instala el APK de la 0.4.1 o más nuevo "
                        "(se actualiza encima, sin perder el enlace)." % link.info.get("version", "?"), EXIT_ERR)
@@ -717,7 +778,7 @@ def cmd_list(argv):
     elif any(d.get("serial_capable") for d in devs):
         sys.stdout.write("Listo para: nexo usb monitor   ·   nexo usb bridge\n")
     elif not o.get("all"):
-        sys.stdout.write("Ninguno sirve como puerto serie (los de almacenamiento llegan en la 0.4.2).\n")
+        sys.stdout.write("Ninguno sirve como puerto serie (los pendrives y discos: nexo usb mounts).\n")
     return 0
 
 
@@ -2403,6 +2464,1724 @@ def cmd_bridge(argv):
     return run_bridge(opts, FgNotifier())
 
 
+# ----------------------------------------------------------------------------------------------------- discos USB
+
+# ----------------------------------------------------------------------------------------------------- discos USB: archivos
+#
+# Android monta el disco por su cuenta (lo hace vold: ni se puede ni se debe repetir desde proot) y lo enseña como un «volumen».
+# Hay dos maneras de entrar en él y las dos dan los mismos resultados (las pruebas lo comparan):
+#   · por la app (lo normal): Nexo abre el disco con el Storage Access Framework de Android, dentro de la carpeta que TÚ elegiste en el
+#     selector del sistema (nexo usb access), y este programa le pide cada operación por el protocolo (storage.*).
+#   · directa: si este proceso ya puede ver la ruta del disco (/storage/XXXX-XXXX) —con root, con Shizuku/rish, o porque el Android de
+#     ese móvil lo permite— trabaja con ella sin pasar por la app. Nunca sale de la raíz del disco ni sigue enlaces simbólicos.
+
+READ_CHUNK = 49152           # = StorageLimits.READ_MAX en la app: lo máximo que devuelve un storage.read
+WRITE_CHUNK = 32768          # = StorageLimits.WRITE_MAX: lo máximo que admite un storage.write
+LIST_PAGE = 2000             # = StorageLimits.LIST_MAX: lo máximo que devuelve un storage.list
+PIPE_DEPTH = 3               # peticiones en vuelo a la vez al copiar (la app las atiende una a una, pero así no espera entre trozo y trozo)
+PART_PREFIX = ".nexo-part-"  # los archivos se escriben con un nombre así (+ pid y número) y se renombran al terminar: nunca queda a medias uno con el nombre bueno
+BAD_NEW_CHARS = '"*:<>?\\|'  # Android cambia estos por «_» al crear algo en un disco: se rechazan antes (como StoragePath.checkNewName)
+MAX_PATH_CHARS = 4096
+TOO_BIG_HINT = " Formatea el disco en exFAT o parte el archivo (split -b 4000M)."
+MAX_NAME_BYTES = 255
+# Fallos que paran todo (no tiene sentido seguir con el siguiente archivo); el resto se anota y se sigue
+FATAL_FS = ("no_access", "unavailable", "gone", "no_space", "read_only", "timeout", "no_connection", "limit", "local_full")
+
+STATE_ES = {"mounted": "montado", "mounted_ro": "solo lectura", "unmounted": "no montado", "checking": "comprobando",
+            "ejecting": "expulsando", "removed": "quitado", "bad_removal": "quitado sin expulsar", "unmountable": "no se puede montar",
+            "nofs": "sin sistema de archivos", "shared": "compartido con un PC"}
+
+
+class FsError(Exception):
+    """Un fallo al trabajar con un disco. `code` son los de la app (docs/PROTOCOLO.md) más «gone» (el disco desapareció a mitad),
+    «local» (falló algo de este lado: una carpeta o un archivo de tu distro) y los de red (timeout, no_connection)."""
+
+    def __init__(self, code, message, extra=None):
+        Exception.__init__(self, message)
+        self.code = code
+        self.message = message
+        self.extra = extra or {}
+
+
+def check_name(name):
+    if not name:
+        raise FsError("bad_path", "Un nombre está vacío")
+    if name in (".", ".."):
+        raise FsError("bad_path", "«%s» no se permite en una ruta" % name)
+    for ch in name:
+        if ch < " " or ch == "\x7f":
+            raise FsError("bad_path", "Un nombre lleva un carácter de control")
+    try:
+        n = len(name.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise FsError("bad_path", "Un nombre no es texto UTF-8 válido: %r" % name)
+    if n > MAX_NAME_BYTES:
+        raise FsError("bad_path", "Un nombre pasa de %d bytes" % MAX_NAME_BYTES)
+
+
+def check_new_name(name):
+    for ch in name:
+        if ch in BAD_NEW_CHARS:
+            raise FsError("bad_path", "Los discos USB no admiten el carácter «%s» en un nombre nuevo: «%s» (usa otro nombre)" % (ch, name))
+    if name.endswith(".") or name.endswith(" "):
+        raise FsError("bad_path", "Un nombre nuevo no puede acabar en punto ni en espacio: «%s»" % name)
+
+
+def parse_path(path):
+    """«/Música/rock/» → ["Música", "rock"]. Rechaza «..», caracteres de control y nombres larguísimos (igual que la app)."""
+    if len(path) > MAX_PATH_CHARS:
+        raise FsError("bad_path", "La ruta es demasiado larga")
+    out = []
+    for seg in path.split("/"):
+        if seg in ("", "."):
+            continue
+        check_name(seg)
+        out.append(seg)
+    return out
+
+
+def join_path(parts):
+    return "/" + "/".join(parts)
+
+
+def human(n):
+    n = float(n)
+    for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or u == "TiB":
+            return ("%d %s" % (n, u)) if u == "B" else ("%.1f %s" % (n, u))
+        n /= 1024.0
+
+
+def when(ms):
+    if not ms:
+        return "—"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000.0))
+    except (OverflowError, OSError, ValueError):
+        return "—"
+
+
+def out(text):
+    """A la salida estándar, sin que un nombre raro rompa el programa."""
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(text.encode("utf-8", "replace"))
+
+
+def os_error(e, writing=False):
+    n = e.errno
+    msg = e.strerror or str(e)
+    if n == errno.ENOENT:
+        return FsError("not_found", msg)
+    if n == errno.ENOTDIR:
+        return FsError("not_dir", msg)
+    if n == errno.EISDIR:
+        return FsError("is_dir", msg)
+    if n == errno.EEXIST:
+        return FsError("exists", msg)
+    if n == errno.ENOTEMPTY:
+        return FsError("not_empty", msg)
+    if n in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+        return FsError("no_space", "El disco está lleno")
+    if n == errno.EFBIG:
+        return FsError("too_big", "El sistema de archivos del disco no admite un archivo tan grande (FAT32: máximo 4 GB)." + TOO_BIG_HINT)
+    if n == errno.EROFS:
+        return FsError("read_only", "El disco está en solo lectura")
+    if n in (errno.EACCES, errno.EPERM):
+        return FsError("denied", ("Sin permiso para escribir ahí: %s" if writing else "Sin permiso para leer: %s") % msg)
+    if n in (errno.ENODEV, errno.ENXIO, errno.ESTALE):
+        return FsError("gone", msg)
+    return FsError("io_error", msg)
+
+
+def app_error(e, gone=False):
+    """Un BridgeError (respuesta con ok=false o conexión caída) → FsError. `gone`: un «not_found» al leer o escribir un archivo ya
+    abierto quiere decir que Android cerró el archivo porque el disco se fue."""
+    c = e.code
+    if c in ("timeout", "no_connection"):
+        return FsError(c, e.message)
+    if c == "not_found" and gone:
+        return FsError("gone", e.message, e.extra)
+    if c == "too_big":
+        return FsError(c, e.message.rstrip(".") + "." + TOO_BIG_HINT, e.extra)
+    return FsError(c, e.message, e.extra)
+
+
+def fs_to_usb(e):
+    """Un FsError → el UsbError (mensaje y código de salida) que se le cuenta al usuario."""
+    c, m, x = e.code, e.message, e.extra
+    vol = x.get("volume")
+    if c == "no_access":
+        return UsbError("Nexo no tiene acceso a ese disco (o Android se lo quitó). Pídelo con:  nexo usb access%s  y elige el disco en la "
+                        "pantalla del móvil." % ((" " + vol) if vol else ""), EXIT_TOUCH)
+    if c == "unavailable":
+        return UsbError("%s. Desenchúfalo y vuélvelo a enchufar; si Android sigue sin montarlo, puede que su sistema de archivos no sea "
+                        "compatible (exFAT y FAT32 casi siempre lo son; NTFS y ext4 depende del móvil)." % m.rstrip("."), EXIT_NODEV)
+    if c == "gone":
+        return UsbError("Se perdió el disco durante la operación (¿lo desenchufaste o lo expulsaste?). Lo que se estaba copiando puede "
+                        "haber quedado a medias: busca archivos «%s*» en el disco para borrarlos." % PART_PREFIX, EXIT_GONE)
+    if c == "timeout":
+        return UsbError(m, EXIT_TIMEOUT)
+    if c == "no_connection":
+        return UsbError(m, EXIT_NOAPP)
+    if c in ("bad_request", "bad_path"):
+        return UsbError(m, EXIT_USAGE)
+    if c in ("local", "local_full"):
+        return UsbError(m, EXIT_ERR)
+    if c == "unknown_command":
+        return UsbError("Esta versión de la app Nexo no sabe de discos USB. Instala el APK de la 0.4.2 o más nuevo (se actualiza encima, "
+                        "sin perder el enlace).", EXIT_ERR)
+    if c == "read_only":
+        return UsbError("%s. Android lo montó así: ¿el pendrive tiene el interruptor de protección, o hay que repararlo en un PC?" % m.rstrip("."),
+                        EXIT_ERR)
+    return UsbError(m, EXIT_ERR)
+
+
+def safe_local_name(name):
+    return bool(name) and name not in (".", "..") and "/" not in name and "\x00" not in name
+
+
+def close_quiet(f):
+    try:
+        f.close()
+    except Exception:
+        pass
+
+
+def remove_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def delete_quiet(fs, parts):
+    try:
+        fs.delete(parts)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------------------------------- discos USB: las dos maneras de entrar
+
+
+class Done(object):
+    """Lo mismo que una respuesta pendiente de la app, pero ya resuelta (la manera directa no espera a nadie)."""
+
+    def __init__(self, v):
+        self.v = v
+
+    def result(self):
+        return self.v
+
+
+class AppPending(object):
+    def __init__(self, pend, after=None, timeout=30.0):
+        self.pend, self.after, self.timeout = pend, after, timeout
+
+    def result(self):
+        try:
+            d = self.pend.result(self.timeout)
+        except BridgeError as e:
+            raise app_error(e, gone=True)
+        return self.after(d) if self.after is not None else d
+
+
+class AppFile(object):
+    """Un archivo abierto en la app (storage.open): se lee y se escribe por trozos."""
+
+    def __init__(self, fs, handle, size, writable):
+        self.fs, self.h, self.size, self.writable, self.closed = fs, handle, size, writable, False
+
+    def _start(self, cmd, **p):
+        try:
+            return self.fs.link.call_async(cmd, **p)
+        except BridgeError as e:
+            raise app_error(e, gone=True)
+
+    def read_async(self, off, n):
+        return AppPending(self._start("storage.read", handle=self.h, offset=off, len=n),
+                          lambda d: base64.b64decode(d.get("data") or ""))
+
+    def read(self, off, n):
+        return self.read_async(off, n).result()
+
+    def write_async(self, off, data):
+        return AppPending(self._start("storage.write", handle=self.h, offset=off, data=base64.b64encode(data).decode("ascii")),
+                          lambda d: int(d.get("n", 0)))
+
+    def write(self, off, data):
+        return self.write_async(off, data).result()
+
+    def close(self):
+        """Cierra el archivo (si es de escritura, la app lo sincroniza antes: si el disco falla, falla aquí)."""
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.fs.link.call("storage.close", 30.0, handle=self.h)
+        except BridgeError as e:
+            raise app_error(e, gone=True)
+
+
+class AppFs(object):
+    """Entrar en el disco por la app de Nexo (storage.*)."""
+
+    kind = "app"
+
+    def __init__(self, link, vol):
+        self.link = link
+        self.uuid = vol["uuid"]
+        self.label = vol.get("label") or vol["uuid"]
+        self.read_only = bool(vol.get("readonly"))
+
+    def _call(self, cmd, timeout=30.0, **p):
+        try:
+            return self.link.call(cmd, timeout, volume=self.uuid, **p)
+        except BridgeError as e:
+            raise app_error(e)
+
+    def stat(self, parts):
+        return self._call("storage.stat", path=join_path(parts))
+
+    def stat_opt(self, parts):
+        try:
+            return self.stat(parts)
+        except FsError as e:
+            if e.code == "not_found":
+                return None
+            raise
+
+    def list(self, parts):
+        out_, off = [], 0
+        while True:
+            d = self._call("storage.list", 40.0, path=join_path(parts), offset=off, limit=LIST_PAGE)
+            ents = d.get("entries") or []
+            out_.extend(ents)
+            off += len(ents)
+            if not ents or off >= int(d.get("total") or 0):
+                return out_
+
+    def open(self, parts, mode="r", create=None, truncate=None, exclusive=None):
+        d = self._call("storage.open", path=join_path(parts), mode=mode, create=create, truncate=truncate, exclusive=exclusive)
+        return AppFile(self, d["handle"], int(d.get("size") or 0), bool(d.get("writable")))
+
+    def mkdir(self, parts, parents=False):
+        self._call("storage.mkdir", path=join_path(parts), parents=bool(parents))
+
+    def delete(self, parts):
+        self._call("storage.delete", path=join_path(parts))
+
+    def rename(self, src, dst, overwrite=False):
+        self._call("storage.rename", overwrite=bool(overwrite), **{"from": join_path(src), "to": join_path(dst)})
+
+
+class DirectFile(object):
+    def __init__(self, fd, writable):
+        self.fd, self.writable, self.closed = fd, writable, False
+        self.size = os.fstat(fd).st_size
+
+    def read(self, off, n):
+        try:
+            return os.pread(self.fd, n, off)
+        except OSError as e:
+            raise os_error(e)
+
+    def read_async(self, off, n):
+        return Done(self.read(off, n))
+
+    def write(self, off, data):
+        done = 0
+        try:
+            while done < len(data):
+                k = os.pwrite(self.fd, data[done:], off + done)
+                if k <= 0:
+                    raise FsError("io_error", "El disco no aceptó más datos")
+                done += k
+        except OSError as e:
+            raise os_error(e, True)
+        return done
+
+    def write_async(self, off, data):
+        return Done(self.write(off, data))
+
+    def truncate(self, n):
+        try:
+            os.ftruncate(self.fd, n)
+        except OSError as e:
+            raise os_error(e, True)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        err = None
+        try:
+            if self.writable:
+                os.fsync(self.fd)
+        except OSError as e:
+            err = os_error(e, True)
+        finally:
+            os.close(self.fd)
+        if err is not None:
+            raise err
+
+
+class DirectFs(object):
+    """Entrar en el disco por su ruta, sin la app: las mismas comprobaciones y los mismos errores que StorageOps (la app), sobre
+    la carpeta real. Nunca sale de la raíz del disco y no sigue enlaces simbólicos (en FAT/exFAT no los hay: es como si no existieran)."""
+
+    kind = "directo"
+
+    def __init__(self, vol):
+        self.root = vol["path"]
+        self.label = vol.get("label") or vol["uuid"]
+        self.read_only = bool(vol.get("readonly"))
+
+    def _need_writable(self):
+        if self.read_only:
+            raise FsError("read_only", "El disco está en solo lectura")
+
+    @staticmethod
+    def _nf(parts):
+        return FsError("not_found", "No existe: " + join_path(parts))
+
+    def _p(self, parts):
+        p = self.root
+        for seg in parts:
+            p = os.path.join(p, seg)
+            try:
+                if stat_mod.S_ISLNK(os.lstat(p).st_mode):
+                    return None
+            except OSError:
+                return None
+        return p
+
+    def _entry(self, p, name):
+        try:
+            s = os.lstat(p)
+        except OSError:
+            return None
+        if stat_mod.S_ISDIR(s.st_mode):
+            isdir = True
+        elif stat_mod.S_ISREG(s.st_mode):
+            isdir = False
+        else:
+            return None
+        e = {"name": name, "type": "dir" if isdir else "file", "size": 0 if isdir else s.st_size, "mtime_ms": int(s.st_mtime * 1000)}
+        if not isdir:
+            e["mime"] = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        e["writable"] = (not self.read_only) and (isdir or os.access(p, os.W_OK))
+        return e
+
+    def stat_opt(self, parts):
+        if not parts:
+            return {"name": "", "type": "dir", "size": 0, "mtime_ms": 0, "writable": not self.read_only}
+        p = self._p(parts)
+        return None if p is None else self._entry(p, parts[-1])
+
+    def stat(self, parts):
+        e = self.stat_opt(parts)
+        if e is None:
+            raise self._nf(parts)
+        return e
+
+    def _check_parent_dir(self, parent):
+        if not parent:
+            return
+        e = self.stat_opt(parent)
+        if e is None:
+            raise self._nf(parent)
+        if e["type"] != "dir":
+            raise FsError("not_dir", "No es una carpeta: " + join_path(parent))
+
+    def list(self, parts):
+        if parts:
+            e = self.stat(parts)
+            if e["type"] != "dir":
+                raise FsError("not_dir", "No es una carpeta: " + join_path(parts))
+        p = self._p(parts)
+        try:
+            names = os.listdir(p)
+        except OSError as ex:
+            raise os_error(ex)
+        out_ = []
+        for name in names:
+            e = self._entry(os.path.join(p, name), name)
+            if e is not None:
+                out_.append(e)
+        out_.sort(key=lambda e: (e["type"] != "dir", e["name"].lower(), e["name"]))
+        return out_
+
+    def open(self, parts, mode="r", create=None, truncate=None, exclusive=None):
+        write = mode != "r"
+        if create is None:
+            create = mode in ("w", "a")
+        if truncate is None:
+            truncate = mode == "w"
+        if not parts:
+            raise FsError("is_dir", "La raíz del disco es una carpeta")
+        if write:
+            self._need_writable()
+        e = self.stat_opt(parts)
+        if e is not None and e["type"] == "dir":
+            raise FsError("is_dir", "Es una carpeta: " + join_path(parts))
+        if e is not None and write and exclusive:
+            raise FsError("exists", "Ya existe: " + join_path(parts))
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            if e is None:
+                if not write or not create:
+                    raise self._nf(parts)
+                parent = parts[:-1]
+                self._check_parent_dir(parent)
+                check_new_name(parts[-1])
+                fd = os.open(os.path.join(self._p(parent), parts[-1]), os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow, 0o644)
+            else:
+                if write and not e["writable"]:
+                    raise FsError("read_only", "No se puede escribir en: " + join_path(parts))
+                fd = os.open(self._p(parts), (os.O_RDWR if write else os.O_RDONLY) | nofollow)
+        except OSError as ex:
+            raise os_error(ex, write)
+        f = DirectFile(fd, write)
+        if write and truncate:
+            try:
+                f.truncate(0)
+            except BaseException:
+                close_quiet(f)
+                raise
+        return f
+
+    def mkdir(self, parts, parents=False):
+        self._need_writable()
+        if not parts:
+            if parents:
+                return
+            raise FsError("exists", "La raíz del disco ya existe")
+        e = self.stat_opt(parts)
+        if e is not None:
+            if e["type"] == "dir" and parents:
+                return
+            raise FsError("exists", "Ya existe: " + join_path(parts))
+        parent = parts[:-1]
+        if parent:
+            pe = self.stat_opt(parent)
+            if pe is None:
+                if not parents:
+                    raise self._nf(parent)
+                first = len(parts) - 1               # antes de crear nada, ningún nivel nuevo puede llevar un nombre que el disco no admita
+                while first > 0 and self.stat_opt(parts[:first]) is None:
+                    first -= 1
+                for seg in parts[first:]:
+                    check_new_name(seg)
+                self.mkdir(parent, True)
+            elif pe["type"] != "dir":
+                raise FsError("not_dir", "No es una carpeta: " + join_path(parent))
+        check_new_name(parts[-1])
+        try:
+            os.mkdir(os.path.join(self._p(parent), parts[-1]), 0o755)
+        except OSError as ex:
+            raise os_error(ex, True)
+
+    def delete(self, parts):
+        self._need_writable()
+        if not parts:
+            raise FsError("bad_path", "La raíz del disco no se borra")
+        e = self.stat(parts)
+        try:
+            if e["type"] == "dir":
+                if os.listdir(self._p(parts)):
+                    raise FsError("not_empty", "La carpeta no está vacía: " + join_path(parts))
+                os.rmdir(self._p(parts))
+            else:
+                os.unlink(self._p(parts))
+        except OSError as ex:
+            raise os_error(ex, True)
+
+    def rename(self, src_parts, dst_parts, overwrite=False):
+        self._need_writable()
+        if not src_parts or not dst_parts:
+            raise FsError("bad_path", "La raíz del disco no se mueve ni se sustituye")
+        if src_parts == dst_parts:
+            return
+        if len(dst_parts) > len(src_parts) and dst_parts[:len(src_parts)] == src_parts:
+            raise FsError("bad_path", "No se puede mover una carpeta dentro de sí misma")
+        check_new_name(dst_parts[-1])
+        src = self.stat(src_parts)
+        dst = self.stat_opt(dst_parts)
+        if dst is not None:
+            same = False
+            try:
+                same = os.path.samefile(self._p(src_parts), self._p(dst_parts))
+            except OSError:
+                pass
+            if not same:
+                if not overwrite:
+                    raise FsError("exists", "Ya existe: " + join_path(dst_parts))
+                if dst["type"] == "dir" and src["type"] != "dir":
+                    raise FsError("is_dir", "El destino es una carpeta: " + join_path(dst_parts))
+                if dst["type"] != "dir" and src["type"] == "dir":
+                    raise FsError("not_dir", "El destino es un archivo: " + join_path(dst_parts))
+                self.delete(dst_parts)
+        self._check_parent_dir(dst_parts[:-1])
+        try:
+            os.rename(self._p(src_parts), os.path.join(self._p(dst_parts[:-1]), dst_parts[-1]))
+        except OSError as ex:
+            raise os_error(ex, True)
+
+# ----------------------------------------------------------------------------------------------------- discos USB: elegir el disco
+
+STATE_HELP = {
+    "checking": "Android lo está comprobando: espera unos segundos y repite.",
+    "ejecting": "Android lo está expulsando.",
+    "unmounted": "Está expulsado: desenchúfalo y vuélvelo a enchufar.",
+    "removed": "Se quitó: enchúfalo de nuevo.",
+    "bad_removal": "Se quitó sin expulsar: enchúfalo de nuevo (si da problemas, repáralo en un PC).",
+    "unmountable": "Android no pudo montarlo: su sistema de archivos no es compatible con este móvil o está dañado "
+                   "(en un PC, repáralo o formatéalo en exFAT).",
+    "nofs": "No tiene sistema de archivos: formatéalo en un PC (exFAT sirve en casi todo).",
+    "shared": "Android lo tiene compartido con un PC (modo almacenamiento USB): desactívalo.",
+}
+
+
+def storage_capable(info):
+    return bool(info.get("storage")) or "storage.status" in (info.get("commands") or [])
+
+
+def scall(link, cmd, timeout=15.0, **params):
+    """Una orden storage.* a la app; si falla, sale ya como el UsbError que se le cuenta al usuario."""
+    try:
+        return link.call(cmd, timeout, **params)
+    except BridgeError as e:
+        raise fs_to_usb(app_error(e))
+
+
+def vol_label(v):
+    return v.get("label") or v.get("uuid") or "?"
+
+
+def vol_state(v):
+    return STATE_ES.get(v.get("state"), v.get("state") or "?")
+
+
+def vol_access(v):
+    if not v.get("granted"):
+        return "no"
+    sc = (v.get("scope") or "").strip("/")
+    return "sí" if not sc else "sí (solo /%s)" % sc
+
+
+def fmt_space(v):
+    t, f = v.get("total"), v.get("free")
+    if t is None:
+        return "—"
+    return "%s libres de %s" % (human(f), human(t)) if f is not None else human(t)
+
+
+def no_disk_text(st):
+    n = int(st.get("mass_storage_devices") or 0)
+    if n > 0:
+        return ("Android ve %d dispositivo%s de almacenamiento por USB pero no montó ningún disco: o aún lo está comprobando (espera unos "
+                "segundos), o su sistema de archivos no es compatible con este móvil (exFAT y FAT32 casi siempre lo son; NTFS y ext4 "
+                "depende del móvil), o no tiene particiones. Mira Ajustes → Almacenamiento." % (n, "" if n == 1 else "s"))
+    return ("No hay ningún disco USB. Enchúfalo con un cable OTG (en Xiaomi/HyperOS: Ajustes → Ajustes adicionales → OTG) y mira: "
+            "nexo usb mounts")
+
+
+def unmounted_text(v):
+    return "El disco «%s» no está montado%s. %s" % (vol_label(v), "" if v.get("state") == "unmounted" else " (%s)" % vol_state(v),
+                                                   STATE_HELP.get(v.get("state"), "Desenchúfalo y vuélvelo a enchufar."))
+
+
+def match_volumes(vols, sel):
+    """Los discos que encajan con lo que escribió el usuario, del más al menos exacto: UUID o nombre enteros, el principio, un trozo."""
+    k = sel.strip().lower()
+    if not k:
+        return []
+    tiers = (lambda v: v.get("uuid", "").lower() == k or vol_label(v).lower() == k,
+             lambda v: v.get("uuid", "").lower().startswith(k) or vol_label(v).lower().startswith(k),
+             lambda v: k in v.get("uuid", "").lower() or k in vol_label(v).lower())
+    for pred in tiers:
+        found = [v for v in vols if pred(v)]
+        if found:
+            return found
+    return []
+
+
+def pick_volume(st, sel, need_mounted=True):
+    vols = st.get("volumes") or []
+    if sel:
+        found = match_volumes(vols, sel)
+        if not found:
+            names = ", ".join("«%s»" % vol_label(v) for v in vols if not v.get("primary")) or "ninguno"
+            raise UsbError("No hay ningún disco llamado «%s» (los que ve Android: %s). Mira: nexo usb mounts" % (sel, names), EXIT_NODEV)
+        if len(found) > 1:
+            raise UsbError("Varios discos encajan con «%s» (%s): usa su UUID (nexo usb mounts)." % (
+                sel, ", ".join("%s «%s»" % (v.get("uuid"), vol_label(v)) for v in found)), EXIT_USAGE)
+        v = found[0]
+    else:
+        cands = [v for v in vols if not v.get("primary")]
+        mounted = [v for v in cands if v.get("mounted")]
+        if len(mounted) == 1:
+            v = mounted[0]
+        elif len(mounted) > 1:
+            raise UsbError("Hay varios discos montados (%s): di cuál con --vol NOMBRE o escribiendo NOMBRE:/ruta." % ", ".join(
+                "«%s»" % vol_label(x) for x in mounted), EXIT_USAGE)
+        elif len(cands) == 1:
+            v = cands[0]
+        elif cands:
+            raise UsbError("Hay varios discos (%s) y ninguno está montado: mira nexo usb mounts." % ", ".join(
+                "«%s»" % vol_label(x) for x in cands), EXIT_NODEV)
+        else:
+            raise UsbError(no_disk_text(st), EXIT_NODEV)
+    if need_mounted and not v.get("mounted"):
+        raise UsbError(unmounted_text(v), EXIT_NODEV)
+    return v
+
+
+def split_ref(spec):
+    """«PENDRIVE:/Música» → («PENDRIVE», «/Música»); «/Música» → (None, «/Música»). Un «:» después de la primera «/» es del nombre."""
+    i = spec.find(":")
+    j = spec.find("/")
+    if i > 0 and (j < 0 or i < j):
+        return spec[:i], spec[i + 1:]
+    return None, spec
+
+
+def resolve_refs(specs, o):
+    """«A:/x», «/y» → (qué disco, [partes de cada ruta]). Todas tienen que ser del mismo disco."""
+    sel = o.get("vol")
+    parts = []
+    for s in specs:
+        v, p = split_ref(s)
+        if v is not None:
+            if sel is not None and sel.strip().lower() != v.strip().lower():
+                raise UsbError("Mezclas discos distintos («%s» y «%s»): usa una orden por disco." % (sel, v), EXIT_USAGE)
+            sel = v
+        parts.append(parse_path(p))
+    return sel, parts
+
+
+def direct_root(v):
+    """La carpeta del disco tal como la vería la app (la que se autorizó), si la ruta que da Android parece una."""
+    path = v.get("path")
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    root = path
+    if v.get("granted"):
+        for seg in (v.get("scope") or "").split("/"):
+            if seg:
+                root = os.path.join(root, seg)
+    return root
+
+
+def try_direct(v, required):
+    """DirectFs si este proceso ve de verdad la carpeta del disco (root, Shizuku/rish, o un Android que lo permita); si no, None."""
+    root = direct_root(v)
+    ok = False
+    why = "Android no dio la ruta del disco"
+    if root is not None:
+        why = "este proceso no puede abrir %s" % root
+        try:
+            if os.path.isdir(root) and os.access(root, os.R_OK | os.X_OK):
+                with os.scandir(root) as it:
+                    for _ in it:
+                        break
+                ok = True
+        except OSError as e:
+            why = "%s: %s" % (root, e.strerror or e)
+    if not ok:
+        if required:
+            raise UsbError("No puedo entrar directamente en el disco (%s). Android no deja a las apps normales abrir /storage/UUID; "
+                           "sin --via direct se usa la app Nexo." % why, EXIT_ERR)
+        return None
+    vv = dict(v)
+    vv["path"] = root
+    return DirectFs(vv)
+
+
+def ensure_access(link, v, say, timeout=120.0):
+    """Pide a Android que Nexo pueda entrar en el disco y espera a que elijas la carpeta en el móvil. Devuelve el volumen ya autorizado."""
+    if v.get("granted"):
+        return v
+    start = time.monotonic()
+    announced = False
+    while True:
+        left = timeout - (time.monotonic() - start)
+        if left <= 0:
+            raise UsbError("Nadie eligió el disco en el móvil. Si no te salió el selector, abre la app Nexo un momento y repite: "
+                           "nexo usb access  (en HyperOS/MIUI, mejor con Nexo en primer plano).", EXIT_TOUCH)
+        wait = int(min(left, 25.0) * 1000)
+        r = scall(link, "storage.access", wait / 1000.0 + 8.0, volume=v["uuid"], wait_ms=wait)
+        if r.get("granted"):
+            vv = dict(v)
+            vv["granted"] = True
+            return vv
+        if r.get("denied"):
+            raise UsbError("Android no le dio acceso a «%s» a Nexo. Repite «nexo usb access», elige el disco (ábrelo desde el menú ≡ si "
+                           "no sale) y toca «Usar esta carpeta» → «Permitir»." % vol_label(v), EXIT_TOUCH)
+        if not announced:
+            say("Nexo necesita tu permiso para entrar en «%s»: mira la pantalla del móvil, elige el disco y toca «Usar esta carpeta» → "
+                "«Permitir» (se pregunta una sola vez)." % vol_label(v))
+            announced = True
+
+
+class Disk(object):
+    """Un disco listo para trabajar: la conexión con la app, el volumen elegido y la manera de entrar (fs)."""
+
+    def __init__(self, link, vol, fs):
+        self.link, self.vol, self.fs = link, vol, fs
+
+    def close(self):
+        self.link.close()
+
+
+def open_disk(o, sel):
+    """Conecta con la app, elige el disco y la manera de entrar (--via app|direct|auto) y, si hace falta, pide el acceso."""
+    link = connect_app(None, "storage")
+    try:
+        st = scall(link, "storage.status")
+        if not st.get("available", True):
+            raise UsbError("Este Android no tiene el servicio de almacenamiento que necesita Nexo.", EXIT_ERR)
+        v = pick_volume(st, sel)
+        via = o.get("via") or "auto"
+        fs = try_direct(v, via == "direct") if via in ("auto", "direct") else None
+        if fs is None:
+            if not v.get("granted"):
+                if o.get("no_ask"):
+                    raise UsbError("Nexo todavía no tiene acceso a «%s». Pídelo con:  nexo usb access" % vol_label(v), EXIT_TOUCH)
+                v = ensure_access(link, v, log, o.get("timeout", 120.0))
+            fs = AppFs(link, v)
+        return Disk(link, v, fs)
+    except BaseException:
+        link.close()
+        raise
+
+
+# ----------------------------------------------------------------------------------------------------- discos USB: copiar
+
+
+def via_arg(s):
+    v = str(s).strip().lower()
+    if v not in ("auto", "app", "direct"):
+        raise ValueError(s)
+    return v
+
+
+STORAGE_SPEC = {"--vol": ("vol", str), "--via": ("via", via_arg), "--no-ask": ("no_ask", True), "--timeout": ("timeout", to_seconds)}
+TRANSFER_SPEC = {"-r": ("recursive", True), "-R": ("recursive", True), "--recursive": ("recursive", True),
+                 "-f": ("force", True), "--force": ("force", True), "-n": ("skip", True), "--skip-existing": ("skip", True),
+                 "--verify": ("verify", True), "-q": ("quiet", True), "--quiet": ("quiet", True), "--json": ("json", True)}
+
+
+def spec_with(*parts):
+    d = dict(STORAGE_SPEC)
+    for p in parts:
+        d.update(p)
+    return d
+
+
+def local_error(e, what):
+    if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+        return FsError("local_full", "No cabe en tu distro: %s" % what)
+    return FsError("local", "%s: %s" % (what, e.strerror or e))
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    try:
+        while len(view):
+            n = os.write(fd, view)
+            view = view[n:]
+    except OSError as e:
+        raise local_error(e, "no pude escribir en un archivo de tu distro")
+
+
+def hash_local(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(1 << 20)
+                if not b:
+                    return h.hexdigest()
+                h.update(b)
+    except OSError as e:
+        raise local_error(e, "no pude releer «%s»" % path)
+
+
+def hash_disk(fs, parts):
+    h = hashlib.sha256()
+    f = fs.open(parts, "r")
+    try:
+        pipeline_read(f, f.size, h.update, Meter(False))
+    finally:
+        close_quiet(f)
+    return h.hexdigest()
+
+
+def disp(job, parts):
+    return "%s:%s" % (vol_label(job.disk.vol), join_path(parts))
+
+
+def fix_name(name):
+    """Los caracteres que un disco USB no admite en un nombre nuevo, cambiados por «_» (--fix-names)."""
+    out_ = "".join("_" if (ch in BAD_NEW_CHARS or ch < " " or ch == "\x7f") else ch for ch in name)
+    while out_.endswith(".") or out_.endswith(" "):
+        out_ = out_[:-1] + "_"
+    return out_ or "_"
+
+
+class Meter(object):
+    """La línea de avance de una copia (solo en una terminal; a un archivo o una tubería no escribe nada)."""
+
+    def __init__(self, enabled):
+        self.on = bool(enabled) and hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+        self.name, self.size, self.done = "", 0, 0
+        self.t0, self.last, self.shown = time.monotonic(), 0.0, False
+
+    def start(self, name, size):
+        self.name, self.size, self.done = name, size, 0
+        self.t0, self.last = time.monotonic(), 0.0
+
+    def add(self, n):
+        self.done += n
+        if not self.on:
+            return
+        now = time.monotonic()
+        if now - self.last < 0.2:
+            return
+        self.last = now
+        el = max(now - self.t0, 0.001)
+        pct = ("%3d %%" % (100 * self.done // self.size)) if self.size else ""
+        line = "  %s  %s / %s  %s  %s/s" % (self.name, human(self.done), human(self.size), pct, human(self.done / el))
+        try:
+            cols = shutil.get_terminal_size((80, 24)).columns
+        except Exception:
+            cols = 80
+        if len(line) >= cols:
+            line = "…" + line[len(line) - (cols - 2):]
+        sys.stderr.write("\r" + line + "\x1b[K")
+        sys.stderr.flush()
+        self.shown = True
+
+    def clear(self):
+        if self.shown:
+            sys.stderr.write("\r\x1b[K")
+            sys.stderr.flush()
+            self.shown = False
+
+
+def pipeline_read(f, size, sink, meter):
+    """Lee `size` bytes de un archivo abierto, con PIPE_DEPTH peticiones en vuelo, y se los va dando a sink(bytes), en orden."""
+    q = collections.deque()
+    sent = 0
+    while sent < size or q:
+        while sent < size and len(q) < PIPE_DEPTH:
+            want = min(READ_CHUNK, size - sent)
+            q.append((sent, want, f.read_async(sent, want)))
+            sent += want
+        off, want, p = q.popleft()
+        data = p.result()
+        while len(data) < want:                                    # lectura corta: se pide lo que falta
+            more = f.read(off + len(data), want - len(data))
+            if not more:
+                raise FsError("io_error", "El archivo cambió o se acortó mientras se copiaba")
+            data += more
+        sink(data)
+        meter.add(len(data))
+
+
+def pipeline_write(f, src, size, meter, hasher=None):
+    """Escribe `size` bytes de un archivo local en uno abierto del disco, con PIPE_DEPTH escrituras en vuelo."""
+    q = collections.deque()
+    off = 0
+    while off < size:
+        data = src.read(min(WRITE_CHUNK, size - off))
+        if not data:
+            raise FsError("local", "El archivo local cambió o se acortó mientras se copiaba")
+        if hasher is not None:
+            hasher.update(data)
+        q.append((off, data, f.write_async(off, data)))
+        off += len(data)
+        if len(q) >= PIPE_DEPTH:
+            finish_write(f, q.popleft(), meter)
+    while q:
+        finish_write(f, q.popleft(), meter)
+
+
+def finish_write(f, item, meter):
+    off, data, p = item
+    n = p.result()
+    while n < len(data):                                           # escritura corta: se manda lo que falta
+        k = f.write(off + n, data[n:])
+        if k <= 0:
+            raise FsError("io_error", "El disco no aceptó más datos")
+        n += k
+    meter.add(len(data))
+
+
+class Job(object):
+    """Lo que comparten los archivos de una misma orden (get, put, rm…): el disco, las opciones, los fallos y lo copiado."""
+
+    def __init__(self, disk, o):
+        self.disk = disk
+        self.fs = disk.fs
+        self.force = bool(o.get("force"))
+        self.skip = bool(o.get("skip"))
+        self.recursive = bool(o.get("recursive"))
+        self.verify = bool(o.get("verify"))
+        self.fix_names = bool(o.get("fix_names"))
+        self.verbose = bool(o.get("verbose"))
+        self.json = bool(o.get("json"))
+        self.quiet = bool(o.get("quiet")) or self.json
+        self.meter = Meter(not self.quiet)
+        self.errors, self.items = [], []
+        self.bytes = 0
+        self.skipped = 0
+        self.t0 = time.monotonic()
+        self.counter = 0
+
+    def say(self, msg):
+        if not self.quiet:
+            self.meter.clear()
+            log(msg)
+
+    def part_name(self):
+        self.counter += 1
+        return "%s%d-%d" % (PART_PREFIX, os.getpid(), self.counter)
+
+    def fail(self, e, what):
+        self.errors.append({"path": what, "error": e.code, "message": e.message})
+        self.meter.clear()
+        log("nexo usb: %s: %s" % (what, e.message))
+
+    def run(self, what, fn, *args):
+        """fn(*args); un fallo que solo afecta a este archivo se anota y se sigue, uno que afecta a todo (disco lleno, sin disco…) sale."""
+        try:
+            return fn(*args)
+        except FsError as e:
+            if e.code in FATAL_FS:
+                raise
+            self.fail(e, what)
+            return None
+
+
+def finish_job(job, label):
+    job.meter.clear()
+    el = max(time.monotonic() - job.t0, 0.001)
+    if job.json:
+        out(json.dumps({"ok": not job.errors, "files": len(job.items), "bytes": job.bytes, "skipped": job.skipped,
+                        "seconds": round(el, 3), "items": job.items, "errors": job.errors}, ensure_ascii=False) + "\n")
+    elif not job.quiet and (len(job.items) > 1 or job.errors or job.skipped):
+        log("%s: %d archivo%s, %s en %.1f s%s%s%s" % (
+            label, len(job.items), "" if len(job.items) == 1 else "s", human(job.bytes), el,
+            (" (%s/s)" % human(job.bytes / el)) if job.bytes else "",
+            (", %d omitido%s" % (job.skipped, "" if job.skipped == 1 else "s")) if job.skipped else "",
+            (", %d con fallos" % len(job.errors)) if job.errors else ""))
+    return EXIT_ERR if job.errors else 0
+
+
+# ---- disco → distro
+
+
+def get_file(job, sp, entry, target):
+    fs = job.fs
+    name = disp(job, sp)
+    if os.path.lexists(target):
+        if os.path.isdir(target) and not os.path.islink(target):
+            raise FsError("is_dir", "En tu distro «%s» es una carpeta" % target)
+        if job.skip:
+            job.skipped += 1
+            job.say("  omitido (ya existe): %s" % target)
+            return
+        if not job.force:
+            raise FsError("exists", "Ya existe «%s» (usa -f para sustituirlo, o -n para saltarlo)" % target)
+    dirn = os.path.dirname(target) or "."
+    if not os.path.isdir(dirn):
+        raise FsError("local", "No existe la carpeta de destino «%s»" % dirn)
+    tmp = os.path.join(dirn, job.part_name())
+    f = fs.open(sp, "r")
+    fd = None
+    ok = False
+    size = 0
+    try:
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except OSError as e:
+            raise local_error(e, "no pude crear «%s»" % tmp)
+        h = hashlib.sha256() if job.verify else None
+
+        def sink(data):
+            if h is not None:
+                h.update(data)
+            write_all(fd, data)
+
+        size = f.size
+        job.meter.start(name, size)
+        pipeline_read(f, size, sink, job.meter)
+        try:
+            os.close(fd)
+        except OSError as e:
+            fd = None
+            raise local_error(e, "no pude cerrar «%s»" % tmp)
+        fd = None
+        if h is not None and hash_local(tmp) != h.hexdigest():
+            raise FsError("io_error", "La copia en tu distro no coincide con lo leído del disco")
+        ms = entry.get("mtime_ms")
+        if ms:
+            try:
+                os.utime(tmp, (ms / 1000.0, ms / 1000.0))
+            except (OSError, OverflowError, ValueError):
+                pass
+        try:
+            os.replace(tmp, target)
+        except OSError as e:
+            raise local_error(e, "no pude dejar «%s»" % target)
+        ok = True
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        close_quiet(f)
+        job.meter.clear()
+        if not ok:
+            remove_quiet(tmp)
+    job.bytes += size
+    job.items.append({"src": name, "dst": target, "bytes": size})
+    job.say("  %s → %s  (%s)" % (name, target, human(size)))
+
+
+def get_tree(job, sp, target):
+    """Una carpeta entera del disco a una carpeta de tu distro (se mezcla con lo que ya haya)."""
+    if os.path.lexists(target):
+        if not os.path.isdir(target) or os.path.islink(target) and not os.path.isdir(os.path.realpath(target)):
+            raise FsError("exists", "Ya existe «%s» y no es una carpeta" % target)
+    else:
+        try:
+            os.mkdir(target, 0o777)
+        except OSError as e:
+            raise local_error(e, "no pude crear la carpeta «%s»" % target)
+    for e in job.fs.list(sp):
+        name = e["name"]
+        cp = sp + [name]
+        what = disp(job, cp)
+        if not safe_local_name(name):
+            job.fail(FsError("bad_path", "nombre no válido en tu distro: %r" % name), what)
+            continue
+        dst = os.path.join(target, name)
+        if e["type"] == "dir":
+            job.run(what, get_tree, job, cp, dst)
+        else:
+            job.run(what, get_file, job, cp, e, dst)
+
+
+def get_one(job, sp, dest, dest_is_dir, contents=False):
+    e = job.fs.stat(sp)
+    if contents and e["type"] == "dir":                            # «ORIGEN/»: lo que hay dentro va directo a DESTINO (como rsync)
+        if not job.recursive:
+            raise FsError("is_dir", "Es una carpeta (usa -r para copiarla entera)")
+        get_tree(job, sp, dest.rstrip("/") or dest)
+        return
+    name = sp[-1] if sp else (vol_label(job.disk.vol).replace("/", "_") or "disco")
+    if dest_is_dir:
+        target = os.path.join(dest, name)
+    else:
+        if dest.endswith("/") and e["type"] != "dir":
+            raise FsError("local", "No existe la carpeta de destino «%s»" % dest)
+        target = dest.rstrip("/") or dest
+    if e["type"] == "dir":
+        if not job.recursive:
+            raise FsError("is_dir", "Es una carpeta (usa -r para copiarla entera)")
+        get_tree(job, sp, target)
+    else:
+        get_file(job, sp, e, target)
+
+
+def cmd_get(argv):
+    o, pos = parse_args(argv, spec_with(TRANSFER_SPEC))
+    if len(pos) < 2:
+        raise UsbError("«get» necesita ORIGEN (en el disco) y DESTINO (en tu distro). Ejemplo: nexo usb get /Fotos/a.jpg .", EXIT_USAGE)
+    sel, plist = resolve_refs(pos[:-1], o)
+    slash = [split_ref(x)[1].endswith("/") for x in pos[:-1]]
+    dest = pos[-1]
+    deep_ok()
+    dest_is_dir = os.path.isdir(dest)
+    if len(plist) > 1 and not dest_is_dir:
+        raise UsbError("Con varios ORIGEN, DESTINO tiene que ser una carpeta que ya exista («%s»)." % dest, EXIT_USAGE)
+    disk = open_disk(o, sel)
+    try:
+        job = Job(disk, o)
+        for sp, sl in zip(plist, slash):
+            job.run(disp(job, sp), get_one, job, sp, dest, dest_is_dir, sl)
+        return finish_job(job, "get")
+    finally:
+        disk.close()
+
+
+# ---- distro → disco
+
+
+def ensure_dir(job, dp):
+    """La carpeta dp del disco: se crea si falta (la de arriba tiene que existir); si ya hay una, se mezcla."""
+    e = job.fs.stat_opt(dp)
+    if e is None:
+        job.fs.mkdir(dp)
+    elif e["type"] != "dir":
+        raise FsError("not_dir", "En el disco «%s» ya existe y no es una carpeta" % disp(job, dp))
+
+
+def put_file(job, lp, st, dp):
+    fs = job.fs
+    name = disp(job, dp)
+    if not dp:
+        raise FsError("bad_path", "Un archivo no puede ser la raíz del disco")
+    check_name(dp[-1])
+    check_new_name(dp[-1])                                         # antes de crear nada: Android cambiaría estos caracteres sin avisar
+    existing = fs.stat_opt(dp)
+    if existing is not None:
+        if existing["type"] == "dir":
+            raise FsError("is_dir", "En el disco «%s» es una carpeta" % name)
+        if job.skip:
+            job.skipped += 1
+            job.say("  omitido (ya existe): %s" % name)
+            return
+        if not job.force:
+            raise FsError("exists", "Ya existe en el disco «%s» (usa -f para sustituirlo, o -n para saltarlo)" % name)
+    size = st.st_size
+    try:
+        src = open(lp, "rb")
+    except OSError as e:
+        raise local_error(e, "no pude leerlo")
+    tmp = dp[:-1] + [job.part_name()]
+    f = None
+    made = False
+    keep = False
+    ok = False
+    try:
+        f = fs.open(tmp, "w", exclusive=True)
+        made = True
+        h = hashlib.sha256() if job.verify else None
+        job.meter.start(name, size)
+        try:
+            pipeline_write(f, src, size, job.meter, h)
+        except OSError as e:
+            raise local_error(e, "no pude leerlo")
+        f.close()                                                  # aquí se vacía al disco: si falla, falla la copia
+        if h is not None and hash_disk(fs, tmp) != h.hexdigest():
+            raise FsError("io_error", "Lo escrito en el disco no coincide con el original")
+        try:
+            fs.rename(tmp, dp, overwrite=existing is not None)
+        except FsError as e:
+            if existing is not None:
+                try:
+                    keep = fs.stat_opt(dp) is None                 # el viejo ya se borró y el nuevo no llegó a su sitio: no se pierde
+                except FsError:
+                    keep = False
+            if keep:
+                raise FsError(e.code, "%s (lo copiado quedó en «%s»)" % (e.message, disp(job, tmp)), e.extra)
+            raise
+        ok = True
+    finally:
+        close_quiet(src)
+        if f is not None:
+            close_quiet(f)
+        job.meter.clear()
+        if made and not ok and not keep:
+            delete_quiet(fs, tmp)
+    job.bytes += size
+    job.items.append({"src": lp, "dst": name, "bytes": size})
+    job.say("  %s → %s  (%s)" % (lp, name, human(size)))
+
+
+def put_tree(job, lp, dp):
+    """Una carpeta de tu distro entera al disco (se mezcla con lo que ya haya; los enlaces simbólicos y archivos especiales se saltan)."""
+    ensure_dir(job, dp)
+    try:
+        names = sorted(os.listdir(lp))
+    except OSError as e:
+        raise local_error(e, "no pude leer la carpeta")
+    for name in names:
+        p = os.path.join(lp, name)
+        cdp = dp + [fix_name(name) if job.fix_names else name]
+        try:
+            st = os.lstat(p)
+        except OSError as e:
+            job.fail(local_error(e, "no pude leerlo"), p)
+            continue
+        if stat_mod.S_ISDIR(st.st_mode):
+            job.run(p, put_tree, job, p, cdp)
+        elif stat_mod.S_ISREG(st.st_mode):
+            job.run(p, put_file, job, p, st, cdp)
+        else:
+            job.skipped += 1
+            job.say("  omitido (%s): %s" % ("enlace simbólico" if stat_mod.S_ISLNK(st.st_mode) else "no es un archivo normal", p))
+
+
+def put_one(job, lp, dp, dest_exists_dir, dest):
+    try:
+        st = os.stat(lp)
+    except OSError as e:
+        raise local_error(e, "no pude leerlo")
+    if lp.endswith("/") and stat_mod.S_ISDIR(st.st_mode):          # «ORIGEN/»: lo que hay dentro va directo a DESTINO (como rsync)
+        if not job.recursive:
+            raise FsError("is_dir", "Es una carpeta (usa -r para copiarla entera)")
+        put_tree(job, lp, dp)
+        return
+    base = os.path.basename(os.path.abspath(lp)) or "raiz"
+    if job.fix_names:
+        base = fix_name(base)
+    if dest_exists_dir:
+        target = dp + [base]
+    else:
+        if dest.endswith("/") and not stat_mod.S_ISDIR(st.st_mode):
+            raise FsError("not_found", "En el disco no existe la carpeta «%s»" % dest)
+        target = dp
+    if stat_mod.S_ISDIR(st.st_mode):
+        if not job.recursive:
+            raise FsError("is_dir", "Es una carpeta (usa -r para copiarla entera)")
+        if not target:
+            raise FsError("bad_path", "No se puede sustituir la raíz del disco")
+        put_tree(job, lp, target)
+    elif stat_mod.S_ISREG(st.st_mode):
+        put_file(job, lp, st, target)
+    else:
+        raise FsError("local", "No es un archivo normal")
+
+
+def cmd_put(argv):
+    o, pos = parse_args(argv, spec_with(TRANSFER_SPEC, {"--fix-names": ("fix_names", True)}))
+    if len(pos) < 2:
+        raise UsbError("«put» necesita ORIGEN (en tu distro) y DESTINO (en el disco). Ejemplo: nexo usb put ./a.jpg /Fotos/", EXIT_USAGE)
+    srcs = pos[:-1]
+    sel, dparts = resolve_refs([pos[-1]], o)
+    dp = dparts[0]
+    dest = split_ref(pos[-1])[1]
+    deep_ok()
+    disk = open_disk(o, sel)
+    try:
+        job = Job(disk, o)
+        de = disk.fs.stat_opt(dp)
+        dir_ = de is not None and de["type"] == "dir"
+        if len(srcs) > 1 and not dir_:
+            raise UsbError("Con varios ORIGEN, DESTINO tiene que ser una carpeta que ya exista en el disco («%s»)." % pos[-1], EXIT_USAGE)
+        for lp in srcs:
+            job.run(lp, put_one, job, lp, dp, dir_, dest)
+        return finish_job(job, "put")
+    finally:
+        disk.close()
+
+
+def deep_ok():
+    """Una ruta de disco mide como mucho 4096 caracteres (hasta ~2000 niveles): se deja recursión de sobra."""
+    if sys.getrecursionlimit() < 6000:
+        sys.setrecursionlimit(6000)
+
+
+# ----------------------------------------------------------------------------------------------------- discos USB: comandos
+
+
+def json_out(obj, o):
+    out(json.dumps(obj, ensure_ascii=False, indent=2 if o.get("pretty") or sys.stdout.isatty() else None) + "\n")
+
+
+def cmd_mounts(argv):
+    o, pos = parse_args(argv, {"--json": ("json", True), "--pretty": ("pretty", True), "--all": ("all", True), "-a": ("all", True),
+                               "--wait": ("wait", to_seconds)})
+    if pos:
+        raise UsbError("«mounts» no lleva argumentos. Prueba: nexo usb help", EXIT_USAGE)
+    link = connect_app(None, "storage")
+    waited = False
+    try:
+        st = scall(link, "storage.status")
+        if o.get("wait"):
+            end = time.monotonic() + o["wait"]
+            told = False
+            while not [v for v in st.get("volumes") or [] if not v.get("primary") and v.get("mounted")] and time.monotonic() < end:
+                if not told:
+                    log("Esperando a que enchufes un disco… (Ctrl+C para dejar de esperar)")
+                    told = True
+                time.sleep(1.0)
+                st = scall(link, "storage.status")
+            waited = True
+    finally:
+        link.close()
+    if o.get("json"):
+        json_out(st, o)
+        return 0
+    vols = st.get("volumes") or []
+    shown = [v for v in vols if o.get("all") or not v.get("primary")]
+    if not shown:
+        log(no_disk_text(st))
+        return EXIT_NODEV if waited else 0
+    rows = []
+    for v in shown:
+        rows.append((v.get("uuid"), vol_label(v) + (" (interno)" if v.get("primary") else ""), vol_state(v), fmt_space(v), vol_access(v),
+                     v.get("path") or "—"))
+    out(table(rows, ("ID", "NOMBRE", "ESTADO", "ESPACIO", "NEXO PUEDE ENTRAR", "RUTA EN ANDROID")) + "\n")
+    usable = [v for v in shown if not v.get("primary")]
+    for v in usable:
+        if not v.get("mounted"):
+            out("  %s: %s\n" % (vol_label(v), STATE_HELP.get(v.get("state"), "Android no lo tiene montado.")))
+    if any(v.get("mounted") and not v.get("granted") for v in usable):
+        out("Siguiente paso: nexo usb access   (Android te enseña su selector de carpetas: elige el disco; se pregunta una sola vez)\n")
+    elif any(v.get("mounted") and v.get("granted") for v in usable):
+        out("Listo para: nexo usb ls · get · put · cat · mkdir · rm · mv · df · eject\n")
+    elif not usable:
+        out("No hay discos USB montados (el interno no cuenta). %s\n" % no_disk_text(st))
+    return 0
+
+
+def cmd_access(argv):
+    o, pos = parse_args(argv, {"--vol": ("vol", str), "--timeout": ("timeout", to_seconds), "--revoke": ("revoke", True),
+                               "--json": ("json", True), "--pretty": ("pretty", True)})
+    if len(pos) > 1:
+        raise UsbError("Solo un DISCO. Prueba: nexo usb help", EXIT_USAGE)
+    sel = pos[0] if pos else o.get("vol")
+    link = connect_app(None, "storage")
+    try:
+        st = scall(link, "storage.status")
+        v = pick_volume(st, sel, need_mounted=not o.get("revoke"))
+        if o.get("revoke"):
+            r = scall(link, "storage.revoke", 15.0, volume=v["uuid"])
+            if o.get("json"):
+                json_out(r, o)
+            else:
+                out("Nexo ya no tiene acceso a «%s» (se quitaron %d permiso%s).\n" % (
+                    vol_label(v), int(r.get("released") or 0), "" if int(r.get("released") or 0) == 1 else "s"))
+            return 0
+        if v.get("granted"):
+            if o.get("json"):
+                json_out({"volume": v["uuid"], "granted": True, "requested": False, "denied": False, "scope": v.get("scope")}, o)
+            else:
+                out("Nexo ya tiene acceso a «%s» (%s).\n" % (vol_label(v), vol_access(v)[3:].strip("()") if (v.get("scope") or "").strip("/") else
+                                                             "el disco entero"))
+            return 0
+        v = ensure_access(link, v, log, o.get("timeout", 120.0))
+        if o.get("json"):
+            json_out({"volume": v["uuid"], "granted": True, "requested": True, "denied": False}, o)
+        else:
+            out("Listo: Nexo ya puede entrar en «%s». Prueba:  nexo usb ls\n" % vol_label(v))
+        return 0
+    finally:
+        link.close()
+
+
+def entry_line(e, long_, human_):
+    name = e["name"] + ("/" if e["type"] == "dir" else "")
+    if not long_:
+        return name
+    size = "-" if e["type"] == "dir" else (human(e["size"]) if human_ else str(e["size"]))
+    return "%s%s  %10s  %s  %s" % ("d" if e["type"] == "dir" else "-", "w" if e.get("writable") else "r", size, when(e.get("mtime_ms")), name)
+
+
+def walk_listing(fs, sp, recursive, acc, errors):
+    try:
+        ents = fs.list(sp)
+    except FsError as e:
+        if e.code in FATAL_FS:
+            raise
+        errors.append((sp, e))
+        return
+    acc.append({"path": join_path(sp), "entries": ents})
+    if recursive:
+        for e in ents:
+            if e["type"] == "dir":
+                walk_listing(fs, sp + [e["name"]], True, acc, errors)
+
+
+def cmd_ls(argv):
+    o, pos = parse_args(argv, spec_with({"-l": ("long", True), "--long": ("long", True), "-a": ("all", True), "--all": ("all", True),
+                                         "-h": ("human", True), "--human": ("human", True), "-R": ("recursive", True),
+                                         "--recursive": ("recursive", True), "--json": ("json", True), "--pretty": ("pretty", True)}))
+    sel, plist = resolve_refs(pos or ["/"], o)
+    deep_ok()
+    disk = open_disk(o, sel)
+    try:
+        acc, errs, rc = [], [], 0
+        for sp in plist:
+            try:
+                e = disk.fs.stat(sp)
+                if e["type"] != "dir":
+                    acc.append({"path": join_path(sp), "entries": [e], "file": True})
+                else:
+                    walk_listing(disk.fs, sp, bool(o.get("recursive")), acc, errs)
+            except FsError as ex:
+                if ex.code in FATAL_FS:
+                    raise
+                errs.append((sp, ex))
+        for sp, ex in errs:
+            log("nexo usb: %s:%s: %s" % (vol_label(disk.vol), join_path(sp), ex.message))
+            rc = EXIT_ERR
+        if o.get("json"):
+            json_out({"volume": disk.vol.get("uuid"), "listings": [{"path": a["path"], "entries": a["entries"]} for a in acc],
+                      "errors": [{"path": join_path(sp), "error": ex.code, "message": ex.message} for sp, ex in errs]}, o)
+            return rc
+        multi = len(acc) > 1
+        for n, a in enumerate(acc):
+            if multi and not a.get("file"):
+                out("%s%s:\n" % ("\n" if n else "", a["path"]))
+            for e in a["entries"]:
+                if a.get("file"):
+                    e = dict(e, name=a["path"])
+                elif e["name"].startswith(".") and not o.get("all"):
+                    continue
+                out(entry_line(e, o.get("long"), o.get("human")) + "\n")
+        return rc
+    finally:
+        disk.close()
+
+
+def cmd_stat(argv):
+    o, pos = parse_args(argv, spec_with({"--json": ("json", True), "--pretty": ("pretty", True)}))
+    if not pos:
+        raise UsbError("«stat» necesita una RUTA del disco.", EXIT_USAGE)
+    sel, plist = resolve_refs(pos, o)
+    disk = open_disk(o, sel)
+    try:
+        res, rc = [], 0
+        for sp in plist:
+            try:
+                e = dict(disk.fs.stat(sp))
+            except FsError as ex:
+                if ex.code in FATAL_FS:
+                    raise
+                log("nexo usb: %s:%s: %s" % (vol_label(disk.vol), join_path(sp), ex.message))
+                rc = EXIT_ERR
+                continue
+            e["path"] = join_path(sp)
+            e["volume"] = disk.vol.get("uuid")
+            res.append(e)
+        if o.get("json"):
+            json_out(res[0] if len(plist) == 1 and res else res, o)
+            return rc
+        for n, e in enumerate(res):
+            if n:
+                out("\n")
+            out("  Ruta:        %s:%s\n  Tipo:        %s\n" % (vol_label(disk.vol), e["path"], "carpeta" if e["type"] == "dir" else "archivo"))
+            if e["type"] != "dir":
+                out("  Tamaño:      %s (%d bytes)\n" % (human(e["size"]), e["size"]))
+            out("  Modificado:  %s\n  Escritura:   %s\n" % (when(e.get("mtime_ms")), "sí" if e.get("writable") else "no"))
+            if e.get("mime"):
+                out("  MIME:        %s\n" % e["mime"])
+        return rc
+    finally:
+        disk.close()
+
+
+def cmd_cat(argv):
+    o, pos = parse_args(argv, spec_with({}))
+    if not pos:
+        raise UsbError("«cat» necesita una o más RUTAS de archivos del disco.", EXIT_USAGE)
+    sel, plist = resolve_refs(pos, o)
+    disk = open_disk(o, sel)
+    try:
+        outb = sys.stdout.buffer
+        meter = Meter(False)
+        rc = 0
+        for sp in plist:
+            what = "%s:%s" % (vol_label(disk.vol), join_path(sp))
+            try:
+                e = disk.fs.stat(sp)
+                if e["type"] == "dir":
+                    raise FsError("is_dir", "Es una carpeta")
+                f = disk.fs.open(sp, "r")
+                try:
+                    pipeline_read(f, f.size, outb.write, meter)
+                finally:
+                    close_quiet(f)
+            except FsError as ex:
+                if ex.code in FATAL_FS:
+                    raise
+                log("nexo usb: %s: %s" % (what, ex.message))
+                rc = EXIT_ERR
+        outb.flush()
+        return rc
+    finally:
+        disk.close()
+
+
+def cmd_mkdir(argv):
+    o, pos = parse_args(argv, spec_with({"-p": ("parents", True), "--parents": ("parents", True)}))
+    if not pos:
+        raise UsbError("«mkdir» necesita una o más RUTAS.", EXIT_USAGE)
+    sel, plist = resolve_refs(pos, o)
+    disk = open_disk(o, sel)
+    try:
+        rc = 0
+        for sp in plist:
+            what = "%s:%s" % (vol_label(disk.vol), join_path(sp))
+            try:
+                disk.fs.mkdir(sp, bool(o.get("parents")))
+            except FsError as ex:
+                if ex.code in FATAL_FS:
+                    raise
+                log("nexo usb: %s: %s" % (what, ex.message))
+                rc = EXIT_ERR
+        return rc
+    finally:
+        disk.close()
+
+
+def rm_tree(job, root, verbose):
+    """Borra una carpeta y todo lo que lleva dentro (de abajo arriba: la app solo borra archivos y carpetas vacías)."""
+    stack = [(root, False)]
+    while stack:
+        sp, visited = stack.pop()
+        what = disp(job, sp)
+        if visited:
+            job.run(what, job.fs.delete, sp)
+            if verbose:
+                job.say("  borrado: %s" % what)
+            continue
+        stack.append((sp, True))
+        try:
+            kids = job.fs.list(sp)
+        except FsError as e:
+            if e.code in FATAL_FS:
+                raise
+            job.fail(e, what)
+            continue
+        for c in kids:
+            cp = sp + [c["name"]]
+            if c["type"] == "dir":
+                stack.append((cp, False))
+            else:
+                job.run(disp(job, cp), job.fs.delete, cp)
+                if verbose:
+                    job.say("  borrado: %s" % disp(job, cp))
+
+
+def rm_one(job, sp, force, verbose):
+    e = job.fs.stat_opt(sp)
+    if not sp:
+        raise FsError("bad_path", "La raíz del disco no se borra (borra sus carpetas una a una)")
+    if e is None:
+        if force:
+            return
+        raise FsError("not_found", "No existe: " + join_path(sp))
+    if e["type"] == "dir":
+        if not job.recursive:
+            raise FsError("is_dir", "Es una carpeta (usa -r para borrarla con todo lo que lleva dentro)")
+        rm_tree(job, sp, verbose)
+    else:
+        job.fs.delete(sp)
+        if verbose:
+            job.say("  borrado: %s" % disp(job, sp))
+
+
+def cmd_rm(argv):
+    o, pos = parse_args(argv, spec_with({"-r": ("recursive", True), "-R": ("recursive", True), "--recursive": ("recursive", True),
+                                         "-f": ("force", True), "--force": ("force", True), "-v": ("verbose", True),
+                                         "--verbose": ("verbose", True)}))
+    if not pos:
+        raise UsbError("«rm» necesita una o más RUTAS.", EXIT_USAGE)
+    sel, plist = resolve_refs(pos, o)
+    deep_ok()
+    disk = open_disk(o, sel)
+    try:
+        job = Job(disk, o)
+        for sp in plist:
+            job.run(disp(job, sp), rm_one, job, sp, bool(o.get("force")), bool(o.get("verbose")))
+        return EXIT_ERR if job.errors else 0
+    finally:
+        disk.close()
+
+
+def cmd_mv(argv):
+    o, pos = parse_args(argv, spec_with({"-f": ("force", True), "--force": ("force", True), "-v": ("verbose", True),
+                                         "--verbose": ("verbose", True)}))
+    if len(pos) < 2:
+        raise UsbError("«mv» necesita ORIGEN y DESTINO (los dos en el disco). Ejemplo: nexo usb mv /a.txt /Carpeta/", EXIT_USAGE)
+    sel, plist = resolve_refs(pos, o)
+    disk = open_disk(o, sel)
+    try:
+        job = Job(disk, o)
+        dest = plist[-1]
+        de = disk.fs.stat_opt(dest)
+        dir_ = de is not None and de["type"] == "dir"
+        if len(plist) > 2 and not dir_:
+            raise UsbError("Con varios ORIGEN, DESTINO tiene que ser una carpeta que ya exista en el disco.", EXIT_USAGE)
+        for sp in plist[:-1]:
+            what = disp(job, sp)
+
+            def one(sp=sp, what=what):
+                if not sp:
+                    raise FsError("bad_path", "La raíz del disco no se mueve")
+                target = dest + [sp[-1]] if dir_ else dest
+                disk.fs.rename(sp, target, bool(o.get("force")))
+                if o.get("verbose"):
+                    job.say("  %s → %s" % (what, disp(job, target)))
+            job.run(what, one)
+        return EXIT_ERR if job.errors else 0
+    finally:
+        disk.close()
+
+
+def cmd_df(argv):
+    o, pos = parse_args(argv, {"--vol": ("vol", str), "--json": ("json", True), "--pretty": ("pretty", True), "--all": ("all", True),
+                               "-a": ("all", True)})
+    if len(pos) > 1:
+        raise UsbError("Solo un DISCO. Prueba: nexo usb help", EXIT_USAGE)
+    link = connect_app(None, "storage")
+    try:
+        st = scall(link, "storage.status")
+    finally:
+        link.close()
+    sel = pos[0] if pos else o.get("vol")
+    vols = st.get("volumes") or []
+    if sel:
+        vols = [pick_volume(st, sel, need_mounted=False)]
+    elif not o.get("all"):
+        vols = [v for v in vols if not v.get("primary")]
+    if o.get("json"):
+        json_out(vols, o)
+        return 0
+    if not vols:
+        log(no_disk_text(st))
+        return 0
+    rows = []
+    for v in vols:
+        t, f = v.get("total"), v.get("free")
+        used = (t - f) if (t is not None and f is not None) else None
+        pct = ("%d %%" % round(100.0 * used / t)) if (used is not None and t) else "—"
+        rows.append((v.get("uuid"), vol_label(v), human(t) if t is not None else "—", human(used) if used is not None else "—",
+                     human(f) if f is not None else "—", pct, vol_state(v)))
+    out(table(rows, ("ID", "NOMBRE", "TOTAL", "USADO", "LIBRE", "USO", "ESTADO")) + "\n")
+    return 0
+
+
+def cmd_eject(argv):
+    o, pos = parse_args(argv, {"--vol": ("vol", str), "--json": ("json", True), "--pretty": ("pretty", True)})
+    if len(pos) > 1:
+        raise UsbError("Solo un DISCO. Prueba: nexo usb help", EXIT_USAGE)
+    sel = pos[0] if pos else o.get("vol")
+    link = connect_app(None, "storage")
+    try:
+        st = scall(link, "storage.status")
+        v = pick_volume(st, sel, need_mounted=False)
+        r = scall(link, "storage.eject", 30.0, volume=v["uuid"])
+    finally:
+        link.close()
+    ejected = bool(r.get("ejected"))
+    if o.get("json"):
+        json_out(r, o)
+        return 0 if ejected else EXIT_ERR
+    n = int(r.get("closed_files") or 0)
+    if n:
+        out("Cerré %d archivo%s abierto%s de «%s».\n" % (n, "" if n == 1 else "s", "" if n == 1 else "s", vol_label(v)))
+    if ejected:
+        out("«%s» expulsado: ya puedes desenchufarlo.\n" % vol_label(v))
+        return 0
+    log(r.get("hint") or "Android no expulsó «%s» desde aquí (a una app normal no siempre se lo permite). Expúlsalo con el botón «Expulsar» "
+        "de Android (la notificación del disco o Ajustes → Almacenamiento) y luego desenchúfalo." % vol_label(v))
+    return EXIT_ERR
+
+
 # ----------------------------------------------------------------------------------------------------- status, stop, reset
 
 
@@ -2496,13 +4275,14 @@ def main(argv):
     if cmd in ("version", "--version", "-V"):
         sys.stdout.write("nexo-usb %s\n" % NEXO_USB_VERSION)
         return 0
-    cmds = {"list": cmd_list, "ls": cmd_list, "permit": cmd_permit, "monitor": cmd_monitor, "bridge": cmd_bridge,
-            "status": cmd_status, "stop": cmd_stop, "reset": cmd_reset}
+    cmds = {"list": cmd_list, "permit": cmd_permit, "monitor": cmd_monitor, "bridge": cmd_bridge, "status": cmd_status, "stop": cmd_stop,
+            "reset": cmd_reset, "mounts": cmd_mounts, "access": cmd_access, "ls": cmd_ls, "stat": cmd_stat, "cat": cmd_cat, "get": cmd_get,
+            "put": cmd_put, "mkdir": cmd_mkdir, "rm": cmd_rm, "mv": cmd_mv, "df": cmd_df, "eject": cmd_eject}
     fn = cmds.get(cmd)
     if fn is None:
         sys.stderr.write("nexo usb: comando desconocido «%s». Prueba: nexo usb help\n" % cmd)
         return EXIT_USAGE
-    if "--help" in rest or "-h" in rest:
+    if "--help" in rest or rest == ["-h"]:
         sys.stdout.write(HELP)
         return 0
     try:
@@ -2510,8 +4290,18 @@ def main(argv):
     except UsbError as e:
         sys.stderr.write("nexo usb: %s\n" % e.message)
         return e.code
+    except FsError as e:
+        u = fs_to_usb(e)
+        sys.stderr.write("nexo usb: %s\n" % u.message)
+        return u.code
     except Stopped:
         return 0
+    except BrokenPipeError:                                  # «nexo usb cat … | head»: quien leía cerró; como cat, sale con 141
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 141
     except KeyboardInterrupt:
         return 130
 

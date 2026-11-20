@@ -516,7 +516,7 @@ lastrec() { tail -1 "$DB/recN" | jq -c .; }
 
 [ -S "$SYS_SOCK" ] || sbus_start
 : > "$DB/ctlN"; : > "$DB/recN"
-NPORT=$(start_app dbusN --ctl "$DB/ctlN" --record "$DB/recN" --minor4)
+NPORT=$(start_app dbusN --ctl "$DB/ctlN" --record "$DB/recN" --minor5)
 NPID=$(cat "$T/dbusN.pid")
 nmdd N "$NPORT"
 swait "$NM" 8 && ok "con WiFi en el móvil, org.freedesktop.NetworkManager aparece en el bus del sistema" || bad "NetworkManager no apareció" "$(cat "$DB/N.log")"
@@ -738,7 +738,7 @@ dd_stop
 kill "$NPID" 2>/dev/null; wait "$NPID" 2>/dev/null
 # con una app que sí cuenta la red (protocolo 1.3), manda lo que ella diga
 : > "$DB/ctlN"
-NPORT=$(start_app dbusN4 --ctl "$DB/ctlN" --minor4)
+NPORT=$(start_app dbusN4 --ctl "$DB/ctlN" --minor5)
 NPID=$(cat "$T/dbusN4.pid")
 nctl "net none"
 sleep 0.4

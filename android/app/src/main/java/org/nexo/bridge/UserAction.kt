@@ -25,6 +25,7 @@ object UserAction {
     const val ID_AUDIO = 1003
     const val ID_LISTENER = 1004
     const val ID_RECOVERY = 1005
+    const val ID_STORAGE = 1006
 
     /**
      * Crea los canales de notificación. Se llama al abrir la pantalla: en Android 13+ eso es

@@ -19,8 +19,8 @@ android {
         // Como no se publica en Google Play, no hay obligación de apuntar más alto.
         targetSdk = 28
 
-        versionCode = 6
-        versionName = "0.4.1"
+        versionCode = 7
+        versionName = "0.4.2"
     }
 
     // Archivos que viajan dentro del APK como assets: el cliente y el instalador de Termux.

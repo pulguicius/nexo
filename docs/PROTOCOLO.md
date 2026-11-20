@@ -1,4 +1,4 @@
-# Protocolo Nexo (versión 1, revisión 3)
+# Protocolo Nexo (versión 1, revisión 4)
 
 Lo que hablan la app Android y los clientes (`nexo`, `nexo-dbus`, o el tuyo). Es deliberadamente simple para que se
 pueda usar desde bash, Python, Node, QML o lo que tengas dentro de una distro.
@@ -11,7 +11,8 @@ conozca, y una app nueva sigue atendiendo a los clientes viejos. La *revisión* 
 | 1 | 0.1.x | WiFi, Bluetooth, eventos, bootstrap |
 | 2 | 0.2.x | audio, media, `wifi.saved/forget/reconnect`, `bt.forget/rename/info`, `logs`, `commands` en `hello`, `gateway/prefix/dns` en `wifi.status` |
 | 3 | 0.4.1 | USB serie (Arduino, ESP32, adaptadores USB↔serie): `usb.status`, `usb.permission`, `usb.open`, `usb.setup`, `usb.control`, `usb.close`, `usb.attach`, el tema de eventos `usb` y el campo `usb` en `hello`. Una conexión puede pasar a ser de **bytes** (`usb.attach`) |
-| 4 | 0.4.3 (previsto) | `net.status` (qué red usa el móvil) y el tema de eventos `net`; notificaciones: `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` |
+| 4 | 0.4.2 | Discos USB (pendrives, discos duros y SSD externos): `storage.status`, `storage.access`, `storage.revoke`, `storage.list`, `storage.stat`, `storage.open`, `storage.read`, `storage.write`, `storage.sync`, `storage.close`, `storage.mkdir`, `storage.delete`, `storage.rename`, `storage.eject`, el tema de eventos `storage` y el campo `storage` en `hello`. Los archivos viajan en trozos de base64 por la misma conexión JSON (no hay conexiones de bytes nuevas) |
+| 5 | 0.4.3 (previsto) | `net.status` (qué red usa el móvil) y el tema de eventos `net`; notificaciones: `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` |
 
 ## Transporte
 
@@ -29,12 +30,13 @@ Si el token es incorrecto, la app espera ~0,8 s, responde `unauthorized` y cierr
 {"id":"1","cmd":"hello","token":"<48 caracteres hex>","client":"mi-cliente/1.0"}
 ```
 ```json
-{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.1","proto":1,"minor":3,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"usb":true,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
+{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.2","proto":1,"minor":4,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"usb":true,"storage":true,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
 ```
 
 - `wifi` y `bluetooth` dicen si el móvil tiene esa radio.
 - `listener` dice si Android le dio a Nexo «acceso a notificaciones» (hace falta para `media.*` y `notif`).
 - `usb` (revisión 3) dice si el móvil tiene modo anfitrión USB (OTG). Una app de la revisión 2 no lo envía.
+- `storage` (revisión 4) dice si el móvil tiene el servicio de almacenamiento de Android (todos lo tienen). Una app de la revisión 3 no lo envía; los comandos `storage.*` en `commands` son la forma segura de saber si esta app maneja discos.
 - `commands` es la lista de comandos que esta app entiende: úsala para detectar capacidades en vez de adivinar por la versión.
 
 El token se muestra en la app y se guarda con `nexo pair TOKEN` (archivo `config` con modo 600). Se invalida con «Token nuevo».
@@ -60,12 +62,24 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 | `needs_user_action` | Android no deja hacerlo solo. La app dejó una **notificación** que abre el panel adecuado: la respuesta trae `"action":"notification"` y `"opens"` = `wifi_panel`, `bluetooth_enable`, `bluetooth_settings`, `volume_panel` o `notification_listener_settings` |
 | `wifi_disabled` / `bluetooth_disabled` | El comando necesita la radio encendida |
 | `not_paired` | El dispositivo Bluetooth no está emparejado en Android |
-| `not_found` | Lo que pides no existe: red guardada, salida de audio, sesión de medios, carátula, dispositivo o sesión USB |
+| `not_found` | Lo que pides no existe: red guardada, salida de audio, sesión de medios, carátula, dispositivo o sesión USB; en discos, un disco, un archivo o carpeta, o un archivo abierto (`handle`) que ya no está abierto |
 | `busy` | USB: el dispositivo ya está abierto (por otra sesión, por otra app, o Android no deja reclamar su interfaz) o la sesión ya tiene un flujo de datos conectado |
 | `unsupported` | Este móvil o esta versión de Android no tiene eso |
 | `failed` | Android rechazó la operación |
 | `timeout` | El comando tardó más de lo razonable (la app no se quedó colgada: contesta y sigue) |
 | `rate_limited` | Solo para `bootstrap` (el instalador): se pidió demasiado seguido (máx. 1 cada 2 s y 10 por minuto en total). Se cierra la conexión; reintenta en unos segundos |
+| `no_access` | Discos USB: Nexo todavía no tiene acceso a ese disco. Se pide con `storage.access` (el usuario lo concede en el selector de carpetas de Android). La respuesta lleva `volume` |
+| `unavailable` | Discos USB: el disco no está montado. La respuesta lleva `volume` y `state` |
+| `bad_path` | Una ruta o un nombre no vale: demasiado largo (4096 caracteres la ruta, 255 bytes un nombre), lleva `..`, caracteres de control o `/` dentro de un nombre; o, en un nombre **nuevo**, un carácter que los discos USB no admiten (`"` `*` `:` `<` `>` `?` `\` y la barra vertical) o un punto o un espacio al final. También: borrar o mover la raíz del disco, o mover una carpeta dentro de sí misma |
+| `exists` | Ya existe lo que se quería crear (o el destino de un renombrado) |
+| `not_dir` | Se esperaba una carpeta y es un archivo |
+| `is_dir` | Se esperaba un archivo y es una carpeta |
+| `not_empty` | La carpeta que se quiere borrar no está vacía (`storage.delete` nunca borra de forma recursiva) |
+| `read_only` | El disco está montado en solo lectura, o ese archivo se abrió solo para leer |
+| `no_space` | El disco está lleno |
+| `too_big` | El archivo no cabe en el sistema de archivos del disco (FAT32 no admite archivos de 4 GiB o más) |
+| `io_error` | Android o el disco fallaron al leer, escribir o borrar |
+| `limit` | Demasiados archivos abiertos a la vez (64 en total, 16 por conexión) |
 | `internal` | Error inesperado de la app |
 
 ## Comandos
@@ -75,7 +89,7 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 |---|---|---|
 | `hello` | `token`, `client?` | información de la app (arriba) |
 | `ping` | — | `{"pong":true,"t":<ms>}` |
-| `subscribe` | `topics?` = `["wifi","bt","audio","media","usb"]` | `{"topics":[…]}`, y después un evento inicial por tema |
+| `subscribe` | `topics?` = `["wifi","bt","audio","media","usb","storage"]` | `{"topics":[…]}`, y después un evento inicial por tema |
 | `unsubscribe` | — | — |
 | `logs` | `n?` (50; máx. 200) | `{"lines":[…],"count":N,"uptime_s":S}`: lo último que anotó la app. Nunca lleva el token ni claves |
 | `bootstrap` | — | **No es JSON**: ver más abajo. No necesita token |
@@ -147,7 +161,7 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 ### USB serie
 Arduino, ESP32 y adaptadores USB↔serie (CDC‑ACM, CP210x, FTDI, CH34x) conectados al móvil por OTG o por un hub. Android **no deja** que una distro
 de proot abra `/dev/bus/usb` ni monte nada, así que la app abre el dispositivo con la API oficial (`UsbManager`, tras pedirle permiso al usuario) y le
-pasa a Linux **solo los bytes de la línea serie**. Pendrives, discos, teclados y ratones no son parte de esto (los discos llegan en la 0.4.2).
+pasa a Linux **solo los bytes de la línea serie**. Los pendrives y los discos tienen su propia sección (justo debajo); teclados y ratones no son parte de esto.
 
 | Comando | Parámetros | `data` |
 |---|---|---|
@@ -195,6 +209,69 @@ printf '%s\n' '{"id":"2","cmd":"usb.attach","session":"s1"}' >&4; read -r -t 5 l
 cat <&4                                                           # …y aquí salen los bytes del Arduino (Ctrl‑C para salir)
 ```
 
+### Discos USB (almacenamiento)
+Pendrives, discos duros y SSD externos conectados por OTG o por un hub. Android monta el disco él solo (`vold`) y lo enseña como un *volumen*; una distro de proot ni lo ve ni
+puede montarlo. Nexo **no** pide «acceso a todos los archivos»: el usuario elige el disco en el selector de carpetas de Android (Storage Access Framework), Android recuerda ese
+permiso, y la app ofrece a Linux las operaciones sobre archivos **solo** dentro de lo autorizado. Todo viaja por la misma conexión JSON: los datos, en trozos de base64.
+Qué está probado y qué no, en [USB-ALMACENAMIENTO.md](USB-ALMACENAMIENTO.md).
+
+| Comando | Parámetros | `data` |
+|---|---|---|
+| `storage.status` | — | `available`, `volumes:[…]` (abajo), `mass_storage_devices` (dispositivos USB de almacenamiento masivo que ve `UsbManager`), `open_files` |
+| `storage.access` | `volume`, `wait_ms?` (0‑30000) | `{volume,granted,requested,denied}` |
+| `storage.revoke` | `volume` | `{volume,released}`: Nexo olvida el acceso (cierra antes sus archivos abiertos) |
+| `storage.list` | `volume`, `path?` (`/`), `offset?` (0), `limit?` (500; de 1 a 2000) | `{path,entries:[…],total,offset}` |
+| `storage.stat` | `volume`, `path?` (`/`) | una entrada (abajo) + `path` |
+| `storage.open` | `volume`, `path`, `mode?` (`r`, `w`, `a` o `rw`), `create?`, `truncate?`, `exclusive?` | `{handle,size,writable}` |
+| `storage.read` | `handle`, `offset`, `len?` (máx. 49152) | `{n,eof,data}`, con `data` en base64 |
+| `storage.write` | `handle`, `offset`, `data` (base64; máx. 32768 bytes ya decodificados) | `{n}` |
+| `storage.sync` | `handle` o `volume` | `{synced}`: cuántos archivos de escritura vació al disco |
+| `storage.close` | `handle` | `{closed}` (`false` si ya no estaba abierto) |
+| `storage.mkdir` | `volume`, `path`, `parents?` (`false`) | `{created:true}` |
+| `storage.delete` | `volume`, `path` | `{deleted:true}` |
+| `storage.rename` | `volume`, `from`, `to`, `overwrite?` (`false`) | `{renamed:true}` |
+| `storage.eject` | `volume` | `{volume,closed_files,attempted,ejected,state,hint?}` |
+
+**Orden de uso:** `storage.status` → (si `granted:false`) `storage.access` → `storage.list` / `storage.stat` → `storage.open` → `storage.read` / `storage.write` → `storage.close`.
+
+- **Volumen.** Los comandos con `volume` aceptan el UUID del disco (`1111-2222`) o su nombre, sin distinguir mayúsculas (`not_found` si no hay ninguno; `bad_request` si dos se llaman igual: usa el UUID).
+  `storage.status` lista los discos que Android tiene (la memoria interna del móvil no aparece). Cada uno: `id` (igual a `uuid`), `uuid`, `label`, `state`
+  (el de Android: `mounted`, `mounted_ro`, `checking`, `ejecting`, `unmounted`, `removed`, `bad_removal`, `unmountable`, `nofs`, `shared`…), `mounted` (montado, con escritura o sin ella),
+  `readonly`, `removable`, `primary`, `path` (dónde lo monta Android, p. ej. `/storage/1111-2222`: solo lo ve quien tenga permiso para ello, no una distro de proot normal),
+  `granted` (¿Nexo tiene acceso?), `scope` (la carpeta autorizada dentro del disco; `""` es el disco entero; `null` si no hay acceso), `open_files`, y `total` y `free` en bytes (`null` si Android no los dice).
+  Los comandos de archivos con el disco sin montar responden `unavailable`.
+- **Acceso.** `storage.access` responde `granted:true, requested:false` si ya lo hay. Si no, abre el selector de carpetas de Android en el móvil (o deja una notificación que lo abre, si la pantalla de Nexo no está a la vista)
+  y, con `wait_ms`, espera esa cantidad de milisegundos a que el usuario conteste; si no contesta a tiempo, responde `granted:false, requested:true, denied:false` y se vuelve a consultar con `storage.status`. `denied:true` = dijo que no.
+  El usuario debe elegir una carpeta **del propio disco** y pulsar «Usar esta carpeta»; si elige una subcarpeta, esa carpeta pasa a ser la raíz para Nexo (`scope` dice cuál) y no puede salir de ella.
+  Android recuerda el permiso aunque se desenchufe el disco; `storage.revoke` lo quita.
+- **Rutas.** Siempre con `/` y relativas a la raíz del disco (o de la carpeta autorizada). `..` no existe y las barras repetidas se ignoran. Los errores de nombre son `bad_path` (tabla de errores).
+  Los nombres nuevos no admiten `"` `*` `:` `<` `>` `?` `\` ni la barra vertical, ni acabar en punto o espacio: Android los cambiaría por `_` sin avisar y el archivo acabaría con otro nombre.
+  Lo que ya existe con esos nombres (por ejemplo, en un disco ext4) se lee, se borra y se mueve igualmente.
+- **Entradas.** `{name,type,size,mtime_ms,mime?,writable}`: `type` es `file` o `dir`; `size` y `mtime_ms` (milisegundos desde 1970) valen 0 si Android no los dice; `mime` falta si no se conoce.
+  `storage.list` devuelve primero las carpetas y luego los archivos, por nombre sin distinguir mayúsculas, siempre en el mismo orden: se puede paginar con `offset` y `limit`.
+- **Abrir.** `mode` `r` lee (por omisión); `w` crea o vacía y escribe; `a` crea si falta y escribe sin vaciar (`size` dice dónde está el final); `rw` lee y escribe uno que ya existe.
+  `create`, `truncate` y `exclusive` (falla con `exists` si ya está) ajustan lo que cada modo hace y solo cuentan en los de escritura. Para crear, la carpeta de arriba debe existir: `open` no crea carpetas.
+  No hay «posición actual»: cada `storage.read` y `storage.write` lleva su `offset` (como `pread` y `pwrite`). `eof:true` quiere decir que esa lectura llegó al final del archivo.
+  Se pueden mandar varias peticiones seguidas sin esperar las respuestas (se contestan en orden): `nexo usb get` y `nexo usb put` mantienen tres en vuelo.
+- **Archivos abiertos.** Un `handle` es de la conexión que lo abrió y se cierra solo cuando esa conexión se cierra, cuando el disco se desmonta, cuando se revoca el acceso o al apagar el puente.
+  Tope: 64 abiertos en total y 16 por conexión (`limit`). Cerrar un archivo de escritura lo vacía antes al disco (`sync`); si eso falla (p. ej. `no_space`), el archivo se cierra igualmente y el error vuelve en la respuesta de `storage.close`.
+  Un `handle` que ya no está abierto responde `not_found`.
+- **Borrar y mover.** `storage.delete` borra un archivo o una carpeta **vacía**: nunca de forma recursiva (`not_empty`), porque Android borraría el árbol entero sin avisar; quien quiera borrar un árbol lo recorre (es lo que hace `nexo usb rm -r`).
+  La raíz del disco no se borra ni se mueve. `storage.rename` renombra o mueve **dentro del mismo disco**; si el destino existe responde `exists`, y con `overwrite:true` sustituye un archivo por otro archivo o una carpeta vacía por otra carpeta.
+- **Expulsar.** `storage.eject` cierra (vaciando antes) los archivos abiertos de ese disco y le pide a Android que lo expulse (`DocumentsContract.ejectRoot`). Una app normal puede no tener permiso para eso y Android lo ignora **sin avisar**:
+  por eso la app mira el estado del disco hasta 3 s después. `ejected:true` = ya no está montado; si no, `ejected:false` y `hint` dice qué hacer a mano (el botón «Expulsar» de Android). `attempted` dice si Android aceptó la llamada (no que expulsara nada) y
+  `state` es el estado del disco tras el intento (`removed` si ya no está).
+- **Eventos.** El tema `storage` (abajo) manda `storage.status` entero cuando se monta, se expulsa o se quita un disco, cambia su estado o Nexo gana o pierde el acceso. No avisa por cada archivo.
+
+```bash
+exec 3<>/dev/tcp/127.0.0.1/8765
+printf '%s\n' '{"id":"1","cmd":"hello","token":"TU_TOKEN"}' >&3;                              read -r -t 5 l <&3
+printf '%s\n' '{"id":"2","cmd":"storage.status"}' >&3;                                        read -r -t 5 l <&3; echo "$l"   # anota el "uuid" del disco
+printf '%s\n' '{"id":"3","cmd":"storage.access","volume":"1111-2222","wait_ms":30000}' >&3;    read -r -t 35 l <&3             # solo la primera vez: se concede en el móvil
+printf '%s\n' '{"id":"4","cmd":"storage.list","volume":"1111-2222","path":"/"}' >&3;          read -r -t 10 l <&3; echo "$l"
+exec 3>&-
+```
+
 ### Media
 Necesita que el usuario conceda a Nexo el **acceso a notificaciones** (Ajustes › Notificaciones › Acceso a notificaciones). Sin él,
 `media.status` responde con `listener:false` (no es un error) y los demás comandos responden `needs_user_action` con `opens:"notification_listener_settings"`.
@@ -222,12 +299,14 @@ Tras `subscribe`, la app envía líneas **sin `id`**:
 {"event":"audio","data":{ …igual que audio.status… }}
 {"event":"media","data":{ …igual que media.status… }}
 {"event":"usb","data":{ …igual que usb.status… }}
+{"event":"storage","data":{ …igual que storage.status… }}
 ```
 
 Se juntan las ráfagas (300 ms) y no se emiten cambios de intensidad de señal ni de posición de la canción
 (quien la necesite la extrapola con `position_ms` y `speed`, o la pide con `media.status`). El tema `usb` avisa cuando se enchufa o desenchufa un dispositivo, cambia un permiso o
 se abre o se cierra una sesión (no por cada byte: los contadores `rx` y `tx` de un evento son los del momento del aviso).
-Sin `topics`, se suscribe a `wifi`, `bt`, `audio`, `media` y `usb`. El cliente `nexo watch` envía un `ping` cada 30 s sin actividad
+El tema `storage` avisa cuando se monta, se expulsa o se quita un disco, cambia su estado o Nexo gana o pierde el acceso a él (no por cada archivo).
+Sin `topics`, se suscribe a `wifi`, `bt`, `audio`, `media`, `usb` y `storage`. El cliente `nexo watch` envía un `ping` cada 30 s sin actividad
 y reconecta solo (con espera creciente) si se corta.
 
 ## `bootstrap`: instalar el cliente sin internet

@@ -21,7 +21,7 @@ jobs:
       # Aviso, no bloquea: sirve para ver los hallazgos de shellcheck sin que una observación tumbe la compilación.
       - name: shellcheck (solo errores)
         continue-on-error: true
-        run: shellcheck -S error termux/bin/nexo termux/bin/nexo-tools termux/install.sh tests/run_tests.sh tests/dbus_tests.sh tests/tools_tests.sh tests/usb_tests.sh tests/usb_hardware_check.sh tests/playerctl_check.sh
+        run: shellcheck -S error termux/bin/nexo termux/bin/nexo-tools termux/install.sh tests/run_tests.sh tests/dbus_tests.sh tests/tools_tests.sh tests/usb_tests.sh tests/usb_storage_tests.sh tests/usb_hardware_check.sh tests/usb_storage_hardware_check.sh tests/playerctl_check.sh
       - name: Pruebas contra la app simulada
         # Las pruebas con un bus D-Bus real dependen más del entorno: van en el trabajo «dbus» (que no bloquea).
         env:
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     # No bloquea: usa puertos locales, PTY y relojes (el reinicio del Arduino se mide en milisegundos) y en un ejecutor muy
     # cargado puede dar un falso rojo. Ojo: lo que prueba es el protocolo y los puentes contra una app SIMULADA; con una
-    # placa y un móvil reales no se ha podido probar (para eso está tests/usb_hardware_check.sh).
+    # placa y un móvil reales no se ha podido probar (para eso están tests/usb_hardware_check.sh y tests/usb_storage_hardware_check.sh).
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -115,8 +115,8 @@ jobs:
             echo "Sin secretos de firma: se usará la clave de depuración."
           fi
 
-      # Las pruebas de JVM de los controladores USB (sin móvil). No bloquean: si alguna falla, el registro dice cuál.
-      - name: Pruebas de JVM (controladores USB)
+      # Las pruebas de JVM de los controladores USB y de las reglas de los discos (sin móvil). No bloquean: si alguna falla, el registro dice cuál.
+      - name: Pruebas de JVM (controladores USB y reglas de los discos)
         continue-on-error: true
         working-directory: android
         run: |

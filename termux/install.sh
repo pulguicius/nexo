@@ -12,7 +12,7 @@
 #
 # Instala cuatro archivos: «nexo» (el cliente), «nexo-dbus» (el reproductor MPRIS/BlueZ/NetworkManager para escritorios;
 # necesita python3 y se activa aparte con «nexo setup-dbus»), «nexo-tools» (archivos entre móviles; necesita python3 y
-# openssl; se usa con «nexo tools») y «nexo-usb» (Arduino, ESP32 y adaptadores serie USB; necesita python3; se usa con
+# openssl; se usa con «nexo tools») y «nexo-usb» (Arduino, ESP32, adaptadores serie y discos USB; necesita python3; se usa con
 # «nexo usb»).
 #
 # Variables opcionales: NEXO_BIN_DIR, NEXO_CONFIG_DIR, NEXO_NO_DEPS=1 (no instalar jq)
@@ -160,7 +160,7 @@ if [ -n "${NEXO_TOOLS_B64:-}" ] || [ -f "$SRC_DIR/bin/nexo-tools" ]; then
     fi
 fi
 
-# nexo-usb (Arduino, ESP32 y adaptadores serie USB): igual de opcional que los dos anteriores.
+# nexo-usb (Arduino, ESP32, adaptadores serie y discos USB): igual de opcional que los dos anteriores.
 if [ -n "${NEXO_USB_B64:-}" ] || [ -f "$SRC_DIR/bin/nexo-usb" ]; then
     TMPU=$BIN_DIR/nexo-usb.tmp.$$
     USB_OK=1
@@ -171,7 +171,7 @@ if [ -n "${NEXO_USB_B64:-}" ] || [ -f "$SRC_DIR/bin/nexo-usb" ]; then
     fi
     if [ "$USB_OK" = 1 ] && chmod 755 "$TMPU" && mv -f "$TMPU" "$BIN_DIR/nexo-usb"; then
         if [ "$IS_TERMUX" = 1 ] && have termux-fix-shebang; then termux-fix-shebang "$BIN_DIR/nexo-usb" 2>/dev/null; fi
-        say "✔ nexo-usb instalado en $BIN_DIR/nexo-usb (Arduino, ESP32 y adaptadores serie USB con un cable OTG: nexo usb list)"
+        say "✔ nexo-usb instalado en $BIN_DIR/nexo-usb (Arduino, ESP32, adaptadores serie y pendrives o discos USB con un cable OTG: nexo usb list · nexo usb mounts)"
         have python3 || warn "nexo-usb necesita python3:  pkg install python"
     else
         rm -f "$TMPU"

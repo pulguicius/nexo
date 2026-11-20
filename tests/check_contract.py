@@ -82,14 +82,14 @@ def keys_in(text, keep=()):
 spec = importlib.util.spec_from_file_location("fake_app", os.path.join(ROOT, "tests", "fake_app.py"))
 fa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fa)
-fa.ARGS = argparse.Namespace(old=False, listener=True, no_session=False, record=None, reqlog=None, minor2=False, minor3=False, minor4=False)
+fa.ARGS = argparse.Namespace(old=False, listener=True, no_session=False, record=None, reqlog=None, minor2=False, minor3=False, minor4=False, minor5=False)
 
 # ---------------------------------------------------------------- comandos y temas
 commands_kt = kt("Commands.kt")
 minor = int(re.search(r"const val MINOR = (\d+)", kt("Protocol.kt")).group(1))
 m = re.search(r"val NAMES: List<String> = listOf\((.*?)\)\.sorted\(\)", commands_kt, re.S)
 names = sorted(re.findall(r'"([a-z.]+)"', m.group(1))) if m else []
-spec_names = sorted(fa.OLD_COMMANDS | fa.NEW_COMMANDS | (fa.V13_COMMANDS if minor >= 3 else set()) | (fa.V14_COMMANDS if minor >= 4 else set()))
+spec_names = sorted(fa.OLD_COMMANDS | fa.NEW_COMMANDS | (fa.V13_COMMANDS if minor >= 3 else set()) | (fa.V14_COMMANDS if minor >= 4 else set()) | (fa.V15_COMMANDS if minor >= 5 else set()))
 check("la lista de comandos de la app (Commands.NAMES) es la de la app falsa", names == spec_names,
       "  solo en la app: %s\n  solo en la falsa: %s" % (sorted(set(names) - set(spec_names)), sorted(set(spec_names) - set(names))))
 
@@ -105,8 +105,9 @@ check("el servidor atiende hello, ping, subscribe, unsubscribe (y usb.attach)",
 
 m = re.search(r"val TOPICS: List<String> = listOf\((.*?)\)", commands_kt, re.S)
 topics = set(re.findall(r'"([a-z]+)"', m.group(1))) if m else set()
-check("los temas a los que se suscribe quien no indica ninguno son wifi, bt, audio, media y usb", topics == {"wifi", "bt", "audio", "media", "usb"}, "  son: %s" % sorted(topics))
-if minor >= 4:
+default_topics = {"wifi", "bt", "audio", "media", "usb"} | ({"storage"} if minor >= 4 else set())
+check("los temas a los que se suscribe quien no indica ninguno son wifi, bt, audio, media, usb y storage", topics == default_topics, "  son: %s" % sorted(topics))
+if minor >= 5:
     m = re.search(r"val OPTIONAL_TOPICS: List<String> = listOf\((.*?)\)", commands_kt, re.S)
     optional_topics = set(re.findall(r'"([a-z]+)"', m.group(1))) if m else set()
     check("…y los temas que hay que pedir expresamente (OPTIONAL_TOPICS) son net y notif", optional_topics == {"net", "notif"}, "  son: %s" % sorted(optional_topics))
@@ -186,8 +187,8 @@ same("media.seek", keys_in(body(media_kt, r"fun seek\(req: JSONObject\): JSONObj
 same("media.play/pause/…", keys_in(body(media_kt, r"fun control\(cmd: String\): JSONObject \{")), {"requested", "state"})
 same("logs", keys_in(body(commands_kt, r"private fun logs\(req: JSONObject\): JSONObject \{")), fa.dispatch("logs", {}).keys())
 
-# protocolo 1.4: estado de la red del móvil y reenvío de notificaciones
-if minor >= 4:
+# protocolo 1.5: estado de la red del móvil y reenvío de notificaciones
+if minor >= 5:
     net_kt, notif_kt = kt("NetHandler.kt"), kt("NotifBridge.kt")
     same("net.status (y el evento «net»)", keys_in(body(net_kt, r"fun status\(\): JSONObject \{")), fa.net_status().keys())
     same("notif.status", keys_in(body(notif_kt, r"fun status\(\): JSONObject \{")), fa.notif_status().keys())
@@ -230,9 +231,87 @@ if minor >= 3:
         fa.usb_unplug("all")
     check("docs/PROTOCOLO.md documenta el tema usb y sus campos", "`usb`" in doc and all(("`%s`" % k) in doc for k in ("serial_capable", "ep_in", "needs_permission")))
 
+# protocolo 1.4: almacenamiento USB
+if minor >= 4:
+    import shutil
+    import tempfile
+    st_kt, logic_kt = kt("StorageHandler.kt"), kt("StorageLogic.kt")
+    fa.ST["dir"] = tempfile.mkdtemp(prefix="nexo-contrato-")
+    try:
+        fa.storage_add("Contrato", "0000-0001", set())
+        disk = os.path.join(fa.ST["dir"], "0000-0001")
+        os.makedirs(os.path.join(disk, "d"))
+        with open(os.path.join(disk, "f.txt"), "wb") as f:
+            f.write(b"x")
+        vol = {"volume": "0000-0001"}
+        stat_spec = fa.storage_status()
+        same("storage.status", keys_in(body(st_kt, r"fun status\(\): JSONObject \{")), stat_spec.keys())
+        same("storage.status (cada volumen, también en los eventos «storage»)",
+             keys_in(body(st_kt, r"private fun volumeJson\(.*?\): JSONObject \{")), stat_spec["volumes"][0].keys())
+        same("storage.access", keys_in(body(st_kt, r"fun access\(req: JSONObject\): JSONObject = guard \{")), fa.storage_access(vol).keys())
+        lst = fa.storage_list(dict(vol, path="/"))
+        same("storage.list", keys_in(body(st_kt, r"fun list\(req: JSONObject\): JSONObject = guard \{")), lst.keys())
+        file_entry = [e for e in lst["entries"] if e["type"] == "file"][0]
+        same("storage (cada entrada de una carpeta, en storage.list y storage.stat)",
+             keys_in(body(st_kt, r"private fun entryJson\(e: DocEntry\): JSONObject \{")), file_entry.keys())
+        same("storage.stat (además de los campos de la entrada)", keys_in(body(st_kt, r"fun stat\(req: JSONObject\): JSONObject = guard \{")),
+             set(fa.storage_stat(dict(vol, path="/f.txt")).keys()) - set(file_entry.keys()))
+        opened = fa.storage_open(dict(vol, path="/f.txt", mode="rw"), None)
+        same("storage.open", keys_in(body(st_kt, r"fun open\(req: JSONObject, owner: Any\?\): JSONObject = guard \{")), opened.keys())
+        same("storage.read", keys_in(body(st_kt, r"fun read\(req: JSONObject\): JSONObject = guard \{")), fa.storage_read({"handle": opened["handle"], "offset": 0}).keys())
+        same("storage.write", keys_in(body(st_kt, r"fun write\(req: JSONObject\): JSONObject = guard \{")),
+             fa.storage_write({"handle": opened["handle"], "offset": 0, "data": "eA=="}).keys())
+        same("storage.sync", keys_in(body(st_kt, r"fun sync\(req: JSONObject\): JSONObject = guard \{")), fa.storage_sync({"handle": opened["handle"]}).keys())
+        same("storage.close", keys_in(body(st_kt, r"fun close\(req: JSONObject\): JSONObject = guard \{")), fa.storage_close({"handle": opened["handle"]}).keys())
+        same("storage.mkdir", keys_in(body(st_kt, r"fun mkdir\(req: JSONObject\): JSONObject = guard \{")), fa.storage_mkdir(dict(vol, path="/n")).keys())
+        same("storage.rename", keys_in(body(st_kt, r"fun rename\(req: JSONObject\): JSONObject = guard \{")),
+             fa.storage_rename(dict(vol, **{"from": "/n", "to": "/m"})).keys())
+        same("storage.delete", keys_in(body(st_kt, r"fun delete\(req: JSONObject\): JSONObject = guard \{")), fa.storage_delete(dict(vol, path="/m")).keys())
+        fa.ST["vols"][0]["eject"] = "silent"
+        same("storage.eject (con el aviso de cuando Android no lo expulsa)", keys_in(body(st_kt, r"fun eject\(req: JSONObject\): JSONObject = guard \{")),
+             fa.storage_eject(vol).keys())
+        same("storage.revoke", keys_in(body(st_kt, r"fun revoke\(req: JSONObject\): JSONObject = guard \{")), fa.storage_revoke(vol).keys())
+
+        def const(src, name):
+            m = re.search(r"const val %s = ([0-9_]+)" % name, src)
+            return int(m.group(1).replace("_", "")) if m else None
+        limits = [("READ_MAX", fa.STORAGE_READ_MAX), ("WRITE_MAX", fa.STORAGE_WRITE_MAX), ("LIST_DEFAULT", fa.STORAGE_LIST_DEFAULT),
+                  ("LIST_MAX", fa.STORAGE_LIST_MAX), ("MAX_HANDLES", fa.STORAGE_MAX_HANDLES),
+                  ("MAX_HANDLES_PER_OWNER", fa.STORAGE_MAX_HANDLES_PER_OWNER), ("MAX_PATH", fa.STORAGE_MAX_PATH),
+                  ("MAX_NAME_BYTES", fa.STORAGE_MAX_NAME_BYTES)]
+        check("los límites del almacenamiento (trozos, listas, archivos abiertos, rutas) son los mismos en la app y en la app falsa",
+              all(const(logic_kt, k) == v for k, v in limits), "  %s" % [(k, const(logic_kt, k), v) for k, v in limits])
+        bad_kt = re.search(r'BAD_NEW_CHARS = "((?:[^"\\]|\\.)*)"', logic_kt).group(1).replace('\\"', '"').replace("\\\\", "\\")
+
+        def refuses(name):
+            try:
+                fa.st_check_new_name(name)
+                return False
+            except fa.Err:
+                return True
+        bad_fake = set(chr(c) for c in range(32, 127) if refuses("a" + chr(c) + "b"))
+        check("los caracteres que no se admiten en un nombre nuevo son los mismos en la app y en la app falsa", bad_fake == set(bad_kt),
+              "  app: %r  falsa: %r" % (sorted(set(bad_kt)), sorted(bad_fake)))
+        block = fa_src[fa_src.index("# ---------------------------------------------------------------- almacenamiento USB"):fa_src.index("def ctl_apply")]
+        codes_fake = set(re.findall(r'Err\("([a-z_]+)"', block))
+        codes_kt = set(re.findall(r'(?:StorageException|CmdException)\(\s*"([a-z_]+)"', logic_kt + kt("StorageSaf.kt") + st_kt))
+        check("el almacenamiento de la app falsa y el de la app lanzan los mismos códigos de error", codes_fake == codes_kt,
+              "  solo en la app: %s\n  solo en la falsa: %s" % (sorted(codes_kt - codes_fake), sorted(codes_fake - codes_kt)))
+    finally:
+        fa.st_handles_close_where(lambda h: True)
+        fa.ST["vols"][:] = []
+        fa.ST["grants"].clear()
+        shutil.rmtree(fa.ST["dir"], ignore_errors=True)
+    check("docs/PROTOCOLO.md documenta el tema storage y sus campos y errores",
+          "`storage`" in doc and all(("`%s`" % k) in doc for k in ("mass_storage_devices", "no_access", "unavailable", "too_big", "no_space", "not_empty", "mtime_ms")))
+    check("existe docs/USB-ALMACENAMIENTO.md y README, CHANGELOG y LIMITACIONES hablan del almacenamiento USB",
+          os.path.isfile(os.path.join(ROOT, "docs", "USB-ALMACENAMIENTO.md")) and "nexo usb mounts" in rd("README.md")
+          and "almacenamiento" in rd("CHANGELOG.md").lower() and "FAT32" in rd("docs/LIMITACIONES.md"))
+
 # ---------------------------------------------------------------- errores y paneles documentados
 all_kt = "\n".join(kt(f) for f in sorted(os.listdir(KT)) if f.endswith(".kt"))
-codes = set(re.findall(r'CmdException\(\s*"([a-z_]+)"', all_kt)) | set(re.findall(r'Protocol\.error\([^,]+,\s*"([a-z_]+)"', all_kt))
+codes = set(re.findall(r'CmdException\(\s*"([a-z_]+)"', all_kt)) | set(re.findall(r'Protocol\.error\([^,]+,\s*"([a-z_]+)"', all_kt)) \
+    | set(re.findall(r'StorageException\(\s*"([a-z_]+)"', all_kt))
 spec_codes = set(re.findall(r'Err\("([a-z_]+)"', fa_src))
 table = doc[doc.index("### Códigos de error"):doc.index("## Comandos")]
 documented = set(re.findall(r"`([a-z_]+)`", "\n".join(l.split("|")[1] for l in table.splitlines() if l.startswith("| `"))))
@@ -250,8 +329,8 @@ opens_fake |= set(re.findall(r'\n\s+"([a-z_]+_(?:settings|panel|enable))"\)', fa
 opens_doc = set(re.findall(r"`([a-z_]+)`", doc[doc.index("| `needs_user_action`"):].split("\n", 1)[0]))
 check("los paneles (`opens`) que abre la app están todos documentados", opens_kt and opens_kt <= opens_doc,
       "  app: %s\n  doc: %s" % (sorted(opens_kt), sorted(opens_doc)))
-if minor < 4:
-    opens_fake -= fa.V14_OPENS      # los paneles del protocolo 1.4 los traerá la app cuando llegue a la revisión 4
+if minor < 5:
+    opens_fake -= fa.V15_OPENS      # los paneles del protocolo 1.5 los traerá la app cuando llegue a la revisión 5
 check("…y los que usa la app falsa existen también en la app", opens_fake <= opens_kt, "  falsa: %s\n  app: %s" % (sorted(opens_fake), sorted(opens_kt)))
 
 # ---------------------------------------------------------------- manifiesto
@@ -272,6 +351,12 @@ if minor >= 3:
     check("res/xml/usb_device_filter.xml: hay dispositivos y los identificadores van en decimal", ids and all(i.isdigit() for i in ids), "  ids: %s" % ids)
     check("la app NO pide permisos de almacenamiento ni de cámara/micrófono para el USB (el permiso USB es el de Android, por dispositivo)",
           "android.permission.MANAGE_USB" not in man and "WRITE_EXTERNAL_STORAGE" not in man)
+if minor >= 4:
+    check("StorageGrantActivity (elegir el disco en el selector de Android) está declarada y NO exportada",
+          re.search(r'\.StorageGrantActivity"[^>]*android:exported="false"', man, re.S) is not None
+          and "ACTION_OPEN_DOCUMENT_TREE" in kt("StorageGrantActivity.kt"))
+    check("el almacenamiento USB NO pide «acceso a todos los archivos» (MANAGE_EXTERNAL_STORAGE): usa solo el selector de carpetas de Android",
+          "MANAGE_EXTERNAL_STORAGE" not in man and "MANAGE_EXTERNAL_STORAGE" not in "".join(kt(f) for f in sorted(os.listdir(KT)) if f.startswith("Storage")))
 check("la app NO pide acceso a internet de verdad ni permisos de SMS/contactos/micrófono",
       not re.search(r"READ_SMS|READ_CONTACTS|RECORD_AUDIO|CAMERA|ACCESS_BACKGROUND_LOCATION|READ_EXTERNAL_STORAGE", man))
 
