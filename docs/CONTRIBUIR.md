@@ -101,7 +101,7 @@ gh secret set NEXO_KEY_PASSWORD                 # la misma contraseña (con PKCS
 
 Guarda `nexo.jks` y su contraseña en un sitio seguro: sin ellos no podrás publicar actualizaciones que se instalen encima.
 Para compilar en local con tu clave, define `NEXO_KEYSTORE`, `NEXO_KEYSTORE_PASSWORD`, `NEXO_KEY_ALIAS` y `NEXO_KEY_PASSWORD`.
-Una etiqueta `v*` (`git tag v0.4.2 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar) hace que el workflow publique el APK en **Releases**.
+Una etiqueta `v*` (`git tag v0.4.3 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar) hace que el workflow publique el APK en **Releases**.
 
 ## Estructura
 

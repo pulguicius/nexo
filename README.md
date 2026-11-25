@@ -49,7 +49,7 @@ ID   TIPO             NOMBRE                       ACTIVA
 $ nexo media next          # y también: play, pause, playpause, stop, prev, seek +10s
 ```
 
-> **Estado: versión 0.4.2** (la última versión cerrada es la 0.3.0). De la 0.1 (WiFi y Bluetooth) hay un APK compilado, firmado y probado en un móvil real
+> **Estado: versión 0.4.3** (la última versión cerrada es la 0.3.0). De la 0.1 (WiFi y Bluetooth) hay un APK compilado, firmado y probado en un móvil real
 > (Xiaomi 25078RA3EL, Android 16 / SDK 36, con Termux Monet y Arch Linux en proot-distro).
 > La 0.2 añadió audio, música, redes guardadas, olvidar/renombrar Bluetooth, formatos para barras de estado y auto-recuperación;
 > la 0.3 añadió `nexo-dbus` con la música del móvil como reproductor MPRIS (`playerctl`, Waybar, Quickshell, GNOME, KDE);
@@ -57,9 +57,10 @@ $ nexo media next          # y también: play, pause, playpause, stop, prev, see
 > la **0.4.0‑beta2 añade `nexo tools`** (enviar y explorar archivos entre móviles: detección en la red, emparejamiento por código, explorador de terminal y gestor en el navegador, escritura opcional),
 > **`nexo update`** (lo que antes era copiar a mano) y un **`setup-guests` corregido** (distros en `containers/NOMBRE/rootfs`, todas las copias de `nexo`, comprobación de cuál ejecuta cada distro);
 > la **0.4.1 añade `nexo usb`**: un Arduino, un ESP32 o un adaptador USB↔serie conectado al móvil con un cable OTG (o un hub) sale en la distro como un puerto serie para `avrdude`, `arduino-cli`, `esptool`, PlatformIO, `screen`…;
-> la **0.4.2 añade los discos USB** a `nexo usb`: un pendrive, un disco duro o un SSD conectado al móvil se explora y se copia desde la distro (`nexo usb mounts`, `ls`, `get`, `put`, `eject`…), sin root y sin «acceso a todos los archivos»: lo monta Android y tú le das acceso a Nexo en el selector de carpetas del sistema.
-> El cliente, `nexo-dbus`, `nexo-tools` y `nexo-usb` pasan **2212 pruebas** (`nexo-dbus` contra un bus D‑Bus real, visto con `busctl` y `gdbus`; `nexo-tools` entre dos «dispositivos» simulados y en un Chromium sin pantalla) y el código de Android compila y coincide con la app simulada y con el protocolo,
-> pero **el código nuevo de la app (0.2) todavía no se ha ejecutado en un móvil**, `nexo-dbus` **no se ha probado con `bluetoothctl`, `nmcli`, `playerctl`, Waybar, etc.** `nexo tools` **no se ha probado entre dos móviles reales** y `nexo usb` **no se ha probado con una placa, un disco ni un móvil reales** (hay un script para cada cosa: [placas](docs/USB.md#probarlo-en-tu-móvil) y [discos](docs/USB-ALMACENAMIENTO.md#probarlo-en-tu-móvil)). Lee [Estado y lo que falta](#estado-y-lo-que-falta).
+> la **0.4.2 añade los discos USB** a `nexo usb`: un pendrive, un disco duro o un SSD conectado al móvil se explora y se copia desde la distro (`nexo usb mounts`, `ls`, `get`, `put`, `eject`…), sin root y sin «acceso a todos los archivos»: lo monta Android y tú le das acceso a Nexo en el selector de carpetas del sistema;
+> la **0.4.3 añade `nexo net` y `nexo notif`**: por dónde sale el móvil a internet (WiFi, datos móviles, cable, VPN; si hay internet de verdad y si es de pago), que además hace que `nmcli` y los applets de red de la distro vean **la red real del móvil** (no solo el WiFi), y, **solo si tú lo activas en la app**, las notificaciones del móvil en tu escritorio (`dunst`, `mako`, GNOME, KDE…) y en la terminal (`nexo notif list`, `dismiss`, `watch`).
+> El cliente, `nexo-dbus`, `nexo-tools` y `nexo-usb` pasan **2555 pruebas** (`nexo-dbus` contra un bus D‑Bus real, visto con `busctl` y `gdbus`; `nexo-tools` entre dos «dispositivos» simulados y en un Chromium sin pantalla) y el código de Android compila y coincide con la app simulada y con el protocolo,
+> pero **el código nuevo de la app (0.2 y siguientes) todavía no se ha ejecutado en un móvil**, `nexo-dbus` **no se ha probado con `bluetoothctl`, `nmcli`, `playerctl`, Waybar, `dunst`, `mako`, GNOME ni KDE**, `nexo tools` **no se ha probado entre dos móviles reales** y `nexo usb` **no se ha probado con una placa, un disco ni un móvil reales** (hay un script para cada cosa: [placas](docs/USB.md#probarlo-en-tu-móvil) y [discos](docs/USB-ALMACENAMIENTO.md#probarlo-en-tu-móvil)). Lee [Estado y lo que falta](#estado-y-lo-que-falta).
 
 ---
 
@@ -79,8 +80,9 @@ elige «Instalar de todos modos». Al estar firmado con clave propia, podrás ac
 2. Pulsa **Iniciar puente**. Queda una notificación fija «Nexo activo»: es lo que mantiene la app viva.
 3. **Muy importante en Xiaomi/HyperOS** y otras capas: mira [Que Android no cierre la app](#que-android-no-cierre-la-app).
    Si no se configura bien, el socket se abre pero la app no responde (código de error 12).
-4. **Para la música** (título, pausa, siguiente, carátula): pulsa **Dar acceso a notificaciones** y activa Nexo. Nexo solo usa ese acceso
-   para ver las sesiones de medios; no lee ni guarda tus notificaciones. En Android 13 o más, si el interruptor sale en gris, ve a
+4. **Para la música** (título, pausa, siguiente, carátula): pulsa **Dar acceso a notificaciones** y activa Nexo. Para la música Nexo solo usa las sesiones de medios:
+   **no lee tus notificaciones** salvo que además actives tú el interruptor **Reenviar notificaciones a Linux** (viene apagado; ver [Red y notificaciones del móvil](#red-y-notificaciones-del-móvil-nexo-net-y-nexo-notif)),
+   y aun así no las guarda. En Android 13 o más, si el interruptor sale en gris, ve a
    Ajustes › Aplicaciones › Nexo › ⋮ (arriba a la derecha) › **Permitir ajustes restringidos** (Android lo exige a las apps instaladas desde un APK).
 
 ### 3. Enlazar Termux
@@ -138,7 +140,9 @@ Dependiendo de la distro, necesitarás instalar `bash` y `jq`:
 | `nexo audio outputs` · `nexo audio switch SALIDA` | Salidas de audio y cuál suena. Cambiarla pide un toque (Android no deja a una app normal) |
 | `nexo media play\|pause\|playpause\|stop\|next\|prev` | Controla la música que suena en el móvil (Spotify, YouTube Music, VLC…) |
 | `nexo media seek +10s\|-10s\|90s\|1:30` · `nexo media art [ARCHIVO]` | Adelantar o ir a un punto; guardar la carátula (JPEG) |
-| `nexo watch [wifi\|bt\|audio\|media\|usb\|storage]` | Cambios en vivo, un JSON por línea (`--pretty` para leerlos mejor; `usb` y `storage` se piden por su nombre; `storage --event` da un evento con nombre por cambio). Reconecta solo |
+| `nexo net [status]` | Por dónde sale el móvil a internet (WiFi, datos móviles, cable, VPN), si hay internet de verdad y si es de pago. Necesita la app 0.4.3 o más nueva |
+| `nexo notif status\|list\|dismiss CLAVE\|--all\|watch` | Las notificaciones del móvil: ver cuáles hay, quitarlas y recibirlas en vivo. **Opcional: viene apagado** y se activa en la app («Reenviar notificaciones a Linux»); [detalles](#red-y-notificaciones-del-móvil-nexo-net-y-nexo-notif) |
+| `nexo watch [wifi\|bt\|audio\|media\|usb\|storage\|net\|notif]` | Cambios en vivo, un JSON por línea (`--pretty` para leerlos mejor; `usb`, `storage`, `net` y `notif` se piden por su nombre; `storage --event` y `notif --event` dan un evento con nombre por cambio). Reconecta solo |
 | `nexo pair [TOKEN] [PUERTO]` · `nexo unpair` | Guarda o borra el enlace a mano (`--token-stdin`: el token no queda en el historial) |
 | `nexo rekey [TOKEN]` | Cambia el token tras «Token nuevo» en la app y actualiza tus distros |
 | `nexo setup-guests [DISTRO…]` | (Termux) copia cliente y enlace a tus distros de proot-distro (`containers/…/rootfs` e `installed-rootfs`), actualiza TODAS las copias de `nexo` que tengan y comprueba cuál ejecuta cada una (`--list`, `--uninstall`, `--private`, `--with-dbus`, `--with-tools`, `--with-usb`, `--no-verify`) |
@@ -146,7 +150,7 @@ Dependiendo de la distro, necesitarás instalar `bash` y `jq`:
 | `nexo tools [COMANDO…]` | Archivos entre móviles: `send`, `fetch`, `server`, `discover`, `pair`, `connect`, `browse`, `ls`, `get`, `put`, `web`… ([guía](docs/NEXO-TOOLS.md)) |
 | `nexo usb list\|permit\|monitor\|bridge\|status\|stop\|reset` | Arduino, ESP32 y adaptadores USB↔serie conectados al móvil: ver qué ve Android, pedir el permiso, un monitor serie y un puerto serie para `avrdude`, `esptool`, PlatformIO… ([guía](docs/USB.md)). Necesita python3 salvo `list` |
 | `nexo usb mounts\|access\|ls\|stat\|cat\|get\|put\|mkdir\|rm\|mv\|df\|eject` | Pendrives, discos duros y SSD que monta Android: ver los discos, dar acceso, listar, copiar en los dos sentidos, crear, borrar, mover, espacio libre y expulsar ([guía](docs/USB-ALMACENAMIENTO.md)). Necesita python3 salvo `mounts` |
-| `nexo setup-dbus [--uninstall]` | Activa `nexo-dbus` (música MPRIS, Bluetooth BlueZ y WiFi NetworkManager del móvil), con arranque automático (`--no-start`, `--own-bus`, `--launcher ARCHIVO`, `--system-policy` para un bus del sistema de verdad). Necesita python3 |
+| `nexo setup-dbus [--uninstall]` | Activa `nexo-dbus` (música MPRIS, Bluetooth BlueZ, red NetworkManager y notificaciones del móvil), con arranque automático (`--no-start`, `--own-bus`, `--launcher ARCHIVO`, `--system-policy` para un bus del sistema de verdad). Necesita python3 |
 | `nexo dbus start\|stop\|restart\|status\|env\|run` | Atajo a `nexo-dbus` (`status` dice qué servicio está activo y por qué no) |
 | `nexo start` | (Termux) abre la app Nexo para despertar el puente |
 | `nexo doctor [--fix]` | Diagnóstico de todo el enlace; `--fix` intenta repararlo |
@@ -225,6 +229,41 @@ No hay `mount` ni `/dev/sda` en la distro (no es root y el kernel es el de Andro
 
 ---
 
+## Red y notificaciones del móvil (`nexo net` y `nexo notif`)
+
+**`nexo net`** dice por dónde sale el móvil a internet ahora mismo (lo que Android llama la «red predeterminada»): WiFi, **datos móviles**, cable, Bluetooth o VPN; si esa red tiene internet **de verdad**
+(Android lo comprueba por su cuenta, así que distingue un portal cautivo o un WiFi sin salida de uno que funciona) y si es **de pago** (datos limitados). No necesita ningún permiso nuevo ni la ubicación.
+
+```console
+$ nexo net
+Red: datos móviles + VPN · con internet · de pago (datos limitados)
+$ nexo net --short                 # datos móviles + VPN   (también --json, --env, --csv, --waybar, --polybar, --qml…)
+$ nexo watch net                   # un evento cada vez que cambia: del WiFi a los datos, una VPN, un portal cautivo…
+```
+
+Con `nexo-dbus`, `nmcli` y los applets de red de la distro ven **esa red real** (hasta ahora solo veían el WiFi): conectividad completa, limitada (portal cautivo o sin internet de verdad) o ninguna, y red «medida».
+
+**`nexo notif`** trae las notificaciones del móvil a la distro. **Es opcional y viene apagado de fábrica**, porque lo que dicen tus notificaciones es lo más privado que hay en el móvil:
+no sale nada de Android hasta que, en la app, das el **acceso a notificaciones** (el mismo que usa la música) **y** activas el interruptor **«Reenviar notificaciones a Linux»**.
+
+```console
+$ nexo notif status
+Notificaciones: se reenvían a Linux · 3 en el móvil ahora
+$ nexo notif list                  # las más nuevas primero, con la clave de cada una
+3 notificaciones
+• com.whatsapp · WhatsApp Ana: ¿Vienes a cenar?   (ahora)
+    clave: k1
+$ nexo notif dismiss k1            # la quita del móvil (o --all)
+$ nexo notif watch --pretty        # las que lleguen y se quiten, en vivo
+```
+
+Con `nexo-dbus` (`nexo setup-dbus`) salen **solas en el escritorio de la distro** (dunst, mako, swaync, GNOME, KDE…) con el nombre de la app, el título y el texto, y si las cierras allí **se quitan también del móvil**.
+Solo viajan por `127.0.0.1` y solo hacia programas con tu token que las piden: **Nexo no las guarda nunca** (ni en el móvil ni en la caché del cliente), nunca reenvía las suyas y `nexo watch` sin tema sigue trayendo solo wifi, bt, audio y media (las notificaciones se piden a propósito: `nexo watch notif`).
+Android no deja a una app quitar las notificaciones **fijas** ni las de servicios en marcha: `nexo notif dismiss` te lo dice en vez de fingir. **Probado contra una app simulada, un demonio de avisos simulado y con pruebas de las reglas en una JVM, y compilado contra Android; no en un móvil, ni con dunst, mako, GNOME o KDE de verdad.**
+Detalles, privacidad y solución de problemas: [`docs/INTEGRACION-ESCRITORIO.md`](docs/INTEGRACION-ESCRITORIO.md#notificaciones-del-móvil-orgfreedesktopnotifications) y [`docs/PROTOCOLO.md`](docs/PROTOCOLO.md).
+
+---
+
 ## Para barras de estado, escritorios y scripts
 
 Cada formato de salida es una opción de cualquier comando de estado (`nexo wifi status --waybar`, `nexo media status --polybar`, `nexo status --qml`…):
@@ -241,7 +280,7 @@ Cada formato de salida es una opción de cualquier comando de estado (`nexo wifi
 | `--dunst` | dunst, mako, swaync | Texto con icono para `notify-send` |
 | `--tmux` | tmux | Texto corto para `status-right` |
 | `--starship` | starship | Texto para un módulo `custom` (vacío si no hay nada que mostrar) |
-| `--csv` | hojas de cálculo, `awk` | CSV en las listas (`wifi scan`, `wifi saved`, `bt paired`, `audio outputs`) |
+| `--csv` | hojas de cálculo, `awk` | CSV en las listas (`wifi scan`, `wifi saved`, `bt paired`, `audio outputs`, `notif list`) |
 
 Las barras (`--waybar`, `--polybar`, `--i3status`, `--qml`, `--tmux`, `--starship`) **nunca fallan**: si la app no contesta (móvil dormido, puente apagado)
 muestran el último valor conocido (hasta 15 minutos) o «offline», en lugar de llenar tu barra de errores. Usan una caché pequeña en `~/.cache/nexo/`
@@ -312,7 +351,7 @@ tmux: `set -g status-right '#(nexo status --tmux)'` · starship: `[custom.nexo]`
 ## Integración universal
 
 Nexo no convierte el móvil en un adaptador WiFi o Bluetooth de Linux: **controla** lo que Android ya tiene y se lo cuenta a tu escritorio.
-Esa cuenta llega por la línea de comandos y, desde la 0.3, también por **D‑Bus** (con `nexo-dbus`), que es lo que hablan los programas de Linux. Hoy la música, y desde la 0.4.0‑beta1 el Bluetooth y el WiFi; las notificaciones llegarán en la 0.4.3:
+Esa cuenta llega por la línea de comandos y, desde la 0.3, también por **D‑Bus** (con `nexo-dbus`), que es lo que hablan los programas de Linux. Primero la música, desde la 0.4.0‑beta1 el Bluetooth y el WiFi, y desde la 0.4.3 la red real del móvil (datos móviles incluidos) y las notificaciones (opcionales):
 
 | Programa o protocolo | Cómo se integra | Estado |
 |---|---|---|
@@ -322,8 +361,9 @@ Esa cuenta llega por la línea de comandos y, desde la 0.3, también por **D‑B
 | Scripts, hojas de cálculo | `--env`, `--json`, `--csv` | ✅ v0.2 |
 | `playerctl`, módulo `mpris` de Waybar, Quickshell, GNOME, KDE (MPRIS) | `nexo-dbus` publica la música del móvil como un reproductor más (`nexo setup-dbus`; [guía](docs/INTEGRACION-ESCRITORIO.md)) | ✅ v0.3 (probado con `busctl` y `gdbus` contra un bus real; los programas reales, sin probar) |
 | `bluetoothctl`, Blueman y applets de Bluetooth (BlueZ) | `nexo-dbus` emula `org.bluez`: adaptador, dispositivos emparejados, batería, encender/apagar (conectar un dispositivo pide un toque en el móvil) | 🚧 v0.4.0‑beta1 (probado con `busctl` y `gdbus` contra un bus real; `bluetoothctl`, sin probar) |
-| `nmcli`, `nm-applet`, applets de red (NetworkManager) | `nexo-dbus` emula `org.freedesktop.NetworkManager`: `wlan0`, redes a la vista y guardadas, conectar/desconectar, encender/apagar | 🚧 v0.4.0‑beta1 (probado con `busctl` y `gdbus` contra un bus real; `nmcli`, sin probar) |
-| Notificaciones del móvil en tu escritorio | Acceso a notificaciones + `org.freedesktop.Notifications` | 🕓 planeado 0.4.3 |
+| `nmcli`, `nm-applet`, applets de red (NetworkManager) | `nexo-dbus` emula `org.freedesktop.NetworkManager`: `wlan0`, redes a la vista y guardadas, conectar/desconectar, encender/apagar y, desde la 0.4.3, el estado global real del móvil (datos móviles, VPN, red de pago, sin internet de verdad) | 🚧 v0.4.0‑beta1 y 0.4.3 (probado con `busctl` y `gdbus` contra un bus real; `nmcli`, sin probar) |
+| Notificaciones del móvil en tu escritorio: dunst · mako · swaync · GNOME · KDE | `nexo-dbus` es cliente de `org.freedesktop.Notifications` (acceso a notificaciones de Android + interruptor «Reenviar notificaciones a Linux», apagado de fábrica); cerrar un aviso en el escritorio lo quita del móvil | 🚧 v0.4.3 (probado con un demonio de avisos simulado y `busctl`; dunst, mako, GNOME y KDE reales, sin probar) |
+| `nexo net`, `nexo notif`, `nexo watch net notif` | Línea de comandos, scripts y barras (`--waybar`, `--qml`…) | ✅ v0.4.3 (el cliente, contra la app simulada; la app, sin ejecutar en un móvil) |
 
 El plan completo, con lo que **no** se puede hacer, está en [`docs/ROADMAP.md`](docs/ROADMAP.md) y [`docs/LIMITACIONES.md`](docs/LIMITACIONES.md).
 
@@ -341,6 +381,10 @@ Nexo **controla** el WiFi, el Bluetooth, el audio y la música de Android; no se
 - **Cambiar la salida de audio del sistema** (`audio switch`). Android no deja a una app normal redirigir el audio: Nexo abre el panel de volumen con una notificación.
   El volumen y el silencio de la música sí se controlan directamente.
 - **Ver y controlar la música** necesita el «acceso a notificaciones». Sin él, `media status` dice que falta (`listener: false`) y los controles piden el permiso.
+- **Notificaciones hacia Linux (0.4.3).** Hace falta ese mismo acceso **y** el interruptor «Reenviar notificaciones a Linux» (apagado de fábrica). Android **no deja quitar** las notificaciones fijas ni las de servicios en marcha
+  (reproductores, VPN, «Nexo activo»…): `nexo notif dismiss` dice cuáles no se pudieron quitar. Las nuevas solo llegan en vivo mientras haya alguien suscrito (`nexo notif watch`, `nexo-dbus`): lo que llegó antes no se recupera,
+  y `nexo notif list` enseña únicamente lo que el móvil tiene ahora. Si el sistema suelta el servicio de notificaciones (algunos fabricantes lo hacen), Nexo le pide a Android que lo enlace otra vez; si no vuelve, apaga y enciende el acceso en los ajustes.
+- **Red del móvil (0.4.3).** `nexo net` cuenta la red **predeterminada** (la que Android usa para salir a internet), no todas las conectadas a la vez: con WiFi y datos móviles encendidos, dirá la que Android esté usando. No da la IP de los datos móviles ni el nombre del operador.
 - **Redes solo WPA3 y redes de empresa (802.1X).** La API clásica no permite crearlas: `nexo wifi connect` abre el panel de WiFi con una notificación.
 - **Redes guardadas** (`wifi saved`, `wifi forget`): Android 10 o más solo las enseña a apps que apuntan a la API 28 y tienen el permiso de ubicación (por eso Nexo apunta a 28);
   solo puedes olvidar las que el sistema deja borrar a esta app. Si no, hace falta un toque.
@@ -372,7 +416,9 @@ Nexo **controla** el WiFi, el Bluetooth, el audio y la música de Android; no se
 - En las distros, `setup-guests` deja el enlace en `/etc/nexo/config` (modo 644, para que lo lean todos los usuarios de esa distro; con `--private`, solo root). Queda dentro de los datos privados de Termux,
   protegidos por el aislamiento de Android.
 - `nexo raw` (peticiones sin filtrar) está apagado salvo que pongas `NEXO_ALLOW_RAW=1`. No es una barrera de seguridad (quien tiene el token puede hablar con la app a mano), sino un freno a los errores.
-- El «acceso a notificaciones» (para la música) lo concedes tú y se puede quitar en cualquier momento en los ajustes de Android. En esta versión Nexo no lee ni guarda ninguna notificación.
+- El «acceso a notificaciones» lo concedes tú y se puede quitar en cualquier momento en los ajustes de Android. Para la música Nexo solo usa las sesiones de medios. **Reenviar tus notificaciones a Linux (0.4.3) es aparte y viene apagado**:
+  hasta que actives el interruptor de la app no sale ninguna de Android. Activado, solo viajan por `127.0.0.1`, solo a programas con tu token que se suscriben al tema `notif`, **no se guardan** (ni la app ni el cliente las apuntan en ningún sitio, ni en el registro ni en la caché), se limita el ritmo y el tamaño de lo que sale y nunca se reenvían las de la propia Nexo.
+  Lo que ya se ha reenviado a tu escritorio queda en manos de tu demonio de avisos (dunst, mako…), que puede guardar su propio historial.
 - El permiso `INTERNET` solo sirve para abrir el socket local: la app no se conecta a ningún servidor. Sin anuncios, sin telemetría.
 - **Discos USB** (`nexo usb ls`, `get`, `put`…): Nexo **no pide «acceso a todos los archivos»**. El acceso lo concedes **disco por disco** en el selector de carpetas de Android (solo se acepta una carpeta del propio disco; si eliges una subcarpeta, esa es la raíz y Nexo no sale de ella) y se quita con `nexo usb access --revoke`. Las rutas se validan en la app, nunca borra recursivamente de una vez, no abre ningún puerto nuevo y cada operación pasa por la conexión autenticada con el token.
 - **Puertos serie** (`nexo usb list`, `monitor`, `bridge`): Android pide el permiso **por dispositivo** y solo la app Nexo lo tiene. El servidor RFC 2217 y el TCP crudo de `nexo usb bridge` **no tienen contraseña** y escuchan solo en `127.0.0.1` (cualquier programa del móvil puede escribir en tu placa mientras estén abiertos: ciérralos con `nexo usb stop`).
@@ -431,13 +477,15 @@ export ANDROID_HOME=/ruta/al/sdk
 ```
 
 El workflow `.github/workflows/build.yml` compila automáticamente y firma el APK usando los secretos del repositorio, publicándolo en Releases al crear una etiqueta
-(`git tag v0.4.2 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar). Cómo preparar la firma y cómo colaborar: [`docs/CONTRIBUIR.md`](docs/CONTRIBUIR.md).
+(`git tag v0.4.3 && git push --tags`; si la etiqueta lleva un guion, la Release se marca como versión preliminar). Cómo preparar la firma y cómo colaborar: [`docs/CONTRIBUIR.md`](docs/CONTRIBUIR.md).
 
 ```bash
-bash tests/run_tests.sh      # 2212 pruebas: cliente, instalador, nexo-dbus, nexo-tools y nexo-usb (puertos serie y discos) contra una app simulada (bash, python3 y jq; las de D-Bus piden además dbus-daemon, busctl y gdbus; las de nexo-tools, openssl)
+bash tests/run_tests.sh      # 2555 pruebas: cliente, instalador, nexo-dbus, nexo-tools y nexo-usb (puertos serie y discos, red y notificaciones) contra una app simulada (bash, python3 y jq; las de D-Bus piden además dbus-daemon, busctl y gdbus; las de nexo-tools, openssl)
 NEXO_TESTS_ONLY=usb bash tests/run_tests.sh   # solo nexo usb (puertos serie)
 NEXO_TESTS_ONLY=storage bash tests/run_tests.sh   # solo los discos USB
-cd android && ./gradlew testDebugUnitTest      # 72 pruebas de JVM: controladores USB serie y reglas de los discos (sin móvil)
+NEXO_TESTS_ONLY=net bash tests/run_tests.sh   # solo nexo net y nexo notif (cliente)
+NEXO_TESTS_ONLY=dbus NEXO_TESTS_DBUS_PART=notif bash tests/run_tests.sh   # solo las notificaciones de nexo-dbus
+cd android && ./gradlew testDebugUnitTest      # 98 pruebas de JVM: controladores USB serie, reglas de los discos, de la red y de las notificaciones (sin móvil)
 ```
 
 Las pruebas incluyen una comprobación de **contrato** (`tests/check_contract.py`): compara el código Kotlin de la app con la app simulada y con `docs/PROTOCOLO.md`
@@ -462,7 +510,11 @@ android/                       Proyecto de Android (Gradle, Kotlin 2.0, AGP 8.7,
     StorageHandler.kt          Discos USB: los comandos storage.* y la expulsión
     AudioHandler.kt            Volumen de música y salidas de audio (AudioManager)
     MediaHandler.kt            Sesiones de medios: qué suena, controles, carátula (MediaSessionManager)
-    NexoNotificationListener.kt  El «acceso a notificaciones» que Android exige para ver la música de otras apps
+    NexoNotificationListener.kt  El «acceso a notificaciones» que Android exige para ver la música de otras apps (y, si el usuario lo activa, el origen de las notificaciones que se reenvían)
+    NotifBridge.kt             Notificaciones → Linux: eventos posted/removed con límite de ritmo, notif.list y notif.dismiss (solo con el reenvío activado)
+    NotifLogic.kt              Notificaciones: qué se reenvía y qué no, recortes, claves y motivos de cierre (sin Android, probada en JVM)
+    NetHandler.kt              Red del móvil: net.status y el tema net (ConnectivityManager, red predeterminada)
+    NetLogic.kt                Red del móvil: de las capacidades de Android al tipo, internet, validada, de pago, VPN y portal cautivo (sin Android, probada en JVM)
     StartActivity.kt           Actividad sin pantalla que enciende el puente (nexo start)
     Bootstrap.kt               Arma el instalador para Termux y su huella SHA-256
     UserAction.kt              Notificaciones «toca para…» cuando Android no deja hacerlo solo
@@ -474,9 +526,9 @@ termux/
   bin/nexo-usb                 Arduino, ESP32, adaptadores USB↔serie (monitor, puerto PTY, RFC 2217, TCP) y discos USB (mounts, ls, get, put…); un solo archivo de Python 3, sin librerías
   install.sh                   El instalador (también --uninstall)
   oneliner.tpl                 Plantilla del comando de una línea que copia la app
-tests/                         App simulada (fake_app.py), pruebas (run_tests.sh, dbus_tests.sh, dbus_system_tests.sh, tools_tests.sh, usb_tests.sh, usb_storage_tests.sh, ui_tests.py, dbus_probe.py, dbus_hold.py, tools_probe.py, usb_client.py),
+tests/                         App simulada (fake_app.py) y demonio de avisos simulado (fake_notifd.py), pruebas (run_tests.sh, dbus_tests.sh, dbus_system_tests.sh, dbus_notif_tests.sh, net_notif_tests.sh, tools_tests.sh, usb_tests.sh, usb_storage_tests.sh, ui_tests.py, dbus_probe.py, dbus_hold.py, tools_probe.py, usb_client.py),
                                las pruebas con hardware real (usb_hardware_check.sh y usb_storage_hardware_check.sh), la referencia de velocidades (ref_baud.py) y la comprobación de contrato (check_contract.py)
-android/app/src/test/          Pruebas de JVM de los controladores USB (UsbSerialTest.kt) y de las reglas de los discos (StorageLogicTest.kt)
+android/app/src/test/          Pruebas de JVM de los controladores USB (UsbSerialTest.kt), de las reglas de los discos (StorageLogicTest.kt), de la red (NetLogicTest.kt) y de las notificaciones (NotifLogicTest.kt)
 docs/                          PROTOCOLO · LIMITACIONES · ANDROID-VERSIONES · FAQ · CONTRIBUIR · ROADMAP · INTEGRACION-ESCRITORIO · NEXO-TOOLS · USB · USB-ALMACENAMIENTO
 .github/workflows/build.yml    Pruebas del cliente + compilación del APK
 ```
@@ -487,7 +539,7 @@ El cliente, `nexo-dbus`, `nexo-tools`, `nexo-usb` y el instalador viajan dentro 
 
 ## Estado y lo que falta
 
-**Versión 0.4.2.**
+**Versión 0.4.3.**
 
 - ✅ **Comprobado en móvil real (v0.1):** Xiaomi 25078RA3EL (Android 16 / SDK 36). El APK compila y se firma automáticamente con un Keystore propio a través de GitHub Actions.
   El cliente lee el WiFi/Bluetooth reales y se comunica sin problemas desde Termux Monet y desde proot-distro (probado en Arch Linux). Se corrigió un bloqueo del hilo de red
@@ -508,6 +560,14 @@ El cliente, `nexo-dbus`, `nexo-tools`, `nexo-usb` y el instalador viajan dentro 
 - ✅ **Comprobado aquí (0.4.1):** **`nexo usb`** contra la app simulada (`tests/fake_app.py`, con «chips» que imitan un CDC‑ACM, un CP210x, un FTDI, un CH340, un Arduino con su cargador STK500 y un eco): `list`, `permit` (concedido, denegado, sin contestar), `monitor`, `bridge` con el puerto PTY (todos los valores de byte, en los dos sentidos, velocidad y formato que cambia el programa, DTR/RTS), el reinicio automático del Arduino (con `inotify`, con `/proc` y sin vigilar), el servidor RFC 2217 y el TCP crudo (reinicio al primer cliente), desenchufar y volver a enchufar (el puerto se queda donde está), varios puentes a la vez, `--detach`/`status`/`stop`/`reset`, estados viejos y procesos ajenos, app caída, token malo y app anterior sin USB;
   el instalador, `setup-guests --with-usb` y `nexo update` con `nexo-usb`; **37 pruebas de JVM** de los controladores (las órdenes de control de cada chip y sus cuentas de velocidad, que además se comparan con una transcripción independiente de libftdi y de `ch341.c`: `tests/ref_baud.py`); el código de Kotlin compila contra la API real de Android; y `tests/usb_hardware_check.sh` (la prueba con hardware real) funciona contra la app simulada.
 - ✅ **Comprobado aquí (0.4.2):** **los discos de `nexo usb`** contra la app simulada (cada disco es una carpeta de verdad, con su etiqueta, UUID, estado, espacio y acceso concedido o no): `mounts` (uno, varios, expulsado, sin acceso, solo lectura), `access` (concedido, denegado, sin contestar, `--revoke`), `ls` (`-lahR`, `--json`, miles de archivos paginados, nombres con acentos, espacios, emojis y `:`), `stat`, `cat` (también con la tubería cerrada), `get` y `put` (archivos de todos los tamaños, de 0 bytes a varios MiB, árboles, `-f`/`-n`, `ORIGEN/`, `--verify`, `--fix-names`, enlaces, sin espacio, disco lleno, solo lectura, desenchufar a media copia, app caída, nada a medias bajo su nombre), `mkdir`, `rm`, `mv`, `df` y `eject` (expulsado, rechazado, con error); **cada orden por los dos caminos** (por la app y directa por la ruta) **comparando resultados en ~75 casos**; `nexo watch storage` y sus eventos; que no queden archivos abiertos ni restos `.nexo-part-*`; y **35 pruebas de JVM** de las reglas de los discos (`StorageLogicTest.kt`). El código de Kotlin compila contra la API real de Android y coincide con la app simulada y con el protocolo 1.4. `tests/usb_storage_hardware_check.sh` (la prueba con un disco real) funciona contra la app simulada (también con `--unplug`, `--eject`, `--speed` y `--big`, con discos de solo lectura, casi llenos, con errores o con el límite de FAT32, y al pararlo con una señal borra su carpeta del disco).
+- ✅ **Comprobado aquí (0.4.3):** **`nexo net` y `nexo notif`** contra la app simulada (`tests/fake_app.py`, protocolo 1.5): `nexo net` en todos los formatos y con WiFi, datos móviles, VPN, portal cautivo, red sin internet de verdad y sin red, con una app anterior (sin `net.status`), `nexo watch net` (reconecta, junta ráfagas y avisa si la app no ofrece el tema), las barras que nunca fallan y la caché;
+  `nexo notif status`, `list` (las más nuevas primero, hasta 40), `dismiss` y `--all` (con notificaciones fijas que Android no deja quitar y claves que ya no existen, y las cuentas exactas de las que se quitaron y las que no), `watch notif` (`--pretty`, `--event` y los motivos de cierre), sin el acceso o con el reenvío apagado (código 3 y los avisos de `nexo doctor`), **que ninguna notificación llegue a la caché del cliente**, sin `jq`, por otro transporte y con la app apagada.
+  **`nexo-dbus`** contra un demonio de avisos simulado (`tests/fake_notifd.py`, visto con `busctl`): llegar, reemplazar, quitar, cerrar en el escritorio y que se quite del móvil (sin bucles), urgencias y categorías, etiquetas, caracteres de control y textos enormes, un demonio que se cae, se reinicia o rechaza un aviso, ningún demonio, reenvío apagado, sin acceso y app anterior;
+  y **NetworkManager con la red real** (datos móviles = red de pago, VPN, WiFi sin salida y portal cautivo = conectividad limitada, sin red) con una app nueva y con una anterior. **26 pruebas de JVM nuevas** de las reglas de la app (`NetLogicTest` y `NotifLogicTest`: nombres de transporte, VPN sobre una red real, recortes que no parten un emoji, qué se reenvía y qué no, motivos de cierre, tamaño de la lista, repetidos y límite de ritmo);
+  el código de Kotlin compila contra la API real de Android y coincide con la app simulada y con el protocolo 1.5 (`tests/check_contract.py`). **Las pruebas se probaron a sí mismas:** se estropeó a propósito el cliente de 10 maneras distintas y las pruebas nuevas cazaron las 10. Al pasar la batería entera, además, saltaron pruebas antiguas que daban por hecho que la app simulada era «1.4», y se corrigieron.
+- ⚠️ **Sin comprobar (0.4.3): TODO lo que necesita un móvil y un escritorio de verdad.** El código nuevo de la app (`NetHandler`, `NotifBridge` y el servicio de notificaciones: qué entrega de verdad Android, con qué claves, motivos de cierre y `cancelNotification`, y cuáles de las notificaciones fijas se resisten en HyperOS/Android 16),
+  que el sistema o HyperOS suelte el servicio de notificaciones con el ahorro de batería, `nexo-dbus` contra un **dunst, mako, swaync, GNOME o KDE de verdad** (el demonio simulado imita la especificación; cada demonio real tiene sus manías: iconos, acciones, urgencia, historial), `nmcli` y los applets de red con la red del móvil, y el consumo de batería de vigilar la red.
+  `shellcheck` no se pudo ejecutar aquí (lo hace GitHub Actions).
 - ⚠️ **Sin comprobar (0.4.2): TODO lo que necesita un móvil y un disco de verdad.** El código nuevo de la app (`StorageManager`, el selector de carpetas, el permiso que Android recuerda, la lectura y escritura por `DocumentsContract`, los avisos de montaje, la expulsión con `ejectRoot`), la velocidad real, qué sistemas de archivos monta tu móvil (FAT32, exFAT, NTFS, ext4), el selector de HyperOS/Android 16 con un disco USB, discos de varios cientos de miles de archivos, hubs y la batería. La copia directa por ruta (`--via direct`) solo se probó con carpetas normales. Para probarlo: [`tests/usb_storage_hardware_check.sh`](tests/usb_storage_hardware_check.sh) (ver [`docs/USB-ALMACENAMIENTO.md`](docs/USB-ALMACENAMIENTO.md#probarlo-en-tu-móvil)).
 - ⚠️ **Sin comprobar (0.4.1): TODO lo que necesita un móvil o una placa de verdad.** El código nuevo de la app (`UsbManager`, el permiso, las transferencias bulk y de control), los controladores con chips reales (ATmega16U2 de un Uno, CH340, CP2102, FT232, ESP32‑S3 por USB nativo), un `avrdude`, `arduino-cli`, `esptool` o PlatformIO reales contra los puertos que ofrece `nexo usb bridge`, hubs, el aviso de permiso en HyperOS/Android 16 y la duración de la batería.
   Para probarlo: [`tests/usb_hardware_check.sh`](tests/usb_hardware_check.sh) (ver [`docs/USB.md`](docs/USB.md#probarlo-en-tu-móvil)).
@@ -520,8 +580,7 @@ El cliente, `nexo-dbus`, `nexo-tools`, `nexo-usb` y el instalador viajan dentro 
 - ⚠️ **Limitaciones del entorno:** El encendido/apagado directo de WiFi/Bluetooth depende de las restricciones de cada fabricante (HyperOS puede pedir un toque manual).
   Las redes con señal muy débil (ej. -87 dBm) pueden hacer que Android reporte un `connected: false` momentáneo mientras re-negocia la conexión.
   HyperOS puede congelar la app: se mitiga, no se puede evitar desde dentro de la app (ver [Que Android no cierre la app](#que-android-no-cierre-la-app)).
-- ❌ **Sin hacer:** las notificaciones del móvil en tu escritorio y la red móvil en NetworkManager (0.4.3, protocolo 1.5: el código de la app aún no lo trae),
-  un explorador interactivo de discos y la emulación de UDisks2 para los gestores de archivos de Linux, Shizuku/`rish` integrado (solo hay acceso directo por ruta si el proceso ya la ve), teclados y ratones USB en la distro, el PL2303 y las placas que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro), los paquetes (AUR, `.deb`, `.rpm`, `APKBUILD`) y F‑Droid (ver [ROADMAP](docs/ROADMAP.md)).
+- ❌ **Sin hacer:** un explorador interactivo de discos y la emulación de UDisks2 para los gestores de archivos de Linux, Shizuku/`rish` integrado (solo hay acceso directo por ruta si el proceso ya la ve), teclados y ratones USB en la distro, el PL2303 y las placas que se reprograman con un «toque» a 1200 baudios (Leonardo, Pro Micro), los paquetes (AUR, `.deb`, `.rpm`, `APKBUILD`) y F‑Droid (ver [ROADMAP](docs/ROADMAP.md)).
 
 Ideas sin explorar: un azulejo de Ajustes rápidos para encender y apagar el puente; conectar dispositivos Bluetooth de verdad mediante ADB inalámbrico o Shizuku.
 

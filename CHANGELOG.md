@@ -2,6 +2,31 @@
 
 Solo lo que cambia para quien usa Nexo. Qué está probado y qué no, en el [README](README.md#estado-y-lo-que-falta).
 
+## 0.4.3
+
+- **Nuevo: `nexo net`** — por dónde sale el móvil a internet ahora mismo: WiFi, **datos móviles**, cable, Bluetooth u otra (la «red predeterminada» de Android), si hay **VPN**, si Android comprobó que hay **internet de verdad** (distingue un WiFi sin salida o un portal cautivo de uno que funciona) y si es **de pago** (datos limitados).
+  Mismos formatos que lo demás (`--json`, `--short`, `--env`, `--csv`, `--waybar`, `--polybar`, `--i3status`, `--qml`, `--dunst`, `--tmux`, `--starship`) y `nexo watch net` para recibir los cambios. **Sin permisos nuevos** (`ACCESS_NETWORK_STATE` ya estaba). No dice la IP de los datos móviles ni el operador.
+- **Nuevo: `nexo notif`** — las **notificaciones del móvil** en la distro: `status`, `list` (las más nuevas primero), `dismiss CLAVE`, `dismiss --all` y `watch` (`--pretty`, `--event`: un evento con nombre por cambio, con el motivo del cierre: tocada, descartada, cancelada, caducada).
+  **Es opcional y viene apagado**: hace falta el «acceso a notificaciones» de Android (el de la música) **y** el nuevo interruptor **«Reenviar notificaciones a Linux»** de la app. Solo viajan por `127.0.0.1` a programas con tu token que las piden (`nexo watch notif`; `nexo watch` sin tema no las trae),
+  **no se guardan nunca** (ni la app ni la caché del cliente), se limita el ritmo (hasta 40 avisos por 10 s, sin repetir uno idéntico) y el tamaño (título 160, texto 500), y no se reenvían las de Nexo, los resúmenes de grupo ni los controles de reproductor. Android no deja quitar las **fijas** ni las de servicios en marcha: `dismiss CLAVE` da el error y `dismiss --all` cuenta cuántas no pudo quitar, en vez de fingir.
+  Sin el acceso o con el reenvío apagado, los comandos dicen qué botón pulsar y salen con el código 3 (`nexo doctor` lo cuenta).
+- **Nuevo: las notificaciones del móvil en tu escritorio.** `nexo-dbus` es ahora también **cliente de `org.freedesktop.Notifications`** (no ocupa ningún nombre): lo que llega al móvil sale en dunst, mako, swaync, GNOME o KDE con el nombre de la app, el título y el texto, **y si lo cierras con la ✕ se quita también del móvil**.
+  Urgencia según la importancia (alarmas y llamadas, crítica), las fijas y las de importancia mínima no se enseñan, el texto se escapa según lo que admita el demonio, y se recupera si el demonio se cae o se reinicia. Queda activo por omisión al arrancar `nexo-dbus` (`nexo setup-dbus`); se apaga con `--no-notify` o `NEXO_DBUS_NOTIFY=0`
+  (`NEXO_DBUS_NOTIFY_ALL=1` enseña también las fijas; `NEXO_DBUS_NOTIFY_DISMISS=0` hace que cerrar aquí no las quite del móvil). `nexo dbus status` tiene una línea «Notificaciones». También `NEXO_DBUS_SESSION_SOCKET=RUTA` (el socket del bus de sesión, para distros raras y pruebas).
+  Guía: [`docs/INTEGRACION-ESCRITORIO.md`](docs/INTEGRACION-ESCRITORIO.md#notificaciones-del-móvil-orgfreedesktopnotifications).
+- **Mejora: NetworkManager ve la red real del móvil.** El estado global que emula `nexo-dbus` (`State`, `Connectivity`, `Metered`) sale ahora de `net.status`: con **datos móviles** y sin WiFi conectado, `nmcli` y los applets dicen «conectado» (antes decían «desconectado», y los programas que hacen caso a NetworkManager —Firefox, por ejemplo— podían creerse sin internet);
+  la red de pago sale como `Metered = yes`; un WiFi sin salida o un portal cautivo, como «conectado (solo sitio)» con conectividad limitada; sin red, «desconectado». Con una app anterior a la 0.4.3 se sigue deduciendo del WiFi, como antes, y `NEXO_DBUS_NM_ASSUME_ONLINE=1` sigue existiendo para ese caso (con la 0.4.3 ya no hace falta).
+- **App Android:** `NetHandler.kt` y `NetLogic.kt` (la red predeterminada con `registerDefaultNetworkCallback`), `NotifBridge.kt` y `NotifLogic.kt` (qué se reenvía, límites y claves), `NexoNotificationListener.kt` ampliado, y el interruptor «Reenviar notificaciones a Linux» en la pantalla de Nexo.
+  **Sin permisos nuevos** en el manifiesto. Versión 0.4.3 (código 8).
+- **Protocolo 1.5** (revisión 5): `net.status`, `notif.status`, `notif.list` y `notif.dismiss`; los temas de eventos `net` y `notif` (opcionales: hay que pedirlos, y una app anterior simplemente los ignora); y `opens: "nexo_app"` en `needs_user_action` (cuando lo que falta es un interruptor de la propia app).
+  Una app anterior y un cliente nuevo (o al revés) se entienden: `nexo net` y `nexo notif` piden instalar el APK nuevo y el resto sigue como siempre. Detalles en [`docs/PROTOCOLO.md`](docs/PROTOCOLO.md).
+- **Corregido: `nexo usb`** — si la app moría a mitad de una copia o de un puente, el mensaje dependía de qué hilo se daba cuenta antes («no pude escribir…» o «se perdió la conexión…»); ahora siempre dice «Se perdió la conexión con la app Nexo». Lo encontraron las pruebas.
+- **CI:** `tests/ci_annotate.sh` convierte las líneas `FALLA` de cada trabajo en anotaciones de GitHub con su detalle (así un fallo se lee en el resumen sin abrir el registro); `shellcheck` incluye los archivos de prueba nuevos y cada uno lleva su `#!`/directiva.
+- Pruebas: 343 comprobaciones más (de 2212 a 2555) sobre `nexo net` y `nexo notif` (`tests/net_notif_tests.sh`), las notificaciones de `nexo-dbus` contra un demonio simulado (`tests/dbus_notif_tests.sh`, `tests/fake_notifd.py`) y NetworkManager con la red real;
+  la app simulada habla ya el protocolo 1.5 por omisión (`--minor2`…`--minor5` fuerzan una anterior; `--reqlog` apunta cada petición), 26 pruebas de JVM nuevas (`NetLogicTest`, `NotifLogicTest`: 98 en total) y la comprobación de contrato ampliada (`tests/check_contract.py`: comandos, campos, errores, temas y documentación de la 1.5).
+  Se probaron las pruebas: se estropeó a propósito el cliente de 10 maneras y las pruebas nuevas detectaron las 10.
+  **Probado contra la app simulada, un demonio de avisos simulado, `busctl`/`gdbus` y pruebas de las reglas en una JVM, y compilado contra Android; todavía no con un móvil ni con dunst, mako, GNOME o KDE de verdad.**
+
 ## 0.4.2
 
 - **Nuevo: almacenamiento USB (los discos en `nexo usb`)** — pendrives, discos duros y SSD externos **dentro de tu distro**. Android los monta y los enseña; Nexo entra solo en lo que tú autorizas en el selector de carpetas del sistema

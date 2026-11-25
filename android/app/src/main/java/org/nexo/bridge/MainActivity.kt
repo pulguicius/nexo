@@ -66,11 +66,13 @@ class MainActivity : Activity() {
     private lateinit var tvAudio: TextView
     private lateinit var tvMedia: TextView
     private lateinit var tvStorage: TextView
+    private lateinit var tvNotif: TextView
     private lateinit var etPort: EditText
     private var tokenShown = false
     private var probing = false
     private val audioProbe by lazy { AudioHandler(this) }
     private val mediaProbe by lazy { MediaHandler(this) }
+    private val notifProbe by lazy { NotifBridge(this) }
 
     private val tick = object : Runnable {
         override fun run() {
@@ -136,7 +138,8 @@ class MainActivity : Activity() {
                 tvMedia,
                 text(
                     "Para ver y controlar la música (título, pausa, siguiente, carátula) Android exige el «acceso a " +
-                        "notificaciones». Nexo solo lo usa para las sesiones de medios: no lee ni guarda tus notificaciones." +
+                        "notificaciones». Para la música Nexo solo usa las sesiones de medios; leer tus notificaciones es " +
+                        "opcional y está apagado (ver «NOTIFICACIONES»). Nexo no guarda nunca tus notificaciones." +
                         (if (Build.VERSION.SDK_INT >= 33)
                             "\n\nSi el interruptor sale en gris (Android 13 o más, app instalada desde un APK): Ajustes › Aplicaciones › " +
                                 "Nexo › ⋮ (arriba a la derecha) › «Permitir ajustes restringidos», y vuelve a intentarlo."
@@ -145,6 +148,38 @@ class MainActivity : Activity() {
                 ),
                 button("Dar acceso a notificaciones") { openListenerSettings() },
                 button("Probar sonido") { playTestTone() }
+            ),
+            lp(bottom = 12)
+        )
+
+        // Notificaciones hacia Linux
+        tvNotif = text("", 13f, TEXT)
+        val swFwd = Switch(this)
+        swFwd.text = "Reenviar notificaciones a Linux"
+        swFwd.setTextColor(TEXT)
+        swFwd.isChecked = Prefs.forwardNotifications(this)
+        swFwd.setOnCheckedChangeListener { _, checked ->
+            Prefs.setForwardNotifications(this, checked)
+            BridgeState.log(if (checked) "Reenvío de notificaciones a Linux: activado" else "Reenvío de notificaciones a Linux: apagado")
+            if (checked && !NexoNotificationListener.isEnabled(this)) {
+                toast("Falta el acceso a notificaciones: concédeselo a Nexo")
+                openListenerSettings()
+            }
+            refresh()
+        }
+        col.addView(
+            card(
+                "NOTIFICACIONES",
+                tvNotif,
+                swFwd,
+                text(
+                    "Si lo activas, las notificaciones de Android llegan a tus distros (por ejemplo a dunst o mako, con " +
+                        "«nexo-dbus») y puedes quitarlas desde allí. Salen solo por 127.0.0.1, solo hacia programas con tu " +
+                        "token que las pidan, y Nexo no las guarda. Nunca reenvía sus propias notificaciones. Está apagado " +
+                        "mientras no lo actives; necesita el acceso a notificaciones de Android.",
+                    12f, MUTED
+                ),
+                button("Dar acceso a notificaciones") { openListenerSettings() }
             ),
             lp(bottom = 12)
         )
@@ -266,6 +301,7 @@ class MainActivity : Activity() {
             var audioLine: String
             var mediaLine: String
             var storageLine: String
+            var notifLine: String
             try {
                 val a = audioProbe.status()
                 audioLine = if (a.optBoolean("available")) {
@@ -312,8 +348,19 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 storageLine = "Discos USB: " + e.javaClass.simpleName
             }
+            try {
+                val st = notifProbe.status()
+                notifLine = when {
+                    !st.optBoolean("access") -> "✘ Falta el acceso a notificaciones"
+                    !st.optBoolean("forwarding") -> "• Reenvío apagado (lo activas aquí abajo)"
+                    else -> "✔ Reenvío activo · " + st.optInt("active") + " notificaciones activas"
+                }
+            } catch (e: Exception) {
+                notifLine = "Notificaciones: " + e.javaClass.simpleName
+            }
             ui.post {
                 probing = false
+                tvNotif.text = notifLine
                 tvAudio.text = audioLine
                 tvMedia.text = mediaLine
                 tvStorage.text = storageLine
@@ -358,7 +405,7 @@ class MainActivity : Activity() {
         lines.add(mark(locOn, "Ubicación del sistema encendida"))
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         lines.add(mark(nm.areNotificationsEnabled(), "Avisos permitidos"))
-        lines.add(mark(NexoNotificationListener.isEnabled(this), "Acceso a notificaciones (música)"))
+        lines.add(mark(NexoNotificationListener.isEnabled(this), "Acceso a notificaciones (música y reenvío a Linux)"))
         if (Build.VERSION.SDK_INT >= 31) {
             lines.add(mark(granted("android.permission.BLUETOOTH_CONNECT"), "Bluetooth (dispositivos cercanos)"))
         }

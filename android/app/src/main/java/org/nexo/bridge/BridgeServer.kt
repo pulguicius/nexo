@@ -333,7 +333,7 @@ class BridgeServer(
             } else {
                 for (i in 0 until arr.length()) {
                     val t = arr.optString(i)
-                    if (t in Commands.TOPICS) wanted.add(t)
+                    if (t in Commands.TOPICS || t in Commands.OPTIONAL_TOPICS) wanted.add(t)
                 }
             }
             topics = wanted
@@ -343,6 +343,7 @@ class BridgeServer(
             // Estado inicial de cada tema, para que quien mira no espere al primer cambio.
             pool.execute {
                 for (t in wanted) {
+                    if (t in Commands.NO_INITIAL_STATE) continue
                     try {
                         send(Protocol.event(t, commands.statusFor(t)))
                     } catch (_: Exception) {

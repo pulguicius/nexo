@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Pruebas de los DISCOS USB de nexo-usb 0.4.2: mounts, access, ls, stat, cat, get, put, mkdir, rm, mv, df y eject.
 # No se ejecuta solo: lo carga tests/run_tests.sh (usa sus ok/bad/run/has/…). Necesita: bash, python3, jq.
 #   NEXO_TESTS_ONLY=storage bash tests/run_tests.sh      ← solo estas (más rápido para trabajar en ellas)

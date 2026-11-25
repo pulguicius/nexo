@@ -197,9 +197,13 @@ if minor >= 5:
     same("notif (cada notificación, en notif.list y en el evento «posted»)", keys_in(body(notif_kt, r"fun view\(.*?\): JSONObject \{")), fa.notif_view({}).keys())
     same("evento notif «posted» (además de los campos de la notificación)", keys_in(body(notif_kt, r"fun postedEvent\(.*?\): JSONObject \{")), {"op"})
     same("evento notif «removed»", keys_in(body(notif_kt, r"fun removedEvent\(.*?\): JSONObject \{")), {"op", "key", "reason"})
-    check("los motivos de «removed» (clicked, dismissed, cancelled, timeout, other) están en NotifBridge.kt",
-          all(('"%s"' % r) in notif_kt for r in ("clicked", "dismissed", "cancelled", "timeout", "other", "posted", "removed")))
+    notif_logic_kt = kt("NotifLogic.kt")
+    reasons = ("clicked", "dismissed", "cancelled", "timeout", "other")
+    check("los motivos de «removed» (%s) están en NotifLogic.kt y las operaciones (posted, removed) en NotifBridge.kt" % ", ".join(reasons),
+          all(('"%s"' % r) in notif_logic_kt for r in reasons) and all(('"%s"' % r) in notif_kt for r in ("posted", "removed")))
     check("docs/PROTOCOLO.md documenta los temas net y notif", "`net`" in doc and "`notif`" in doc)
+    check("docs/PROTOCOLO.md documenta los motivos de «removed»", all(("`%s`" % r) in doc for r in reasons),
+          "  sin documentar: %s" % [r for r in reasons if ("`%s`" % r) not in doc])
 
 check("docs/PROTOCOLO.md documenta todos los comandos de la app",
       all(("`%s`" % n) in doc for n in names), "  sin documentar: %s" % [n for n in names if ("`%s`" % n) not in doc])
@@ -359,5 +363,20 @@ if minor >= 4:
           "MANAGE_EXTERNAL_STORAGE" not in man and "MANAGE_EXTERNAL_STORAGE" not in "".join(kt(f) for f in sorted(os.listdir(KT)) if f.startswith("Storage")))
 check("la app NO pide acceso a internet de verdad ni permisos de SMS/contactos/micrófono",
       not re.search(r"READ_SMS|READ_CONTACTS|RECORD_AUDIO|CAMERA|ACCESS_BACKGROUND_LOCATION|READ_EXTERNAL_STORAGE", man))
+
+# ---------------------------------------------------------------- documentación de la revisión 5 (0.4.3: red y notificaciones)
+if minor >= 5:
+    readme, changelog, limites, roadmap = rd("README.md"), rd("CHANGELOG.md"), rd("docs/LIMITACIONES.md"), rd("docs/ROADMAP.md")
+    check("README, CHANGELOG y LIMITACIONES hablan de `nexo net` y `nexo notif`, y dicen que el reenvío es opcional y viene apagado",
+          "nexo net" in readme and "nexo notif" in readme and "Reenviar notificaciones a Linux" in readme and "apagado de fábrica" in readme
+          and "nexo net" in changelog and "nexo notif" in changelog
+          and "## Notificaciones (`nexo notif`)" in limites and "## Red del móvil (`nexo net`)" in limites and "apagado" in limites.lower())
+    m_chg = re.search(r"^## (\S+)", changelog, re.M)
+    check("el README (estado), el CHANGELOG (primera sección) y el ROADMAP dicen la versión de la app (%s)" % version_name,
+          ("Estado: versión %s" % version_name) in readme and m_chg is not None and m_chg.group(1) == version_name
+          and ("Estado: **v%s**" % version_name) in roadmap,
+          "  README: %s  CHANGELOG: %s  ROADMAP: %s" % (("Estado: versión %s" % version_name) in readme, m_chg and m_chg.group(1), ("Estado: **v%s**" % version_name) in roadmap))
+    left = [n for n, t in (("README.md", readme), ("CHANGELOG.md", changelog), ("docs/LIMITACIONES.md", limites), ("docs/ROADMAP.md", roadmap)) if "@@" in t]
+    check("no queda ninguna marca de relleno (@@…@@) en README, CHANGELOG, LIMITACIONES ni ROADMAP", not left, "  quedan en: %s" % left)
 
 sys.exit(1 if failed else 0)

@@ -80,6 +80,7 @@ class BridgeService : Service() {
         "media" to Runnable { emit("media") },
         "usb" to Runnable { emit("usb") },
         "storage" to Runnable { emit("storage") },
+        "net" to Runnable { emit("net") },
     )
 
     /** Los avisos de Android llegan a ráfagas: se juntan 300 ms antes de avisar a los clientes. */
@@ -193,6 +194,17 @@ class BridgeService : Service() {
         cmds.usb.watch()
         cmds.storage.onChange = { schedule("storage") }
         cmds.storage.watch()
+        cmds.net.onChange = { schedule("net") }
+        cmds.net.watch()
+        // Las notificaciones reenviadas salen por el hilo de los avisos (serializado con el resto) para que un cliente lento no
+        // frene al servicio de Android que las entrega.
+        cmds.notif.sink = { ev ->
+            try {
+                bg.execute { server?.broadcast("notif", ev) }
+            } catch (_: Exception) {
+            }
+        }
+        NexoNotificationListener.bridge = cmds.notif
         NexoNotificationListener.onChange = {
             main.post {
                 commands?.media?.watch()
@@ -276,8 +288,8 @@ class BridgeService : Service() {
                 if (srv != null && cmds != null) {
                     try {
                         val st = cmds.statusFor(topic)
-                        // audio y bt no tienen datos que cambien solos: no se repite un estado idéntico.
-                        if (topic == "audio" || topic == "bt") {
+                        // audio, bt y net avisan de más (cada cambio de señal, cada volumen): no se repite un estado idéntico.
+                        if (topic == "audio" || topic == "bt" || topic == "net") {
                             val key = st.toString()
                             synchronized(lastSent) {
                                 if (lastSent[topic] == key) return@execute
@@ -380,6 +392,15 @@ class BridgeService : Service() {
         BridgeState.clients = 0
         unregisterEvents()
         NexoNotificationListener.onChange = null
+        NexoNotificationListener.bridge = null
+        commands?.notif?.let {
+            it.sink = null
+            it.reset()
+        }
+        commands?.net?.let {
+            it.onChange = null
+            it.unwatch()
+        }
         commands?.media?.let {
             it.onChange = null
             it.unwatch()

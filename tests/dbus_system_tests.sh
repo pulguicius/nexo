@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Pruebas de los servicios de nexo-dbus que viven en el bus del SISTEMA (BlueZ; después NetworkManager). No se ejecuta
 # solo: lo carga tests/dbus_tests.sh dentro del bloque que ya comprobó que hay dbus-daemon, busctl y gdbus, así que
 # hereda DB, DD, ok/bad/…, poll, start_app, dd_start… Como en MPRIS, los clientes son independientes de nexo-dbus:
@@ -347,8 +348,8 @@ sleep 2.5
 ! shas "$BZ" && ok "--no-bluez → tampoco" || bad "--no-bluez ocupó el nombre"
 dd_stop
 DD_OPTS=(-v)
-# sin ningún servicio que ofrecer, no tiene sentido quedarse: sale diciendo por qué (y no «no hay bus»)
-DD_OPTS=(-v --no-mpris --no-bluez --no-nm)
+# sin ningún servicio que ofrecer (ni siquiera las notificaciones, desde la 0.4.3), no tiene sentido quedarse: sale diciendo por qué (y no «no hay bus»)
+DD_OPTS=(-v --no-mpris --no-bluez --no-nm --no-notify)
 bzdd N3 "$YPORT"
 poll '! kill -0 "$DD_PID" 2>/dev/null' 5 && ok "con todos los servicios apagados, nexo-dbus sale en vez de quedarse sin hacer nada…" || bad "siguió en marcha sin servicios"
 grep -q "todos los servicios están apagados" "$DB/N3.log" && ok "…y dice que es porque están apagados" || bad "mensaje sin servicios" "$(cat "$DB/N3.log")"
@@ -706,6 +707,18 @@ nctl "net none"
 npoll '[ "$(np "$NMR" $NMIF State)" = 20 ] && [ "$(np "$NMR" $NMIF Connectivity)" = 1 ]' 4 && ok "sin ninguna red (modo avión…) State = 20 y Connectivity = 1, aunque el WiFi siga «conectado» en la lista" || bad "State sin red" "$(np "$NMR" $NMIF State) $(np "$NMR" $NMIF Connectivity)"
 nctl "net auto"
 npoll '[ "$(np "$NMR" $NMIF State)" = 70 ]' 4 && ok "…y vuelve a 70 cuando vuelve la red" || bad "State tras volver la red"
+# Android no logra comprobar que hay internet (un WiFi sin salida): hay red, pero no «internet completo»
+nctl "net validated off"
+npoll '[ "$(np "$NMR" $NMIF State)" = 60 ] && [ "$(np "$NMR" $NMIF Connectivity)" = 3 ]' 4 && ok "internet sin validar (WiFi sin salida): State = 60 (conectado a un sitio) y Connectivity = 3 (limitada), no 70/4" || bad "State con internet sin validar" "$(np "$NMR" $NMIF State) $(np "$NMR" $NMIF Connectivity)"
+eqv "…y CheckConnectivity dice lo mismo (limitada)" 3 "$(sbj call "$NM" "$NMR" $NMIF CheckConnectivity | jq -r '.data[0]')"
+nctl "net captive on"
+npoll '[ "$(np "$NMR" $NMIF State)" = 60 ] && [ "$(np "$NMR" $NMIF Connectivity)" = 3 ]' 4 && ok "con un portal cautivo también: 60 y limitada (no se finge una internet completa)" || bad "State con portal cautivo" "$(np "$NMR" $NMIF State) $(np "$NMR" $NMIF Connectivity)"
+nctl "net captive off"
+nctl "net internet off"
+npoll '[ "$(np "$NMR" $NMIF State)" = 50 ] && [ "$(np "$NMR" $NMIF Connectivity)" = 1 ]' 4 && ok "una red que ni declara salida a internet: State = 50 (solo local) y Connectivity = 1 (ninguna)" || bad "State sin salida a internet" "$(np "$NMR" $NMIF State) $(np "$NMR" $NMIF Connectivity)"
+nctl "net internet on"
+nctl "net validated on"
+npoll '[ "$(np "$NMR" $NMIF State)" = 70 ] && [ "$(np "$NMR" $NMIF Connectivity)" = 4 ]' 4 && ok "…y vuelve a 70 y completa cuando Android da la red por buena" || bad "State tras validar" "$(np "$NMR" $NMIF State) $(np "$NMR" $NMIF Connectivity)"
 nctl "wifi disconnect"
 npoll '[ "$(np "$NMR" $NMIF State)" = 20 ]' 4
 nctl "net cellular"
@@ -718,13 +731,13 @@ zmon_stop
 dd_stop
 sgone "$NM" 6 && ok "al parar nexo-dbus, NetworkManager se va" || bad "NetworkManager no se fue"
 
-# una app anterior (0.2/0.3) no sabe de net.status: el estado sale solo del WiFi
+# una app anterior (0.2 a 0.4.2: protocolo < 1.5) no sabe de net.status: el estado sale solo del WiFi
 kill "$NPID" 2>/dev/null; wait "$NPID" 2>/dev/null
 : > "$DB/ctlN"
-NPORT=$(start_app dbusN2 --ctl "$DB/ctlN")
+NPORT=$(start_app dbusN2 --ctl "$DB/ctlN" --minor4)
 NPID=$(cat "$T/dbusN2.pid")
 nmdd N2 "$NPORT"
-npoll '[ "$(np "$NMR" $NMIF State)" = 70 ]' 8 && ok "con una app 0.2/0.3 (sin net.status) conectada al WiFi, State = 70" || bad "app antigua" "$(cat "$DB/N2.log")"
+npoll '[ "$(np "$NMR" $NMIF State)" = 70 ]' 8 && ok "con una app anterior a la 0.4.3 (sin net.status) conectada al WiFi, State = 70" || bad "app antigua" "$(cat "$DB/N2.log")"
 eqv "…y Metered = 0 (no lo sabe)" 0 "$(np "$NMR" $NMIF Metered)"
 nctl "wifi disconnect"
 npoll '[ "$(np "$NMR" $NMIF State)" = 20 ]' 4 && ok "…y sin WiFi conectado, 20" || bad "app antigua sin WiFi"
@@ -736,7 +749,7 @@ eqv "…y Connectivity = 4 (completa)" 4 "$(np "$NMR" $NMIF Connectivity)"
 eqv "…sin inventar una conexión: el dispositivo sigue desconectado y sin conexión principal" '30 "/"' "$(np "$NMD" $NMIF.Device State) $(np "$NMR" $NMIF PrimaryConnection)"
 dd_stop
 kill "$NPID" 2>/dev/null; wait "$NPID" 2>/dev/null
-# con una app que sí cuenta la red (protocolo 1.3), manda lo que ella diga
+# con una app que sí cuenta la red (protocolo 1.5), manda lo que ella diga
 : > "$DB/ctlN"
 NPORT=$(start_app dbusN4 --ctl "$DB/ctlN" --minor5)
 NPID=$(cat "$T/dbusN4.pid")

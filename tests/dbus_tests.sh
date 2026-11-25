@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Pruebas de nexo-dbus (MPRIS sobre D-Bus). No se ejecuta solo: lo carga tests/run_tests.sh (usa sus ok/bad/run/has/…).
 # Usa un dbus-daemon de verdad y, como CLIENTES independientes, busctl (sd-bus) y gdbus (GLib): si ellos entienden
 # lo que dice nexo-dbus, lo entenderán playerctl, Waybar, KDE y GNOME. La app Nexo es la app falsa de siempre.
@@ -11,6 +12,138 @@ import ast, sys
 ast.parse(open(sys.argv[1], encoding="utf-8").read(), feature_version=(3, 7))
 PY
 then ok "nexo-dbus usa solo sintaxis de Python 3.7 (el de las distros más viejas)"; else bad "sintaxis de Python 3.7" "$(cat "$T/err")"; fi
+
+# Las funciones puras de las notificaciones (sin bus): el texto que llega del móvil se limpia antes de enseñarlo en el escritorio,
+# y el servicio no recuerda más de NOTIFY_MAX_IDS avisos ni hace caso de eventos sin sentido. El script de Python escribe
+# «ok …» o «FALLA …» por línea y aquí se pasa cada una a ok/bad.
+if python3 -B - "$ROOT/termux/bin/nexo-dbus" >"$T/notifunit.out" 2>"$T/err" <<'PY'
+import importlib.machinery, importlib.util, sys, threading
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("nexo_dbus", sys.argv[1])
+spec = importlib.util.spec_from_loader("nexo_dbus", loader)
+nd = importlib.util.module_from_spec(spec)
+loader.exec_module(nd)
+
+
+def check(name, got, want):
+    print(("ok   " + name) if got == want else ("FALLA " + name + "  [salió %r y se esperaba %r]" % (got, want)))
+
+
+t = nd.notify_text
+check("notify_text deja el texto corto como está", t("hola ¿qué tal? ñandú", 50), "hola ¿qué tal? ñandú")
+check("…quita los caracteres de control (pitidos, escapes, NUL, DEL)", t("a\x07b\x1b[31mc\x7fd\x00e", 50), "ab[31mcde")
+check("…en una sola línea: los saltos se vuelven un espacio (también \\r\\n)", t("uno\ndos\r\ntres  \n  cuatro\r\rcinco", 50), "uno dos tres cuatro cinco")
+check("…o en varias, con \\n y sin más de una línea en blanco seguida", t("a\r\nb\n\n\n\nc\rd", 50, True), "a\nb\n\nc\nd")
+check("…quita los espacios y tabuladores de los bordes", t("  \t x \n ", 50), "x")
+check("…recorta con «…» sin pasarse del límite", t("0123456789", 6), "01234…")
+check("…justo en el límite no recorta", t("0123456789", 10), "0123456789")
+check("…cuenta letras, no bytes: no parte una tilde ni un emoji", t("ñandú😀ñandú😀", 7), "ñandú😀…")
+check("…un límite de cero deja el texto vacío", t("x", 0), "")
+check("…None es vacío", t(None, 10), "")
+check("…y un texto que no es texto, también se convierte", t(42, 10), "42")
+check("markup_escape neutraliza &, < y >", nd.markup_escape("<a href='x'>&</a>"), "&lt;a href='x'&gt;&amp;&lt;/a&gt;")
+check("…y no escapa dos veces lo que ya era una entidad (empieza por el &)", nd.markup_escape("&lt;"), "&amp;lt;")
+
+
+class Conn(object):
+    """Un «bus» de mentira: contesta a Notify con números que suben (o con el del aviso que se reemplaza)."""
+
+    def __init__(self):
+        self.n = 0
+        self.calls = []
+
+    def call(self, dest, path, iface, member, sig="", body=(), timeout=8.0):
+        self.calls.append((member, body))
+        if member == "GetCapabilities":
+            return (["body"],)
+        if member == "GetServerInformation":
+            return ("falso", "nexo", "1.0", "1.2")
+        if member == "Notify":
+            self.n += 1
+            return (body[1] or self.n,)
+        return ()
+
+
+class Bridge(object):
+    ready = threading.Event()
+    last_ready = 0.0
+
+    def call(self, *a, **k):
+        return {}
+
+
+n = nd.Notifier(Bridge())
+n.bus = Conn()
+for i in range(nd.NOTIFY_MAX_IDS + 50):
+    n._job_post({"key": "k%d" % i, "app": "A", "title": "t", "text": "x", "importance": 3})
+check("el servicio recuerda como mucho NOTIFY_MAX_IDS notificaciones", (len(n.ids), len(n.keys)), (nd.NOTIFY_MAX_IDS, nd.NOTIFY_MAX_IDS))
+check("…y olvida las más viejas, no las nuevas", ("k0" in n.ids, "k%d" % (nd.NOTIFY_MAX_IDS + 49) in n.ids), (False, True))
+n.bus.calls[:] = []
+n._job_post({"key": "k%d" % (nd.NOTIFY_MAX_IDS + 49), "app": "A", "title": "t2", "text": "y", "importance": 3})
+check("…y una que sí recuerda se reemplaza (replaces_id = su número)", n.bus.calls[0][1][1], n.ids["k%d" % (nd.NOTIFY_MAX_IDS + 49)])
+n.bus.calls[:] = []
+n._job_remove("k0")
+check("quitar una que se olvidó no llama al demonio", n.bus.calls, [])
+n._job_remove("k%d" % (nd.NOTIFY_MAX_IDS + 49))
+check("quitar una que se recuerda llama a CloseNotification", [c[0] for c in n.bus.calls], ["CloseNotification"])
+n.stop()
+
+n.bus.calls[:] = []
+
+
+class Quiet(nd.Notifier):
+    def _worker(self):          # sin hilo de trabajo: así se ve qué trabajos se encolan
+        return
+
+
+q = Quiet(Bridge())
+q.on_event("notif", {"op": "posted"})
+q.on_event("notif", {"op": "posted", "key": 5})
+q.on_event("notif", {"op": "posted", "key": ""})
+q.on_event("notif", {"op": "otra", "key": "x"})
+q.on_event("notif", "texto")
+q.on_event("notif", None)
+q.on_event("wifi", {"op": "posted", "key": "x"})
+check("on_event ignora lo que no sea un aviso o una baja con clave de texto", q._q.qsize(), 0)
+q.on_event("notif", {"op": "posted", "key": "x", "title": "t"})
+q.on_event("notif", {"op": "removed", "key": "x", "reason": "clicked"})
+check("…y encola los buenos", [q._q.get()[0], q._q.get()[0]], ["post", "remove"])
+
+d = nd.Notifier(Bridge())
+d.stop()
+check("describe sin bus", d.describe()[0], "nobus")
+d.bus = Conn()
+check("…sin enlace con la app", d.describe()[0], "link")
+d.link_ok = lambda: True
+check("…sin saber aún lo del reenvío", d.describe()[0], "wait")
+d.app = {"access": True, "forwarding": True, "active": 0}
+check("…con todo en orden", d.describe()[0], "active")
+d.app = {"access": True, "forwarding": False, "active": 0}
+check("…con el reenvío apagado", d.describe()[0], "noforward")
+d.app = {"access": False, "forwarding": True, "active": 0}
+check("…sin acceso a las notificaciones de Android", d.describe()[0], "noaccess")
+d.app = False
+check("…con una app antigua", d.describe()[0], "noapp")
+d.app = "cosa rara"
+check("…con una respuesta que no es lo que se esperaba (no se rompe)", d.describe()[0], "wait")
+d.app = {"access": True, "forwarding": True}
+d.nodaemon = True
+check("…sin demonio de notificaciones", d.describe()[0], "nodaemon")
+d.nodaemon = False
+d.server = ("dunst", "knopwob", "1.9.2")
+check("…el texto cuenta qué demonio es", "dunst 1.9.2" in d.describe()[1], True)
+PY
+then
+    while IFS= read -r l; do
+        case $l in
+            "ok   "*) ok "${l#ok   }" ;;
+            "FALLA "*) bad "${l#FALLA }" ;;
+        esac
+    done < "$T/notifunit.out"
+    [ "$(grep -c -E '^(ok|FALLA) ' "$T/notifunit.out")" -ge 30 ] || bad "el script de las funciones de notificaciones no llegó al final" "$(cat "$T/notifunit.out")"
+else
+    bad "pruebas de las funciones de notificaciones (Python)" "$(cat "$T/err")"
+fi
 CLIENT_VERSION=$(sed -n 's/^NEXO_VERSION="\(.*\)"/\1/p' "$ROOT/termux/bin/nexo")
 run python3 "$DD" version;               eq "nexo-dbus version = la del cliente" "nexo-dbus $CLIENT_VERSION"
 run python3 "$DD" help;                  has "help explica qué es" "reproductor MPRIS"
@@ -21,20 +154,36 @@ run python3 "$DD" run --bus;             rc_is "--bus sin valor → uso (2)" 2
 run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" python3 "$DD" run
 rc_is "sin token ni enlace → 11" 11
 has "…y dice cómo enlazar" "nexo pair"
-# nexo-dbus también mira /run/user/UID/bus: en un PC con escritorio ese bus existe y las pruebas de «sin bus» no valen
-if [ -S "/run/user/$(id -u)/bus" ]; then
-    NOBUS=0
-    echo "  --    esta máquina tiene un bus de sesión real en /run/user/$(id -u)/bus: se omiten las pruebas de «sin bus»"
-else
-    NOBUS=1
-fi
-if [ "$NOBUS" = 1 ]; then
-run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" NEXO_TOKEN=00ff python3 "$DD" run
+# nexo-dbus también mira /run/user/UID/bus y el bus del sistema: en un PC con escritorio, en un contenedor con dbus o en un
+# ejecutor de CI existen, y entonces «sin bus» no sería cierto (y nexo-dbus se pondría a servir BlueZ en el bus del sistema
+# en vez de salir). Las pruebas que necesitan «sin bus» llevan "${SIN_BUS[@]}": un socket de sesión que no existe y sin bus
+# del sistema. Así valen en cualquier máquina, con o sin buses reales.
+SIN_BUS=(NEXO_DBUS_SESSION_SOCKET="$T/sin-bus-de-sesion" NEXO_DBUS_SYSTEM_BUS=none)
+run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" "${SIN_BUS[@]}" NEXO_TOKEN=00ff python3 "$DD" run
 rc_is "con token pero sin bus de sesión → 3" 3
 has "…y explica qué hacer" "dbus-run-session"
-run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" python3 "$DD" env
+run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" "${SIN_BUS[@]}" python3 "$DD" env
 rc_is "env sin bus → 3" 3
-fi
+# …y NEXO_DBUS_SESSION_SOCKET sustituye de verdad a las rutas de siempre: con un socket suyo que existe, lo usa
+mkdir -p "$T/nohome/sesion"
+python3 - "$T/nohome/sesion/bus" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PY
+run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" NEXO_DBUS_SESSION_SOCKET="$T/nohome/sesion/bus" python3 "$DD" env
+eq "NEXO_DBUS_SESSION_SOCKET: usa ese socket" "export DBUS_SESSION_BUS_ADDRESS='unix:path=$T/nohome/sesion/bus'"
+mkdir -p "$T/nohome/runtime"
+python3 - "$T/nohome/runtime/bus" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+PY
+run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome/runtime" python3 "$DD" env
+eq "sin esa variable sigue mirando \$XDG_RUNTIME_DIR/bus" "export DBUS_SESSION_BUS_ADDRESS='unix:path=$T/nohome/runtime/bus'"
+run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome/runtime" NEXO_DBUS_SESSION_SOCKET="$T/sin-bus-de-sesion" NEXO_DBUS_SYSTEM_BUS=none python3 "$DD" env
+rc_is "…y con la variable apuntando a la nada no mira el de XDG_RUNTIME_DIR (→ 3)" 3
+rm -rf "$T/nohome/sesion" "$T/nohome/runtime"
 run env -i PATH="$PATH" HOME="$T/nohome" XDG_RUNTIME_DIR="$T/nohome" DBUS_SESSION_BUS_ADDRESS="unix:path=/x'y" python3 "$DD" env
 eq "env imprime una línea para eval (con comillas a salvo)" "export DBUS_SESSION_BUS_ADDRESS='unix:path=/x'\\''y'"
 
@@ -264,8 +413,10 @@ nmon() { grep -c -- "$2" "$1" 2>/dev/null || true; }
 
 bus_start && ok "arranca un dbus-daemon de pruebas" || bad "dbus-daemon de pruebas"
 
-# NEXO_TESTS_DBUS_PART=system (solo BlueZ y compañía) | mpris (solo el reproductor) | all (por omisión): para iterar rápido
-if [ "${NEXO_TESTS_DBUS_PART:-all}" != system ]; then
+# NEXO_TESTS_DBUS_PART=system (solo BlueZ y compañía) | mpris (solo el reproductor) | notif (solo las notificaciones de Android)
+# | all (por omisión): para iterar rápido
+DBUS_PART=${NEXO_TESTS_DBUS_PART:-all}
+if [ "$DBUS_PART" = all ] || [ "$DBUS_PART" = mpris ]; then
 
 # ------------------------------------------------------------------------------ la sonda de tipos D-Bus
 echo "== nexo-dbus: los tipos D-Bus los entiende un cliente de verdad (busctl)"
@@ -551,7 +702,7 @@ dd_stop
 # ------------------------------------------------------------------------------ start / stop / status / --own-bus
 echo "== nexo-dbus: start, stop, status y bus propio"
 SPORT=$(start_app dbusS)
-sd() { env -i PATH="$PATH" HOME="$DB/home" XDG_RUNTIME_DIR="$DB/runS" XDG_CACHE_HOME="$DB/cacheS" NEXO_PORT="$SPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none "$@"; }
+sd() { env -i PATH="$PATH" HOME="$DB/home" XDG_RUNTIME_DIR="$DB/runS" XDG_CACHE_HOME="$DB/cacheS" NEXO_PORT="$SPORT" NEXO_TOKEN="$TOKEN" "${SIN_BUS[@]}" "$@"; }
 mkdir -p "$DB/runS"
 run sd python3 "$DD" status;                       rc_is "status con nexo-dbus parado → 1" 1
 run sd DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS_SOCK" python3 "$DD" start
@@ -565,10 +716,8 @@ has "start otra vez no duplica nada" "ya está en marcha"
 run sd python3 "$DD" stop;                         rc_is "stop" 0
 wait_gone "$MP" 4 && ok "…y el reproductor se va" || bad "stop no liberó el nombre"
 run sd python3 "$DD" status;                       rc_is "status tras stop → 1" 1
-if [ "$NOBUS" = 1 ]; then
 run sd python3 "$DD" start;                        rc_is "start sin bus de sesión → 3" 3
 has "…y dice qué hacer" "--own-bus"
-fi
 
 run sd python3 "$DD" start --own-bus
 rc_is "start --own-bus arranca su propio bus" 0
@@ -606,16 +755,18 @@ run sdr "$SD/bin/nexo" setup-dbus --uninstall
 rc_is "--uninstall" 0
 wait_gone "$MP" 6 && ok "…para el servicio y el reproductor se va" || bad "--uninstall no paró nexo-dbus"
 [ ! -e "$DB/homeR/.config/autostart/nexo-dbus.desktop" ] && ok "…y quita el arranque automático" || bad "quedó el .desktop"
-if [ "$NOBUS" = 1 ]; then
-run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none "$SD/bin/nexo" setup-dbus
+run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" "${SIN_BUS[@]}" "$SD/bin/nexo" setup-dbus
 rc_is "sin bus de sesión, setup-dbus deja el arranque listo y no falla" 0
 has "…y explica que se arrancará con el escritorio" "no hay bus de sesión"
-run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_SYSTEM_BUS=none "$SD/bin/nexo" setup-dbus --uninstall
-fi
+run env -i PATH="$SD/stubs:$SD/bin:$PATH" HOME="$DB/homeR" XDG_RUNTIME_DIR="$DB/runR2" XDG_CACHE_HOME="$DB/cacheR2" NEXO_PORT="$RPORT" NEXO_TOKEN="$TOKEN" "${SIN_BUS[@]}" "$SD/bin/nexo" setup-dbus --uninstall
 
 fi   # parte MPRIS
 
-if [ "${NEXO_TESTS_DBUS_PART:-all}" != mpris ]; then
+if [ "$DBUS_PART" = all ] || [ "$DBUS_PART" = notif ]; then
+. "$ROOT/tests/dbus_notif_tests.sh"
+fi
+
+if [ "$DBUS_PART" = all ] || [ "$DBUS_PART" = system ]; then
 . "$ROOT/tests/dbus_system_tests.sh"
 fi
 

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Pruebas de nexo-tools 2.4 (servidor HTTPS, emparejamiento, descubrimiento, explorador, escritura, envío con código).
 # No se ejecuta solo: lo carga tests/run_tests.sh (usa sus ok/bad/run/has/…). Necesita: bash, python3, openssl.
 # Simula DOS dispositivos en esta máquina: A (servidor, con su HOME) y B (cliente, con el suyo), hablando por 127.0.0.1.

@@ -4,8 +4,8 @@
 # y da la salida con formato. No depende de qué Termux uses (F-Droid, GitHub, Monet, forks...).
 # Licencia: GPL-3.0-or-later
 
-NEXO_VERSION="0.4.2"
-CLIENT_MINOR=4          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
+NEXO_VERSION="0.4.3"
+CLIENT_MINOR=5          # revisión del protocolo (docs/PROTOCOLO.md) que este cliente aprovecha entera
 export LC_ALL=C
 
 NEXO_HOST=${NEXO_HOST:-127.0.0.1}
@@ -70,9 +70,16 @@ Música (hace falta darle a Nexo «acceso a notificaciones» en Android)
   media play|pause|playpause|stop|next|prev
   media seek +10s|-10s|90s|1:30 Adelanta, atrasa o va a un punto
   media art [ARCHIVO]           Guarda la carátula y muestra dónde quedó
+Red y notificaciones del móvil (hace falta la app 0.4.3 o más nueva)
+  net [status]                  Por dónde sale el móvil a internet (WiFi, datos móviles, cable…), si hay internet de verdad, si es de pago y si hay VPN
+  notif status                  Si Nexo reenvía tus notificaciones a Linux (es opcional: está apagado hasta que lo activas en la app Nexo)
+  notif list                    Las notificaciones que tiene el móvil ahora, con la clave de cada una
+  notif dismiss CLAVE | --all   Las quita del móvil (Android no deja quitar las fijas ni las de servicios en marcha)
+  notif watch                   Las que lleguen y se quiten, en vivo (--pretty para leerlas; --event para eventos sueltos)
 Eventos
-  watch [wifi|bt|audio|media|usb|storage]  Cambios en vivo, un JSON por línea (--pretty para leerlos; --event para eventos sueltos;
-                                 «storage» avisa al enchufar, montar, expulsar o quitar un disco USB; por omisión van los cuatro primeros)
+  watch [wifi|bt|audio|media|usb|storage|net|notif]  Cambios en vivo, un JSON por línea (--pretty para leerlos; --event para eventos sueltos;
+                                 «storage» avisa al enchufar, montar, expulsar o quitar un disco USB; «net» cuando cambia la red del móvil;
+                                 «notif» trae tus notificaciones y hay que pedirlo a propósito; por omisión van wifi, bt, audio y media)
 Escritorio (el móvil como MPRIS, BlueZ y NetworkManager: playerctl, bluetoothctl, nmcli, Waybar, Quickshell, GNOME, KDE…)
   setup-dbus [--uninstall]      Deja nexo-dbus funcionando y con arranque automático (hace falta python3)
                                 (--no-start no lo arranca ahora, --own-bus crea los buses de D-Bus que falten,
@@ -80,6 +87,8 @@ Escritorio (el móvil como MPRIS, BlueZ y NetworkManager: playerctl, bluetoothct
                                  --system-policy [--policy-user NOMBRE]… deja que Linux permita a ese usuario
                                  ocupar org.bluez y NetworkManager en el bus del sistema; pide root)
   dbus COMANDO                  Atajo a nexo-dbus: start, stop, restart, status (qué hace cada servicio), env, run…
+                                Con «Reenviar notificaciones a Linux» activado en la app, las notificaciones del móvil salen en tu escritorio
+                                (dunst, mako, swaync, GNOME, KDE…) por nexo-dbus: no hace falta nada más (--no-notify las apaga)
 Archivos entre móviles (nexo-tools: no hace falta el puente; solo la misma red WiFi)
   tools [COMANDO…]              Abre nexo-tools. Lo más usado (todo lo que sigue a «tools» es de nexo-tools):
                                   tools send ARCHIVO…        envía SOLO eso y da un código para el otro móvil
@@ -133,7 +142,7 @@ Formatos de salida
   --dunst     Texto con icono para notify-send, dunst, mako, swaync
   --tmux      Texto corto para status-right de tmux
   --starship  Texto para un módulo custom de starship (vacío si no hay nada que mostrar)
-  --csv       CSV (en listas: wifi scan, wifi saved, bt paired, audio outputs)
+  --csv       CSV (en listas: wifi scan, wifi saved, bt paired, audio outputs, notif list)
   Las barras (waybar, polybar, i3status, qml, tmux, starship) nunca fallan: si la app no responde muestran «offline».
   Iconos Nerd Font por omisión; NEXO_ICONS=none los quita.
 
@@ -508,11 +517,11 @@ cache_failing() {
 set_icons() {
     case ${NEXO_ICONS:-nerd} in
         none|off|0|no)
-            G_WIFI=""; G_BT=""; G_VOL=""; G_VOLLOW=""; G_MUTE=""; G_MUSIC=""; G_PLAY=""; G_PAUSE=""; G_STOP="" ;;
+            G_WIFI=""; G_BT=""; G_VOL=""; G_VOLLOW=""; G_MUTE=""; G_MUSIC=""; G_PLAY=""; G_PAUSE=""; G_STOP=""; G_NET="" ;;
         *)
             # Font Awesome dentro de Nerd Fonts (existen en las versiones 2 y 3). Bytes UTF-8 en octal, porque LC_ALL=C.
             G_WIFI=$'\357\207\253'; G_BT=$'\357\212\223'; G_VOL=$'\357\200\250'; G_VOLLOW=$'\357\200\247'
-            G_MUTE=$'\357\200\246'; G_MUSIC=$'\357\200\201'; G_PLAY=$'\357\201\213'; G_PAUSE=$'\357\201\214'; G_STOP=$'\357\201\215' ;;
+            G_MUTE=$'\357\200\246'; G_MUSIC=$'\357\200\201'; G_PLAY=$'\357\201\213'; G_PAUSE=$'\357\201\214'; G_STOP=$'\357\201\215'; G_NET=$'\357\202\254' ;;
     esac
 }
 
@@ -600,6 +609,34 @@ def vm_media:
      end)
   | stale($d);
 
+def netname($t): ({"wifi": "WiFi", "cellular": "datos móviles", "ethernet": "cable", "bluetooth": "Bluetooth", "other": "otra red"}[$t] // $t);
+def vm_net:
+  (.data // {}) as $d
+  | (if $d.offline == true then off_vm("net"; $gn; $d)
+     elif $d.available == false then base("net"; $gn) + {state: "unavailable", short: "n/d", wtext: "n/d", long: "Red: el móvil no da información de red", tip: "Red: no disponible", icon: "network-offline-symbolic"}
+     elif $d.type == "none" then base("net"; $gn) + {state: "none", short: "sin red", wtext: "sin red", long: "Red: el móvil no tiene conexión", tip: "Red: sin conexión", color: warn, icon: "network-offline-symbolic"}
+     else
+       netname($d.type) as $n
+       | ($n + (if $d.vpn == true then " + VPN" else "" end)) as $nv
+       | (if $d.validated == true then "connected" elif $d.captive == true then "captive" else "limited" end) as $st
+       | (if $st == "connected" then $nv elif $st == "captive" then $nv + ": iniciar sesión" else $nv + " sin internet" end) as $sh
+       | base("net"; $gn)
+         + {state: $st, short: $sh, wtext: $sh,
+            long: ("Red: " + $nv + " · "
+                   + (if $st == "connected" then "con internet"
+                      elif $st == "captive" then "portal cautivo: hay que iniciar sesión en la red"
+                      elif $d.internet == true then "sin internet de verdad (Android no logra comprobarlo)"
+                      else "sin salida a internet" end)
+                   + (if $d.metered == true then " · de pago (datos limitados)" else "" end)),
+            tip: ("Red: " + $sh),
+            pct: (if $st == "connected" then 100 else 0 end), active: ($st == "connected"),
+            color: (if $st == "connected" then good else warn end),
+            icon: (if $st != "connected" then "network-error-symbolic" elif $d.vpn == true then "network-vpn-symbolic"
+                   elif $d.type == "wifi" then "network-wireless-symbolic" elif $d.type == "cellular" then "network-cellular-symbolic"
+                   elif $d.type == "ethernet" then "network-wired-symbolic" else "network-transmit-receive-symbolic" end)}
+     end)
+  | stale($d);
+
 def acts($t):
   if $t == "wifi" then [[1, "wifi reconnect"]]
   elif $t == "bt" then [[1, "bt toggle"]]
@@ -613,7 +650,7 @@ def polybar:
   | (reduce acts($t)[] as $a (""; . + "%{A\($a[0]):\($bin) \($a[1]):}")) as $open
   | ([acts($t)[] | "%{A}"] | join("")) as $close
   | "%{F\(.color)}" + $open + gl_ + $txt + $close + "%{F-}";
-def interesting: .state as $s | any(["connected", "on", "playing", "paused", "muted"][]; . == $s);
+def interesting: .state as $s | any(["connected", "on", "playing", "paused", "muted", "captive", "limited"][]; . == $s);
 
 def out($p):
   if $p == "text" then .long
@@ -632,6 +669,7 @@ def csvrow($t):
   | if $t == "wifi" then "connected,ssid,signal,band,ip", ([$d.connected, $d.ssid, $d.rssi, $d.band, $d.ip] | @csv)
     elif $t == "bt" then "enabled,connected,bonded", ([$d.enabled, $d.connected, $d.bonded_count] | @csv)
     elif $t == "audio" then "volume,muted,output", ([$d.volume, $d.muted, ($d.output.name // null)] | @csv)
+    elif $t == "net" then "type,internet,validated,metered,vpn,captive", ([$d.type, $d.internet, $d.validated, $d.metered, $d.vpn, $d.captive] | @csv)
     else "state,title,artist,album,app", ([$d.state, $d.title, $d.artist, $d.album, $d.app] | @csv) end;
 '
 
@@ -651,6 +689,16 @@ JQ_EVENT='if .event == "wifi" then
   elif .event == "media" then
     "media → " + (.data | if .listener == false then "sin acceso a notificaciones" elif .available != true then "nada en reproducción"
                           else "\(.state): \(.title // "?")" + (if (.artist // "") != "" then " — " + .artist else "" end) end)
+  elif .event == "net" then
+    "red   → " + (.data | if .available == false then "sin información de red" elif .type == "none" then "sin conexión"
+                          else ({"wifi": "WiFi", "cellular": "datos móviles", "ethernet": "cable", "bluetooth": "Bluetooth"}[.type] // "otra red")
+                               + (if .vpn then " + VPN" else "" end)
+                               + (if .validated then " (con internet)" elif .captive then " (portal cautivo: falta iniciar sesión)" else " (sin internet)" end)
+                               + (if .metered then " · de pago" else "" end) end)
+  elif .event == "notif" then
+    "notif → " + (.data | if .op == "posted" then (.app // .package // "?") + ": " + (if (.title // "") != "" then .title else "(sin título)" end)
+                                                     + (if (.text // "") != "" then " — " + .text else "" end)
+                          else "se quitó \(.key // "?") (" + ({"clicked": "la tocaste", "dismissed": "descartada", "cancelled": "la app la retiró", "timeout": "caducó"}[.reason] // "otro motivo") + ")" end)
   elif .event == "usb" then
     "usb   → " + (.data | if .available == false then "sin USB host" else "\((.devices // []) | length) dispositivo(s)" end)
   elif .event == "storage" then
@@ -694,6 +742,22 @@ def evs($t; $p; $c):
          (if $p == null or $p.track_id != $c.track_id or $p.title != $c.title then [mk("track"; {title: $c.title, artist: $c.artist, album: $c.album, app: $c.app})] else [] end)
          + (if $p == null or $p.state != $c.state then [mk("state"; {state: $c.state})] else [] end)
        end)
+  elif $t == "net" then
+    if $c.available == false then [mk("unavailable"; {})]
+    else
+      (if $p == null or ($p.type == "none") != ($c.type == "none") then
+         [(if $c.type == "none" then mk("disconnected"; (if $p != null then {previous: $p.type} else {} end))
+           else mk("connected"; {network: $c.type, internet: $c.validated, metered: $c.metered, vpn: $c.vpn}) end)]
+       elif $c.type != "none" and $p.type != $c.type then
+         [mk("changed"; {network: $c.type, previous: $p.type, internet: $c.validated, metered: $c.metered, vpn: $c.vpn})]
+       else [] end)
+      + (if $c.type == "none" then []
+         elif $p == null or $p.validated != $c.validated then [mk(if $c.validated then "online" else "offline" end; {})]
+         else [] end)
+      + (if $p != null and $c.type != "none" and $p.type != "none" and $p.vpn != $c.vpn then [mk(if $c.vpn then "vpn_on" else "vpn_off" end; {})] else [] end)
+    end
+  elif $t == "notif" then
+    [{type: "notif", event: ($c.op // "changed")} + ($c | del(.op))]
   elif $t == "storage" then
     def vols($s): (($s // {}).volumes // []) | map(select(.primary | not));
     def vinfo($v): {volume: $v.uuid, label: $v.label, state: $v.state, readonly: $v.readonly};
@@ -722,6 +786,7 @@ topic_cmd() {
         bt) echo bt.status ;;
         audio) echo audio.status ;;
         media) echo media.status ;;
+        net) echo net.status ;;
     esac
 }
 
@@ -1166,8 +1231,8 @@ watch_once() {
             *'"ok":true'*) ;;
             *) printf '%s\n' "$line" >&2; exit 14 ;;
         esac
-        # ¿Se quedó algún tema fuera? (una app antigua solo conoce wifi y bt)
-        for t in wifi bt audio media; do
+        # ¿Se quedó algún tema fuera? (una app antigua solo conoce wifi y bt; «net» y «notif» son de la 0.4.3)
+        for t in wifi bt audio media usb storage net notif; do
             case $1 in *"\"$t\""*) case $line in *"\"$t\""*) ;; *) printf 'nexo: esta app no ofrece eventos de «%s» (¿APK antiguo? mira: nexo version --check)\n' "$t" >&2 ;; esac ;; esac
         done
         while :; do
@@ -1206,9 +1271,9 @@ cmd_watch() {
     local topics=() ev=0 a list="" sep=""
     for a in "$@"; do
         case $a in
-            wifi|bt|audio|media|usb|storage) topics+=("$a") ;;
+            wifi|bt|audio|media|usb|storage|net|notif) topics+=("$a") ;;
             --event|--events) ev=1 ;;
-            *) die 2 "watch: argumento desconocido «$a» (wifi, bt, audio, media, usb, storage, --event, --pretty)" ;;
+            *) die 2 "watch: argumento desconocido «$a» (wifi, bt, audio, media, usb, storage, net, notif, --event, --pretty)" ;;
         esac
     done
     [ "${#topics[@]}" -gt 0 ] || topics=(wifi bt audio media)
@@ -1223,6 +1288,142 @@ cmd_watch() {
     else
         watch_loop "[$list]"
     fi
+}
+
+# ------------------------------------------------------------------ red y notificaciones del móvil (protocolo 1.5)
+
+# net [status] → por dónde sale el móvil a internet
+cmd_net() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status|st) topic_show net ;;
+        *) die 2 "net: subcomando desconocido «$sub» (status)" ;;
+    esac
+}
+
+# rpc_many PETICION... → RESP (una línea por petición). Si falla la conexión, termina el programa.
+rpc_many() {
+    local rc=0
+    need_token
+    rpc "$@" || rc=$?
+    case $rc in
+        0) return 0 ;;
+        10) die 10 "No se puede conectar con Nexo en $NEXO_HOST:$NEXO_PORT. ¿Está encendido el puente en la app? (mira: nexo doctor)" ;;
+        13) die 11 "Nexo rechazó el token. Vuelve a copiar el comando de instalación desde la app (o usa: nexo rekey TOKEN)." ;;
+        *)  hint_frozen; die 12 "La conexión con Nexo se cortó o no respondió a tiempo." ;;
+    esac
+}
+
+NOTIF_STATUS_JQ='.data
+  | if (.access | not) then "Notificaciones: Nexo no tiene el acceso a notificaciones de Android (ajustes de Android › Acceso a notificaciones › Nexo)"
+    elif (.forwarding | not) then "Notificaciones: el reenvío está apagado (en la app Nexo, activa «Reenviar notificaciones a Linux»)"
+    else "Notificaciones: se reenvían a Linux · \(.active) en el móvil ahora" end'
+
+NOTIF_LIST_JQ='def ago($ms): ((now - $ms / 1000) | floor) as $s
+  | if $s < 60 then "ahora" elif $s < 3600 then "hace \($s / 60 | floor) min" elif $s < 86400 then "hace \($s / 3600 | floor) h" else "hace \($s / 86400 | floor) d" end;
+(.data.notifications // []) as $n
+| if ($n | length) == 0 then "No hay notificaciones."
+  else
+    (($n | length | tostring) + (if ($n | length) == 1 then " notificación" else " notificaciones" end)),
+    ($n[] | ("• " + (.app // .package // "?")
+             + (if (.title // "") != "" then " · " + .title else "" end)
+             + (if (.text // "") != "" then ": " + (.text | split("\n") | join(" ")) else "" end)
+             + "   (" + ago(.time // 0) + (if .ongoing then ", fija" elif (.clearable | not) then ", no se puede quitar" else "" end) + ")"),
+            ("    clave: " + .key))
+  end'
+
+# notif dismiss CLAVE | --all
+notif_dismiss() {
+    local key="" all=0 a
+    for a in "$@"; do
+        case $a in
+            --all|-a) all=1 ;;
+            -*) die 2 "notif dismiss: opción desconocida «$a» (--all)" ;;
+            *) [ -z "$key" ] || die 2 "notif dismiss: una clave cada vez (o --all para todas)"; key=$a ;;
+        esac
+    done
+    if [ "$all" = 1 ]; then
+        [ -z "$key" ] || die 2 "notif dismiss: o una clave o --all, no las dos cosas"
+        have_jq || die 1 "notif dismiss --all necesita jq (pkg install jq / apt install jq)"
+        need notif.list
+        local keys=() reqs=() R=() k i done_n=0 failed=0 skipped last_err=""
+        mapfile -t keys < <(printf '%s' "$RESP" | jq -r '.data.notifications[] | select(.clearable and (.ongoing | not)) | .key')
+        skipped=$(printf '%s' "$RESP" | jq -r '[.data.notifications[] | select((.clearable and (.ongoing | not)) | not)] | length')
+        if [ "${#keys[@]}" -gt 0 ]; then
+            for k in "${keys[@]}"; do reqs+=("$(build notif.dismiss "key=$k")"); done
+            NO_RETRY=1
+            rpc_many "${reqs[@]}"
+            mapfile -t R <<<"$RESP"
+            for i in "${!reqs[@]}"; do
+                RESP=${R[$i]:-}
+                if resp_ok; then done_n=$((done_n + 1))
+                elif [ "$(err_code)" = not_found ]; then done_n=$((done_n + 1))        # ya no estaba: la quitaron entretanto
+                else failed=$((failed + 1)); last_err=$(printf '%s' "$RESP" | jq -r '.message // .error // ""' 2>/dev/null); fi
+            done
+        fi
+        if [ "$FMT" = json ]; then
+            printf '{"dismissed":%s,"failed":%s,"skipped":%s}\n' "$done_n" "$failed" "${skipped:-0}"
+        else
+            if [ "${#keys[@]}" -eq 0 ]; then
+                if [ "${skipped:-0}" -gt 0 ]; then echo "Ninguna se puede quitar ($skipped son fijas o de servicios en marcha)."
+                else echo "No hay notificaciones que quitar."; fi
+            else
+                echo "Quitadas: $done_n"
+                [ "${skipped:-0}" -gt 0 ] && echo "Sin quitar: $skipped (Android no deja quitar las fijas ni las de servicios en marcha)"
+                [ "$failed" -gt 0 ] && warn "No pude quitar $failed${last_err:+: $last_err}"
+            fi
+        fi
+        [ "$failed" -eq 0 ]
+        return $?
+    fi
+    [ -n "$key" ] || die 2 "Uso: nexo notif dismiss CLAVE   (o --all; las claves salen de: nexo notif list)"
+    NO_RETRY=1
+    need notif.dismiss "key=$key"
+    if [ "$FMT" = json ] && have_jq; then printf '%s' "$RESP" | jq -c '.data'
+    else echo "Notificación quitada."; fi
+}
+
+# notif watch: los eventos del tema notif (cmd_watch hace el resto)
+notif_watch() {
+    need_token
+    if have_jq && call_try notif.status; then
+        printf '%s' "$RESP" | jq -r 'if (.data.access | not) then "nexo: Nexo no tiene el acceso a notificaciones de Android: no llegará ninguna (mira: nexo notif status)"
+            elif (.data.forwarding | not) then "nexo: el reenvío está apagado: actívalo en la app Nexo («Reenviar notificaciones a Linux») para que lleguen (mira: nexo notif status)"
+            else empty end' >&2
+    fi
+    cmd_watch notif "$@"
+}
+
+# notif status|list|dismiss|watch. Las notificaciones son privadas: no se guardan en la caché de las barras.
+cmd_notif() {
+    local sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        status|st)
+            need notif.status
+            if ! have_jq; then printf '%s\n' "$RESP"; return 0; fi
+            case $FMT in
+                json) printf '%s' "$RESP" | jq -c '.data' ;;
+                env)  printf '%s' "$RESP" | jq -r --arg p NOTIF "$JQ_ENV" ;;
+                csv)  printf '%s' "$RESP" | jq -r '"access,forwarding,active", ([.data.access, .data.forwarding, .data.active] | @csv)' ;;
+                short) printf '%s' "$RESP" | jq -r 'if .data.access and .data.forwarding then (.data.active | tostring) else "off" end' ;;
+                *)    printf '%s' "$RESP" | jq -r "$NOTIF_STATUS_JQ" ;;
+            esac ;;
+        list|ls)
+            need notif.list
+            if ! have_jq; then printf '%s\n' "$RESP"; [ "${NEXO_NOHINT:-0}" = 1 ] || warn "(instala jq para ver esto con formato: pkg install jq / apt install jq)"; return 0; fi
+            case $FMT in
+                json) printf '%s' "$RESP" | jq -c '.data' ;;
+                csv)  printf '%s' "$RESP" | jq -r '"app,title,text,time,category,importance,ongoing,clearable,key",
+                                                   (.data.notifications[] | [.app, .title, .text, .time, .category, .importance, .ongoing, .clearable, .key] | @csv)' ;;
+                short) printf '%s' "$RESP" | jq -r '.data.notifications | length' ;;
+                *)    printf '%s' "$RESP" | jq -r "$NOTIF_LIST_JQ" ;;
+            esac ;;
+        dismiss|clear|close) notif_dismiss "$@" ;;
+        watch) notif_watch "$@" ;;
+        *) die 2 "notif: subcomando desconocido «$sub» (status, list, dismiss, watch)" ;;
+    esac
 }
 
 cmd_ping() {
@@ -2377,6 +2578,15 @@ cmd_doctor() {
         printf '%s' "$h" | jq -r '.data | if has("usb") then "usb        este móvil \(if .usb then "tiene" else "NO tiene" end) USB host (OTG)\(if .usb then ": nexo usb list · nexo usb mounts" else "" end)" else empty end'
         printf '%s' "$h" | jq -r '.data | if has("listener") then "medios     acceso a notificaciones: \(if .listener then "sí" else "NO (Nexo → Permisos → Acceso a notificaciones; hace falta para «nexo media»)" end)" else empty end'
     fi
+    if have_jq && call_try net.status; then
+        printf '%s' "$RESP" | jq -r '.data | "red        " + (if .available == false then "el móvil no da información de red" elif .type == "none" then "el móvil no tiene conexión"
+            else ({"wifi": "WiFi", "cellular": "datos móviles", "ethernet": "cable", "bluetooth": "Bluetooth"}[.type] // "otra red") + (if .vpn then " + VPN" else "" end)
+                 + (if .validated then ", con internet" elif .captive then ", con portal cautivo (falta iniciar sesión en la red)" else ", SIN internet" end)
+                 + (if .metered then " · de pago" else "" end) end)'
+    fi
+    if have_jq && call_try notif.status; then
+        printf '%s' "$RESP" | jq -r '.data | "notific.   reenvío a Linux: \(if .forwarding then "sí (\(.active) en el móvil)" else "no (opcional: app Nexo → «Reenviar notificaciones a Linux»)" end)\(if .access then "" else " · falta el acceso a notificaciones de Android" end)"'
+    fi
     if have_jq && call_try wifi.status; then
         printf '%s' "$RESP" | jq -r '"permisos   ubicación: \(if .data.permission_location then "sí" else "NO (hace falta para ver el nombre del WiFi)" end) · ubicación del sistema: \(if .data.location_enabled then "sí" else "NO" end)"'
     fi
@@ -2398,7 +2608,7 @@ cmd_version() {
         return 1
     fi
     if [ "$minor" -lt "$CLIENT_MINOR" ]; then
-        for c in audio media wifi.saved bt.info logs usb storage; do
+        for c in audio media wifi.saved bt.info logs usb storage net notif; do
             if printf '%s' "$RESP" | jq -e --arg c "$c" '(.data.commands // []) | any(.[]; startswith($c))' >/dev/null 2>&1; then :; else missing+="$c "; fi
         done
         echo "✘ La app es más antigua que el cliente: faltan ${missing:-funciones nuevas}. Instala el APK nuevo (se actualiza encima, sin perder el enlace)."
@@ -2472,7 +2682,7 @@ main() {
         if have nexo; then NEXO_BIN=nexo; else NEXO_BIN=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0"); fi
     fi
     JQA=(--arg gw "$G_WIFI" --arg gb "$G_BT" --arg gv "$G_VOL" --arg gl "$G_VOLLOW" --arg gm "$G_MUTE"
-         --arg gmu "$G_MUSIC" --arg gp "$G_PLAY" --arg gpa "$G_PAUSE" --arg gs "$G_STOP" --arg bin "$NEXO_BIN")
+         --arg gmu "$G_MUSIC" --arg gp "$G_PLAY" --arg gpa "$G_PAUSE" --arg gs "$G_STOP" --arg gn "$G_NET" --arg bin "$NEXO_BIN")
 
     set -- "${ARGS[@]}"
     local cmd=${1:-help}
@@ -2483,6 +2693,8 @@ main() {
         bt|bluetooth) cmd_bt "$@" ;;
         audio|volume|vol) if [ "$cmd" = audio ]; then cmd_audio "$@"; else cmd_audio volume "$@"; fi ;;
         media|music) cmd_media "$@" ;;
+        net|network) cmd_net "$@" ;;
+        notif|notifications) cmd_notif "$@" ;;
         watch) cmd_watch "$@" ;;
         ping) cmd_ping ;;
         raw) cmd_raw "$@" ;;

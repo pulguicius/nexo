@@ -4,12 +4,15 @@ import android.content.ComponentName
 import android.content.Context
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 
 /**
  * Android solo deja que una app vea las sesiones de medios de las demás (la música que suena, sus
  * botones y su carátula) si tiene concedido el «acceso a notificaciones». Este servicio es esa
- * llave: en esta versión NO lee ni guarda ninguna notificación; solo existe para que
- * `MediaSessionManager.getActiveSessions()` nos conteste.
+ * llave. Además, desde la 0.4.3, si el usuario activa «Reenviar notificaciones a Linux» en la app,
+ * pasa lo que ocurre con las notificaciones a NotifBridge (que las entrega por el puente local a los
+ * clientes suscritos). Con el interruptor apagado (lo normal) NO lee ni reenvía ninguna notificación,
+ * y no guarda nada nunca.
  *
  * El usuario lo concede una sola vez en Ajustes › Notificaciones › Acceso a notificaciones.
  */
@@ -19,6 +22,15 @@ class NexoNotificationListener : NotificationListenerService() {
         @Volatile
         var connected = false
             private set
+
+        /** El servicio, mientras Android lo tiene enlazado (para `activeNotifications` y `cancelNotification`). */
+        @Volatile
+        var instance: NexoNotificationListener? = null
+            private set
+
+        /** Lo asigna el servicio del puente mientras escucha: sin él no se reenvía nada. */
+        @Volatile
+        var bridge: NotifBridge? = null
 
         /** ¿Le dio el usuario el acceso a notificaciones a Nexo? */
         fun isEnabled(ctx: Context): Boolean {
@@ -43,6 +55,7 @@ class NexoNotificationListener : NotificationListenerService() {
     }
 
     override fun onListenerConnected() {
+        instance = this
         connected = true
         BridgeState.log("Acceso a notificaciones activo")
         onChange?.invoke()
@@ -50,7 +63,26 @@ class NexoNotificationListener : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         connected = false
+        instance = null
+        bridge?.reset()
         BridgeState.log("Acceso a notificaciones perdido")
         onChange?.invoke()
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?, rankingMap: RankingMap?) {
+        if (sbn == null) return
+        try {
+            bridge?.onPosted(sbn, rankingMap)
+        } catch (_: Exception) {
+            // una notificación rara no debe tirar el servicio
+        }
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?, rankingMap: RankingMap?, reason: Int) {
+        if (sbn == null) return
+        try {
+            bridge?.onRemoved(sbn, reason)
+        } catch (_: Exception) {
+        }
     }
 }

@@ -26,6 +26,7 @@ object UserAction {
     const val ID_LISTENER = 1004
     const val ID_RECOVERY = 1005
     const val ID_STORAGE = 1006
+    const val ID_FORWARD = 1007
 
     /**
      * Crea los canales de notificación. Se llama al abrir la pantalla: en Android 13+ eso es
@@ -83,6 +84,9 @@ object UserAction {
         if (Build.VERSION.SDK_INT >= 29) Intent(Settings.Panel.ACTION_VOLUME)
         else Intent(Settings.ACTION_SOUND_SETTINGS)
 
-    /** Donde el usuario concede a Nexo el «acceso a notificaciones» (necesario para controlar la música). */
+    /** La pantalla de Nexo (`opens` = `nexo_app`): donde se activa «Reenviar notificaciones a Linux». */
+    fun nexoApp(ctx: Context): Intent = Intent(ctx, MainActivity::class.java)
+
+    /** Donde el usuario concede a Nexo el «acceso a notificaciones» (necesario para controlar la música y reenviar notificaciones). */
     fun notificationListenerSettings(): Intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
 }

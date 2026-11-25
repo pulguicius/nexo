@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """App Nexo FALSA, para probar el cliente (y nexo-dbus) sin un móvil, y en CI.
 
-Imita el protocolo de docs/PROTOCOLO.md (versión 1, revisión 4): JSON por línea sobre TCP en 127.0.0.1,
+Imita el protocolo de docs/PROTOCOLO.md (versión 1, revisión 5): JSON por línea sobre TCP en 127.0.0.1,
 con token, eventos en vivo y el comando `bootstrap` que entrega el instalador (igual que Bootstrap.kt).
 Es la «especificación ejecutable» del protocolo: si la app real y este archivo difieren, uno de los dos tiene un fallo.
 
@@ -17,7 +17,7 @@ Uso:  fake_app.py --token HEX --termux-dir ../termux --portfile /tmp/p [--record
       fake_app.py --drop-after-hello N  las N primeras conexiones contestan el hello y se cortan al recibir el primer comando
       fake_app.py --leak-token        mete el token en el registro (para probar que el cliente lo oculta)
       fake_app.py --storage-dir DIR   carpeta donde viven los discos USB simulados (uno por subcarpeta «UUID»); por omisión, una temporal
-      fake_app.py --minor2|--minor3|--minor4|--minor5   fuerza una revisión del protocolo (por omisión, la de la app real: la 1.4)
+      fake_app.py --minor2|--minor3|--minor4|--minor5   fuerza una revisión del protocolo (por omisión, la de la app real: la 1.5)
 """
 import argparse
 import base64
@@ -40,7 +40,9 @@ LOGLINES = collections.deque(maxlen=200)
 CONN_COUNT = [0]
 
 STATE = {"wifi_on": True, "ssid": "MiCasa", "bt_on": True}
-NET = {"override": None, "vpn": False, "captive": False}  # --ctl «net cellular|ethernet|none|auto», «net vpn on|off», «net captive on|off»
+NET = {"override": None, "vpn": False, "captive": False, "validated": True, "internet": True}
+# --ctl «net wifi|cellular|ethernet|none|auto», «net vpn on|off», «net captive on|off» (portal cautivo), «net validated on|off»
+# (off = Android no logra comprobar que hay internet) y «net internet on|off» (off = la red ni siquiera lo declara)
 NOTIF = {"access": True, "forwarding": True}              # permiso de acceso a notificaciones y el interruptor de la app
 NOTIFS = []                                               # las notificaciones activas del «móvil»
 AUDIO = {"level": 9, "min": 0, "max": 15, "muted": False, "ringer": "normal"}
@@ -78,11 +80,11 @@ TINY_JPEG = ("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP////////////////////////////////
 
 V14_COMMANDS = {"storage.status", "storage.access", "storage.revoke", "storage.list", "storage.stat", "storage.open", "storage.read",
                 "storage.write", "storage.sync", "storage.close", "storage.mkdir", "storage.delete", "storage.rename", "storage.eject"}   # protocolo 1.4 (almacenamiento USB: 0.4.2)
-V15_COMMANDS = {"net.status", "notif.status", "notif.list", "notif.dismiss"}     # protocolo 1.5 (red del móvil y notificaciones: la app real los traerá en la 0.4.3)
+V15_COMMANDS = {"net.status", "notif.status", "notif.list", "notif.dismiss"}     # protocolo 1.5 (red del móvil y notificaciones: 0.4.3)
 V15_OPENS = {"nexo_app"}                                                         # paneles (`opens`) que solo existen desde el 1.5
 
 
-APP_MINOR = 4          # revisión del protocolo que habla la app REAL (Protocol.MINOR en Kotlin): 1.3 = USB serie (0.4.1), 1.4 = almacenamiento (0.4.2); súbela a 5 cuando llegue net/notif a la app
+APP_MINOR = 5          # revisión del protocolo que habla la app REAL (Protocol.MINOR en Kotlin): 1.3 = USB serie (0.4.1), 1.4 = almacenamiento (0.4.2), 1.5 = red y notificaciones (0.4.3)
 
 
 def level():
@@ -195,7 +197,8 @@ def net_status():
     if t == "none":
         return {"available": True, "type": "none", "internet": False, "validated": False, "metered": False, "vpn": False, "captive": False}
     cap = NET["captive"]          # portal cautivo: hay red con internet «declarado», pero Android no ha podido validarla
-    return {"available": True, "type": t, "internet": True, "validated": not cap, "metered": t == "cellular", "vpn": NET["vpn"], "captive": cap}
+    return {"available": True, "type": t, "internet": NET["internet"], "validated": NET["validated"] and NET["internet"] and not cap,
+            "metered": t == "cellular", "vpn": NET["vpn"], "captive": cap}
 
 
 def notif_view(n):
@@ -386,10 +389,16 @@ def dispatch(cmd, req, owner=None):
         if not NOTIF["forwarding"]:
             raise needs_user("Activa «Reenviar notificaciones a Linux» en la app Nexo", "nexo_app")
         if cmd == "notif.list":
-            return {"notifications": [notif_view(n) for n in NOTIFS]}
-        gone = [n for n in NOTIFS if n["key"] == req.get("key")]
+            return {"notifications": [notif_view(n) for n in reversed(NOTIFS)][:40]}      # las más nuevas primero y hasta 40, como la app real
+        if not req.get("key"):
+            raise Err("bad_request", "Falta «key»: la clave de la notificación (mírala con notif.list)")
+        gone = [n for n in NOTIFS if n["key"] == req.get("key") and not n.get("ghost")]     # «ghost»: sale en la lista, pero ya no está (se quitó entretanto)
         if not gone:
             raise Err("not_found", "No hay ninguna notificación con esa clave")
+        if gone[0].get("stubborn"):                                                         # «stubborn»: se anuncia como quitable y Android no la quita
+            raise Err("failed", "Android no quitó la notificación")
+        if not gone[0].get("clearable", True):
+            raise Err("failed", "Android no deja quitar esa notificación (es fija o de un servicio que está en marcha)")
         NOTIFS.remove(gone[0])
         broadcast("notif", {"op": "removed", "key": gone[0]["key"], "reason": "dismissed"})
         return {"dismissed": True}
@@ -1732,7 +1741,7 @@ def ctl_apply(line):
         storage_ctl(w)
         return
     if w[0] == "net" and len(w) >= 2:
-        if w[1] in ("vpn", "captive") and len(w) >= 3:
+        if w[1] in ("vpn", "captive", "validated", "internet") and len(w) >= 3:
             NET[w[1]] = w[2] == "on"
         else:
             NET["override"] = None if w[1] == "auto" else w[1]
@@ -1740,7 +1749,7 @@ def ctl_apply(line):
         return
     if w[0] == "notif" and len(w) >= 2:
         if w[1] == "post" and len(w) >= 5:
-            # notif post CLAVE APP TÍTULO|TEXTO [@category=call] [@importance=4] [@ongoing=1] [@clearable=0]
+            # notif post CLAVE APP TÍTULO|TEXTO [@category=call] [@importance=4] [@ongoing=1] [@clearable=0] [@stubborn=1] [@ghost=1]
             rest = line.split(None, 4)[4]
             extra = {}
             while True:
@@ -1752,17 +1761,19 @@ def ctl_apply(line):
                 else:
                     break
             title, _, text = rest.partition("|")
+            text = text.replace("\\n", "\n")                  # «\n» en la orden = salto de línea en el texto (la orden es de una sola línea)
             n = {"key": w[2], "package": "org.fake." + w[3].lower(), "app": w[3], "title": title, "text": text,
                  "time": int(time.time() * 1000), "category": extra.get("category", "msg"), "importance": int(extra.get("importance", 3)),
-                 "ongoing": extra.get("ongoing", "0") == "1", "clearable": extra.get("clearable", "1") == "1"}
+                 "ongoing": extra.get("ongoing", "0") == "1", "clearable": extra.get("clearable", "1") == "1",
+                 "stubborn": extra.get("stubborn") == "1", "ghost": extra.get("ghost") == "1"}
             NOTIFS[:] = [x for x in NOTIFS if x["key"] != n["key"]] + [n]
             if NOTIF["forwarding"] and NOTIF["access"]:
                 broadcast("notif", dict(notif_view(n), op="posted"))
         elif w[1] == "remove" and len(w) >= 3:
             gone = [x for x in NOTIFS if x["key"] == w[2]]
             NOTIFS[:] = [x for x in NOTIFS if x["key"] != w[2]]
-            if gone and NOTIF["forwarding"] and NOTIF["access"]:
-                broadcast("notif", {"op": "removed", "key": w[2], "reason": "cancelled"})
+            if gone and NOTIF["forwarding"] and NOTIF["access"]:       # notif remove CLAVE [MOTIVO]: cancelled (por omisión) | clicked | dismissed | timeout | other
+                broadcast("notif", {"op": "removed", "key": w[2], "reason": w[3] if len(w) > 3 else "cancelled"})
         elif w[1] in ("forwarding", "access") and len(w) >= 3:
             NOTIF[w[1]] = w[2] == "on"
         return
@@ -1813,7 +1824,7 @@ def hello_data():
     if ARGS.old:
         return {"app": "nexo", "version": "0.1.0", "proto": 1, "android_sdk": 35, "target_sdk": 28, "device": "Fake Phone",
                 "wifi": True, "bluetooth": True}
-    return {"app": "nexo", "version": "0.4.2", "proto": 1, "minor": level(), "android_sdk": 35, "target_sdk": 28,
+    return {"app": "nexo", "version": "0.4.3", "proto": 1, "minor": level(), "android_sdk": 35, "target_sdk": 28,
             "device": "Fake Phone", "wifi": True, "bluetooth": True, "listener": ARGS.listener, "uptime_s": uptime(),
             **({"usb": True} if v13() else {}), **({"storage": True} if v14() else {}),
             "commands": sorted((OLD_COMMANDS | NEW_COMMANDS) | (V13_COMMANDS if v13() else set()) | (V14_COMMANDS if v14() else set())

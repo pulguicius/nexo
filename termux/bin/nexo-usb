@@ -44,7 +44,7 @@ import termios
 import threading
 import time
 
-NEXO_USB_VERSION = "0.4.2"
+NEXO_USB_VERSION = "0.4.3"
 CLIENT_NAME = "nexo-usb/" + NEXO_USB_VERSION
 
 EXIT_ERR, EXIT_USAGE, EXIT_TOUCH, EXIT_NODEV, EXIT_GONE = 1, 2, 3, 4, 5
@@ -394,7 +394,7 @@ def unsupported_text(d):
         return "%s (%s): %s." % (dev_title(d), dev_vidpid(d), d["note"])
     kind = d.get("kind")
     why = {
-        "storage": "es una unidad de almacenamiento (pendrive, disco…): de eso se ocupará «nexo usb mounts» en la 0.4.2",
+        "storage": "es una unidad de almacenamiento (pendrive, disco…), no un puerto serie: se explora con «nexo usb mounts»",
         "hid": "es un teclado o ratón: Android ya lo usa, y una distro de proot no ve /dev/input",
         "hub": "es un hub: no hace nada por sí solo; lo que cuelgue de él aparece aparte",
     }.get(kind, "no es un adaptador serie que Nexo conozca todavía (sé hablar CDC-ACM, CP210x, FTDI y CH340)")
@@ -580,7 +580,9 @@ class Link(object):
             try:
                 s.sendall(data)
             except OSError as e:
-                raise BridgeError("no_connection", "No pude escribir a la app Nexo: %s" % e)
+                # Si la app murió a mitad de una copia, escribirle también falla (conexión reiniciada, tubería rota): para quien lo
+                # lee es lo mismo que perderla, y se cuenta igual que cuando lo nota el hilo que lee (así no depende de quién llegó antes).
+                raise BridgeError("no_connection", "Se perdió la conexión con la app Nexo (no pude escribirle: %s)" % (e.strerror or e))
 
     def call_async(self, cmd, **params):
         """Envía la petición y devuelve ya un Pending: así se pueden tener varias en vuelo (la app las contesta una a una, en orden)."""

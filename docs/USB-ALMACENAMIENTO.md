@@ -52,7 +52,7 @@ $ nexo usb eject
 
 - Un móvil con **USB host (OTG)** y un cable OTG o un hub. Un disco duro mecánico suele pedir más corriente de la que da el móvil: usa un hub con alimentación propia.
   En algunos Xiaomi/HyperOS hay un interruptor «OTG» en Ajustes → Ajustes adicionales que se apaga solo si no hay nada conectado.
-- La app Nexo 0.4.2 (protocolo 1.4) y el cliente 0.4.2 en Termux (`nexo version --check` lo comprueba). Para usarlo **dentro de una distro**: `nexo setup-guests --with-usb`
+- La app Nexo 0.4.2 o más nueva (protocolo 1.4 o más) y el cliente de la misma versión en Termux (`nexo version --check` lo comprueba). Para usarlo **dentro de una distro**: `nexo setup-guests --with-usb`
   (copia `nexo-usb` y necesita `python3` en la distro; `nexo usb mounts` funciona hasta sin Python, pero solo ese y `list`).
 - Un disco que **Android monte**. Casi todos los móviles montan FAT32 y exFAT; NTFS y ext4 dependen del móvil. Android no dice qué sistema de archivos tiene un disco ni si es
   USB o tarjeta, así que Nexo tampoco puede decirlo. Si el disco sale en `nexo usb mounts` con un estado distinto de `montado`, la tabla explica qué le pasa

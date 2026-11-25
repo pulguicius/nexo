@@ -5,7 +5,7 @@ import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Reparte cada comando del protocolo (docs/PROTOCOLO.md) al manejador de WiFi, Bluetooth, audio, medios, USB o almacenamiento. */
+/** Reparte cada comando del protocolo (docs/PROTOCOLO.md) al manejador de WiFi, Bluetooth, audio, medios, USB, almacenamiento, red o notificaciones. */
 class Commands(context: Context) {
     private val ctx: Context = context.applicationContext
     private val wifi = WifiHandler(ctx)
@@ -14,6 +14,8 @@ class Commands(context: Context) {
     val media = MediaHandler(ctx)
     val usb = UsbHandler(ctx)
     val storage = StorageHandler(ctx)
+    val net = NetHandler(ctx)
+    val notif = NotifBridge(ctx)
 
     /** Lo que se le devuelve a un cliente al autenticarse. */
     fun hello(): JSONObject {
@@ -35,7 +37,7 @@ class Commands(context: Context) {
         return o
     }
 
-    /** Estado actual de un tema de eventos ("wifi", "bt", "audio", "media", "usb" o "storage"). */
+    /** Estado actual de un tema de eventos ("wifi", "bt", "audio", "media", "usb", "storage", "net" o "notif"). */
     fun statusFor(topic: String): JSONObject = when (topic) {
         "wifi" -> wifi.status()
         "bt" -> bt.status()
@@ -43,6 +45,8 @@ class Commands(context: Context) {
         "media" -> media.status()
         "usb" -> usb.status()
         "storage" -> storage.status()
+        "net" -> net.status()
+        "notif" -> notif.status()
         else -> throw CmdException("bad_request", "Tema desconocido: $topic")
     }
 
@@ -94,6 +98,10 @@ class Commands(context: Context) {
         "storage.delete" -> storage.delete(req)
         "storage.rename" -> storage.rename(req)
         "storage.eject" -> storage.eject(req)
+        "net.status" -> net.status()
+        "notif.status" -> notif.status()
+        "notif.list" -> notif.list()
+        "notif.dismiss" -> notif.dismiss(req)
         "logs" -> logs(req)
         else -> throw CmdException("unknown_command", "Comando desconocido: $cmd")
     }
@@ -133,9 +141,16 @@ class Commands(context: Context) {
             "storage.status", "storage.access", "storage.revoke", "storage.list", "storage.stat", "storage.open",
             "storage.read", "storage.write", "storage.sync", "storage.close", "storage.mkdir", "storage.delete",
             "storage.rename", "storage.eject",
+            "net.status", "notif.status", "notif.list", "notif.dismiss",
         ).sorted()
 
-        /** Temas a los que se puede suscribir un cliente. */
+        /** Temas a los que se suscribe quien no indica ninguno (y a los que puede suscribirse uno que sí los indica). */
         val TOPICS: List<String> = listOf("audio", "bt", "media", "storage", "usb", "wifi")
+
+        /** Temas que hay que pedir expresamente en `subscribe`: `notif` lleva el contenido de tus notificaciones, y `net` es de la revisión 5. */
+        val OPTIONAL_TOPICS: List<String> = listOf("net", "notif")
+
+        /** Temas que no mandan un estado inicial al suscribirse: solo avisan de lo que pasa. */
+        val NO_INITIAL_STATE: Set<String> = setOf("notif")
     }
 }

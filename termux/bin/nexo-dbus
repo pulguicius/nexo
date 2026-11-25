@@ -24,6 +24,7 @@ import collections
 import hashlib
 import json
 import os
+import queue
 import re
 import signal
 import socket
@@ -35,7 +36,7 @@ import time
 import traceback
 from urllib.parse import quote, unquote_to_bytes
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 CLIENT_NAME = "nexo-dbus/" + VERSION
 
 MPRIS_NAME = "org.mpris.MediaPlayer2.nexo"
@@ -55,6 +56,9 @@ ERR_ACCESS = "org.freedesktop.DBus.Error.AccessDenied"
 ERR_NEEDS_USER = "org.nexo.Error.NeedsUserAction"
 ERR_FAILED = "org.freedesktop.DBus.Error.Failed"
 ERR_NOREPLY = "org.freedesktop.DBus.Error.NoReply"
+ERR_SERVICEUNKNOWN = "org.freedesktop.DBus.Error.ServiceUnknown"
+ERR_NONAMEOWNER = "org.freedesktop.DBus.Error.NameHasNoOwner"
+ERR_SPAWN = "org.freedesktop.DBus.Error.Spawn."          # el bus intentó arrancar el servicio y no pudo
 ERR_ARGS = "org.freedesktop.DBus.Error.InvalidArgs"
 ERR_NOOBJ = "org.freedesktop.DBus.Error.UnknownObject"
 ERR_NOMETHOD = "org.freedesktop.DBus.Error.UnknownMethod"
@@ -627,6 +631,7 @@ class Bus(object):
         self.owned = set()
         self.closed = threading.Event()
         self.on_name_lost = None
+        self.on_signal = None       # (Message) -> None: las señales de otros que pidió con add_match (se llama en el hilo lector: sin bloquear)
         self._serial = 0
         self._slock = threading.Lock()
         self._wlock = threading.Lock()
@@ -763,6 +768,10 @@ class Bus(object):
                         threading.Thread(target=cb, args=(name,), daemon=True).start()
                 else:
                     self.owned.add(name)
+            else:
+                cb = self.on_signal
+                if cb is not None:
+                    cb(msg)
         elif msg.type == MSG_CALL:
             self._on_call(msg)
 
@@ -806,6 +815,10 @@ class Bus(object):
 
     def list_activatable(self):
         return list(self.call(BUS_NAME, BUS_PATH, BUS_NAME, "ListActivatableNames")[0])
+
+    def add_match(self, rule):
+        """Pide al bus que le entregue las señales que cumplan la regla (sin esto, las señales de otros programas no llegan)."""
+        self.call(BUS_NAME, BUS_PATH, BUS_NAME, "AddMatch", "s", (rule,))
 
     # ---- objetos exportados
 
@@ -2558,7 +2571,7 @@ class NetworkManager(NameService):
     def __init__(self, bridge, mode="auto", force=False, grace_down=30.0):
         NameService.__init__(self, bridge, mode, force, grace_down)
         self.status = None            # wifi.status
-        self.net = None               # net.status (apps con el protocolo 1.3)
+        self.net = None               # net.status (apps con el protocolo 1.5)
         self.scan = []                # wifi.scan: una red por nombre
         self.scan_mono = 0.0
         self.last_scan_ms = 0
@@ -2688,7 +2701,7 @@ class NetworkManager(NameService):
             return 40, 1, 0
         net = self.net if isinstance(self.net, dict) and self.net.get("type") else None
         if net is None:
-            # la app no cuenta qué red usa el móvil (protocolo < 1.3): solo se sabe si el WiFi está conectado, salvo que se
+            # la app no cuenta qué red usa el móvil (protocolo < 1.5): solo se sabe si el WiFi está conectado, salvo que se
             # pida dar siempre por bueno el internet (NEXO_DBUS_NM_ASSUME_ONLINE=1: sales por datos móviles, por ejemplo)
             return (70, 4, 0) if self._connected() or self.assume_online else (20, 1, 0)
         if net.get("type") == "none":
@@ -3284,13 +3297,325 @@ class NetworkManager(NameService):
         return self._active_path()
 
 
+
+# ----------------------------------------------------------------------------------------------------- notificaciones
+
+NOTIFY_NAME = "org.freedesktop.Notifications"
+NOTIFY_PATH = "/org/freedesktop/Notifications"
+NOTIFY_ICON = "phone"
+# categorías de Android → categorías de las notificaciones de escritorio (https://specifications.freedesktop.org/notification-spec/);
+# las demás se mandan sin categoría
+NOTIFY_CATEGORY = {"msg": "im.received", "email": "email.arrived", "progress": "transfer"}
+NOTIFY_MAX_IDS = 300
+NOTIFY_CTRL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+NOTIFY_BREAKS = re.compile("[ ]*[\r\n]+[ ]*")
+NOTIFY_BLANKS = re.compile("\n{3,}")
+
+
+def notify_text(s, limit, multiline=False):
+    """El texto de una notificación de Android listo para el escritorio: sin caracteres de control, en una línea (o en varias,
+    sin más de una línea en blanco seguida) y recortado a `limit` letras (con «…» si hubo que cortar)."""
+    s = NOTIFY_CTRL.sub("", clean_text(s)).replace("\t", " ")
+    if multiline:
+        s = NOTIFY_BLANKS.sub("\n\n", s.replace("\r\n", "\n").replace("\r", "\n"))
+    else:
+        s = NOTIFY_BREAKS.sub(" ", s)
+    s = s.strip()
+    if limit <= 0:
+        return ""
+    return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
+
+
+def markup_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class Notifier(object):
+    """Las notificaciones de Android en el escritorio de Linux, por org.freedesktop.Notifications (dunst, mako, swaync, GNOME, KDE…).
+
+    No ocupa ningún nombre: es un CLIENTE del demonio de notificaciones que haya en el bus de sesión.
+      · «posted» (la app, protocolo 1.5) → Notify. Si Android actualiza una notificación (una conversación que recibe otro mensaje,
+        una barra de progreso) se reemplaza la misma (replaces_id): no salen dos.
+      · «removed» (la tocaste en el móvil, la descartaste, la app la retiró) → CloseNotification: desaparece también aquí.
+      · Si la cierras AQUÍ con el ratón (NotificationClosed, motivo «descartada»), se quita también del móvil (notif.dismiss).
+        NEXO_DBUS_NOTIFY_DISMISS=0 lo desactiva.
+      · Las notificaciones fijas (reproductor, VPN, servicios en marcha) y las de importancia mínima no se enseñan;
+        NEXO_DBUS_NOTIFY_ALL=1 las enseña también.
+
+    Privacidad: no sale nada del móvil hasta que activas «Reenviar notificaciones a Linux» en la app Nexo (y le das acceso a las
+    notificaciones en Android); nexo-dbus no guarda ninguna. El texto llega limpio: sin caracteres de control, recortado y, si el
+    demonio entiende marcado, escapado: una notificación del móvil no puede meter etiquetas, enlaces ni imágenes en tu escritorio."""
+
+    NAME = ""
+    LABEL = "Notificaciones"
+    TOPICS = ("notif",)
+
+    def __init__(self, bridge, grace_down=30.0):
+        self.bridge = bridge
+        self.grace_down = grace_down
+        self.bus = None
+        self.lock = threading.RLock()
+        self.ids = collections.OrderedDict()     # clave de Android → número que le dio el demonio
+        self.keys = {}                           # número del demonio → clave de Android
+        self.show_all = os.environ.get("NEXO_DBUS_NOTIFY_ALL", "") == "1"
+        self.sync_dismiss = os.environ.get("NEXO_DBUS_NOTIFY_DISMISS", "") != "0"
+        self.markup = None                       # ¿el demonio entiende marcado en el cuerpo? (None: aún no se sabe)
+        self.server = None                       # (nombre, fabricante, versión) del demonio
+        self.nodaemon = False
+        self.app = None                          # notif.status de la app (False: la app es antigua y no sabe de notificaciones)
+        self._said = set()                       # avisos que ya se dieron en el registro (cada uno, una vez)
+        self._nodaemon_said = False
+        self._who = None                         # el demonio que se anotó en el registro, para anotar solo cuando cambia
+        self._t_status = None                    # cuándo se le preguntó por última vez a la app (None: aún no)
+        self._was_ready = False
+        self._q = queue.Queue()
+        self._halt = threading.Event()
+        threading.Thread(target=self._worker, name="notif-trabajo", daemon=True).start()
+
+    # ---- eventos de la app → trabajos (se hacen en otro hilo: hablar con el demonio puede tardar)
+
+    def on_event(self, topic, data):
+        if topic != "notif" or not isinstance(data, dict):
+            return
+        key = data.get("key")
+        if not isinstance(key, str) or not key:
+            return
+        if data.get("op") == "posted":
+            self._q.put(("post", dict(data)))
+        elif data.get("op") == "removed":
+            self._q.put(("remove", key))
+
+    def link_ok(self):
+        b = self.bridge
+        return b.ready.is_set() or (b.last_ready > 0 and (time.monotonic() - b.last_ready) < self.grace_down)
+
+    # ---- ciclo de vida
+
+    def attach(self, bus):
+        self.bus = bus
+        self.markup = None
+        self.server = None
+        self.nodaemon = False
+        with self.lock:
+            self.ids.clear()       # si el bus se reconectó, el demonio puede ser otro: sus números ya no valen
+            self.keys.clear()
+        bus.on_signal = self._on_signal
+        try:
+            bus.add_match("type='signal',interface='%s'" % NOTIFY_NAME)
+            # si el demonio se reinicia (o lo cambias por otro), los números que dio ya no valen
+            bus.add_match("type='signal',sender='%s',interface='%s',member='NameOwnerChanged',arg0='%s'" % (BUS_NAME, BUS_NAME, NOTIFY_NAME))
+        except DBusError as e:
+            dbg("Notificaciones: no pude pedir las señales del demonio: %s" % e)
+
+    def detach(self):
+        self.bus = None
+
+    def stop(self):
+        self._halt.set()
+        self._q.put(None)
+
+    def tick(self):
+        """Cada medio segundo: de vez en cuando pregunta a la app cómo está el reenvío (para explicarlo en «nexo-dbus status»)."""
+        if self.bus is None:
+            return
+        ready = self.bridge.ready.is_set()
+        if ready and not self._was_ready:
+            self._t_status = None         # se (re)conectó con la app: que vuelva a contar cómo está el reenvío
+        self._was_ready = ready
+        now = time.monotonic()
+        if ready and (self._t_status is None or now - self._t_status >= 20.0):
+            self._t_status = now
+            self._q.put(("status",))
+
+    def describe(self):
+        """(estado, texto) para «nexo-dbus status» y «nexo doctor»."""
+        if self.bus is None:
+            return "nobus", "sin conexión al bus de sesión"
+        if not self.link_ok():
+            return "link", "esperando a la app Nexo (¿responde? mira: nexo doctor)"
+        a = self.app
+        if a is False:
+            return "noapp", "esta versión de la app Nexo no reenvía notificaciones: instala el APK de la 0.4.3 o más nuevo"
+        if not isinstance(a, dict):
+            return "wait", "preguntando a la app por el reenvío…"
+        if not a.get("access"):
+            return "noaccess", "falta el acceso a notificaciones de Android (app Nexo → Permisos → Acceso a notificaciones)"
+        if not a.get("forwarding"):
+            return "noforward", "el reenvío está apagado: actívalo en la app Nexo («Reenviar notificaciones a Linux»)"
+        if self.nodaemon:
+            return "nodaemon", "no hay un demonio de notificaciones en el bus de sesión (instala dunst, mako o swaync; GNOME y KDE ya traen uno)"
+        if self.server and self.server[0]:
+            return "active", "reenviando a %s %s (org.freedesktop.Notifications)" % (self.server[0], self.server[2])
+        return "active", "reenviando a org.freedesktop.Notifications"
+
+    # ---- hilo de trabajo
+
+    def _worker(self):
+        while not self._halt.is_set():
+            try:
+                job = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                return
+            try:
+                getattr(self, "_job_" + job[0])(*job[1:])
+            except Exception as e:          # un fallo con una notificación no debe parar a las demás
+                log("Notificaciones: error inesperado: %r" % (e,))
+                dbg(traceback.format_exc())
+
+    def _call(self, member, sig="", body=()):
+        bus = self.bus
+        if bus is None:
+            raise DBusError(ERR_FAILED, "sin conexión al bus")
+        return bus.call(NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, member, sig, body, timeout=5.0)
+
+    def _probe(self):
+        """Le pregunta al demonio qué entiende y quién es. Lanza DBusError si no hay demonio."""
+        caps = self._call("GetCapabilities")[0]
+        self.markup = "body-markup" in list(caps)
+        try:
+            info = self._call("GetServerInformation")
+            self.server = tuple(clean_text(x) for x in (list(info) + ["", "", ""])[:3])
+        except DBusError:
+            self.server = None
+        self.nodaemon = False
+        self._nodaemon_said = False
+        who = (" ".join(self.server[:1] + self.server[2:3]).strip() if self.server else "") or NOTIFY_NAME
+        if who != self._who:                     # se anota la primera vez y cada vez que cambia de demonio
+            self._who = who
+            log("Notificaciones: demonio de notificaciones: %s" % who)
+
+    def _no_daemon(self, e, forwarding=True):
+        self.markup = None
+        self.server = None
+        self._who = None
+        self.nodaemon = True
+        if forwarding and not self._nodaemon_said:    # solo se cuenta si el reenvío está en marcha: quien no lo usa no necesita saberlo
+            self._nodaemon_said = True
+            log("Notificaciones: no hay un demonio de notificaciones en el bus de sesión (%s): instala dunst, mako o swaync "
+                "(GNOME y KDE ya traen uno); mientras tanto no se muestran" % (e.message or e.name))
+
+    @staticmethod
+    def _int(v, default):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _job_post(self, d):
+        if self.bus is None:
+            return
+        ongoing = bool(d.get("ongoing"))
+        importance = self._int(d.get("importance"), 3)
+        if not self.show_all and (ongoing or importance <= 1):
+            return
+        if self.markup is None:
+            try:
+                self._probe()
+            except DBusError as e:
+                self._no_daemon(e)         # (si llega un aviso es que el reenvío está en marcha: se cuenta)
+                return
+        app = notify_text(d.get("app") or d.get("package"), 80) or "Android"
+        title = notify_text(d.get("title"), 200)
+        body = notify_text(d.get("text"), 1000, multiline=True)
+        if self.markup:
+            # el demonio interpreta marcado: lo que llega del móvil es TEXTO, no etiquetas
+            body = markup_escape(body)
+            title = title.replace("<", "‹").replace(">", "›")
+            app = app.replace("<", "‹").replace(">", "›")
+        category = d.get("category")
+        urgency = 2 if category in ("alarm", "call") else (0 if importance <= 2 else 1)
+        hints = {"urgency": Variant("y", urgency)}
+        if category in NOTIFY_CATEGORY:
+            hints["category"] = Variant("s", NOTIFY_CATEGORY[category])
+        key = d["key"]
+        with self.lock:
+            replaces = self.ids.get(key, 0)
+        try:
+            nid = self._call("Notify", "susssasa{sv}i",
+                             (app, replaces, NOTIFY_ICON, title or app, body, [], hints, 0 if ongoing else -1))[0]
+        except DBusError as e:
+            if e.name in (ERR_SERVICEUNKNOWN, ERR_NONAMEOWNER, ERR_NOREPLY) or e.name.startswith(ERR_SPAWN):
+                self._no_daemon(e)
+            else:
+                log("Notificaciones: el demonio no aceptó una notificación: %s" % (e.message or e.name))
+            return
+        with self.lock:
+            if replaces and replaces != nid:
+                self.keys.pop(replaces, None)
+            self.ids[key] = nid
+            self.ids.move_to_end(key)
+            self.keys[nid] = key
+            while len(self.ids) > NOTIFY_MAX_IDS:
+                _k, n = self.ids.popitem(last=False)
+                self.keys.pop(n, None)
+
+    def _job_remove(self, key):
+        with self.lock:
+            nid = self.ids.pop(key, None)
+            if nid is not None:
+                self.keys.pop(nid, None)
+        if nid is None or self.bus is None:
+            return
+        try:
+            self._call("CloseNotification", "u", (nid,))
+        except DBusError as e:
+            dbg("Notificaciones: no pude cerrar la %s: %s" % (nid, e))
+
+    def _job_dismiss(self, key):
+        try:
+            self.bridge.call("notif.dismiss", timeout=8.0, key=key)
+        except BridgeError as e:
+            dbg("Notificaciones: el móvil no quitó la notificación (%s): %s" % (e.code, e.message))
+
+    def _job_status(self):
+        try:
+            self.app = self.bridge.call("notif.status", timeout=6.0)
+        except BridgeError as e:
+            if e.code == "unknown_command":
+                self.app = False
+        a = self.app
+        if a is False and "noapp" not in self._said:
+            self._said.add("noapp")
+            log("Notificaciones: %s" % self.describe()[1])
+        if self.bus is not None:
+            forwarding = isinstance(a, dict) and bool(a.get("access")) and bool(a.get("forwarding"))
+            try:
+                self._probe()
+            except DBusError as e:
+                self._no_daemon(e, forwarding)
+
+    # ---- señales del demonio: si cierras una notificación aquí, se quita del móvil
+
+    def _on_signal(self, msg):
+        if msg.interface == BUS_NAME and msg.member == "NameOwnerChanged" and len(msg.body) >= 3 and msg.body[0] == NOTIFY_NAME:
+            with self.lock:                  # otro demonio (o el mismo, reiniciado): empieza de cero
+                self.ids.clear()
+                self.keys.clear()
+            self.markup = None
+            self.server = None
+            self._q.put(("status",))         # y se vuelve a mirar quién hay (y qué entiende) ahora mismo
+            return
+        if msg.interface != NOTIFY_NAME or msg.member != "NotificationClosed" or len(msg.body) < 2:
+            return
+        nid, reason = msg.body[0], msg.body[1]
+        with self.lock:
+            key = self.keys.pop(nid, None)
+            if key is not None and self.ids.get(key) == nid:
+                del self.ids[key]
+        # motivos de la especificación: 1 caducó, 2 la cerró el usuario, 3 la cerró CloseNotification (lo hicimos nosotros), 4 otro
+        if key is not None and reason == 2 and self.sync_dismiss:
+            self._q.put(("dismiss", key))
+
+
 # ----------------------------------------------------------------------------------------------------- el servicio
 
 
 # Los servicios del bus del sistema (clase, nombre de la opción en Opts) y el de notificaciones (cliente del bus de sesión).
-# Cada parte que se añade (NetworkManager, UDisks2, notificaciones) se apunta aquí.
+# Cada parte que se añade (UDisks2…) se apunta aquí.
 SYSTEM_SERVICES = [(Bluez, "bluez"), (NetworkManager, "nm")]
-NOTIFIER = None
+NOTIFIER = Notifier
 
 
 class Opts(object):
@@ -3328,14 +3653,28 @@ def _socket_alive(address):
     return False
 
 
+def session_sockets():
+    """Dónde suele estar el socket del bus de sesión (systemd y dbus-broker lo ponen en la carpeta de ejecución del
+    usuario). NEXO_DBUS_SESSION_SOCKET (para distros raras y para las pruebas) lo sustituye: entonces no se mira ningún
+    otro."""
+    only = os.environ.get("NEXO_DBUS_SESSION_SOCKET")
+    if only:
+        return [only]
+    out = []
+    for d in (os.environ.get("XDG_RUNTIME_DIR"), "/run/user/%d" % os.getuid()):
+        if d and os.path.join(d, "bus") not in out:
+            out.append(os.path.join(d, "bus"))
+    return out
+
+
 def find_session_bus():
     """La dirección del bus de sesión: la del entorno, el de systemd/dbus-broker, o el que creó --own-bus."""
     a = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
     if a:
         return a
-    for d in (os.environ.get("XDG_RUNTIME_DIR"), "/run/user/%d" % os.getuid()):
-        if d and os.path.exists(os.path.join(d, "bus")):
-            return "unix:path=" + os.path.join(d, "bus")
+    for p in session_sockets():
+        if os.path.exists(p):
+            return "unix:path=" + p
     try:
         with open(own_bus_file("session")) as f:
             a = f.read().strip()
@@ -3541,6 +3880,8 @@ class Daemon(object):
         out = []
         if self.mpris is None:
             out.append({"name": "MPRIS", "state": "off", "text": "apagado"})
+        if not any(s.label == Notifier.LABEL for s in self.slots):
+            out.append({"name": Notifier.LABEL, "state": "off", "text": "apagado"})
         for s in self.slots:
             if s.bus is None:
                 kind = "de sesión" if s.kind == "session" else "del sistema"
@@ -3616,7 +3957,7 @@ class Daemon(object):
             except (ValueError, OSError):
                 pass
         if not self.slots:
-            log("No hay nada que hacer: todos los servicios están apagados (mira NEXO_DBUS_MPRIS, _BLUEZ y _NM, o las opciones --no-…).")
+            log("No hay nada que hacer: todos los servicios están apagados (mira NEXO_DBUS_MPRIS, _BLUEZ, _NM y _NOTIFY, o las opciones --no-…).")
             raise SystemExit(EXIT_USAGE)
         if not [s for s in self.slots if self._connect(s)]:
             errs = [s.error for s in self.slots if s.error]
@@ -3689,11 +4030,15 @@ Qué hace (cada servicio tiene su propia conexión y falla por separado):
   MPRIS            org.mpris.MediaPlayer2.nexo en el bus de SESIÓN mientras Android reproduce algo   → playerctl, Waybar…
   BlueZ            org.bluez en el bus del SISTEMA: adaptador hci0 y dispositivos emparejados       → bluetoothctl, blueman…
   NetworkManager   org.freedesktop.NetworkManager en el bus del SISTEMA: wlan0 y las redes del móvil → nmcli, nm-applet…
-  Notificaciones   las notificaciones de Android salen por org.freedesktop.Notifications (dunst, mako…)
+  Notificaciones   las notificaciones de Android salen por org.freedesktop.Notifications (dunst, mako, swaync, GNOME, KDE…),
+                   si activas «Reenviar notificaciones a Linux» en la app Nexo; cerrarlas aquí las quita del móvil
   Si ya hay un BlueZ o un NetworkManager de verdad, no los pisa (modo pasivo).
 
 Variables: NEXO_DBUS_BUS, NEXO_DBUS_SYSTEM_BUS, NEXO_DBUS_ALWAYS=1, NEXO_PORT, NEXO_TOKEN, NEXO_CONFIG,
+           NEXO_DBUS_SESSION_SOCKET=ruta (el socket del bus de sesión, en vez de $XDG_RUNTIME_DIR/bus y /run/user/UID/bus),
            NEXO_DBUS_FORCE=1 (reclama el nombre aunque ya lo tenga otro),
+           NEXO_DBUS_NOTIFY_ALL=1 (enseña también las notificaciones fijas —reproductor, VPN…— y las de importancia mínima),
+           NEXO_DBUS_NOTIFY_DISMISS=0 (cerrar una notificación en el escritorio ya no la quita del móvil),
            NEXO_DBUS_MPRIS / _BLUEZ / _NM / _NOTIFY = 0 (apagado) · 1 (siempre) · auto (por omisión),
            NEXO_DBUS_GRACE=segundos (espera antes de retirar el reproductor cuando deja de sonar, 3 por omisión),
            NEXO_DBUS_GRACE_DOWN=segundos (ídem si la app Nexo no responde, 30),

@@ -43,6 +43,7 @@ count() { grep -c -- "$2" "$1" 2>/dev/null; }   # count ARCHIVO PATRÓN → vece
 start_app() {
     local name=$1 i
     shift
+    rm -f -- "$T/$name.port"     # un archivo de puerto de una app anterior con el mismo nombre haría devolver SU puerto
     python3 "$ROOT/tests/fake_app.py" --token "$TOKEN" --portfile "$T/$name.port" "$@" >/dev/null 2>&1 &
     APP_PIDS+=($!)
     echo $! > "$T/$name.pid"     # (start_app suele llamarse dentro de $(…): el array no sale de ahí, el archivo sí)
@@ -55,7 +56,7 @@ for need in python3 jq; do
 done
 
 echo "== Sintaxis"
-for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/bin/nexo-tools" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh" "$ROOT/tests/tools_tests.sh" "$ROOT/tests/usb_tests.sh" "$ROOT/tests/usb_storage_tests.sh" "$ROOT/tests/usb_hardware_check.sh" "$ROOT/tests/usb_storage_hardware_check.sh"; do
+for f in "$ROOT/termux/bin/nexo" "$ROOT/termux/bin/nexo-tools" "$ROOT/termux/install.sh" "$ROOT/tests/run_tests.sh" "$ROOT/tests/dbus_tests.sh" "$ROOT/tests/tools_tests.sh" "$ROOT/tests/usb_tests.sh" "$ROOT/tests/usb_storage_tests.sh" "$ROOT/tests/usb_hardware_check.sh" "$ROOT/tests/usb_storage_hardware_check.sh" "$ROOT/tests/ci_annotate.sh" "$ROOT/tests/dbus_system_tests.sh" "$ROOT/tests/dbus_notif_tests.sh" "$ROOT/tests/net_notif_tests.sh" "$ROOT/tests/playerctl_check.sh"; do
     if bash -n "$f" 2>"$T/err"; then ok "bash -n $(basename "$f")"; else bad "bash -n $(basename "$f")" "$(cat "$T/err")"; fi
 done
 for f in "$ROOT"/tests/*.py "$ROOT/termux/bin/nexo-dbus" "$ROOT/termux/bin/nexo-usb"; do
@@ -101,9 +102,10 @@ export NEXO_PORT=$PORT
 export NEXO_CACHE_TTL=0     # sin caché salvo en las pruebas que la quieren
 
 # Para iterar rápido: NEXO_TESTS_ONLY=dbus bash tests/run_tests.sh  (solo nexo-dbus), =tools (solo nexo-tools), =usb (todo nexo-usb:
-# serie y discos) o =storage (solo los discos USB de nexo-usb)
+# serie y discos), =storage (solo los discos USB de nexo-usb) o =net (solo «nexo net» y «nexo notif», del cliente)
 case "${NEXO_TESTS_ONLY:-}" in
     dbus|tools) . "$ROOT/tests/${NEXO_TESTS_ONLY}_tests.sh"; finish ;;
+    net) "$NEXO" pair "$TOKEN" >/dev/null 2>&1 || bad "pair con el token bueno"; . "$ROOT/tests/net_notif_tests.sh"; finish ;;
     usb) . "$ROOT/tests/usb_tests.sh"; . "$ROOT/tests/usb_storage_tests.sh"; finish ;;
     storage) . "$ROOT/tests/usb_storage_tests.sh"; finish ;;
 esac
@@ -303,6 +305,8 @@ NEXO_PORT=$NS run "$NEXO" media status;  has "sin nada sonando" "nada en reprodu
 NEXO_PORT=$NS run "$NEXO" media play;    rc_is "…media play dice que no hay sesión (1)" 1
 NEXO_PORT=$NS run "$NEXO" media status --starship; eq "…y starship no muestra nada" ""
 NEXO_PORT=$NS run "$NEXO" status;        has "status también funciona sin sesión" "Media: nada en reproducción"
+
+. "$ROOT/tests/net_notif_tests.sh"             # nexo net y nexo notif (protocolo 1.5)
 
 echo "== Formatos para barras y prompts"
 run "$NEXO" wifi status --polybar
@@ -805,8 +809,10 @@ old_nexo 0.3.0 > "$UG/containers/ubuntu/rootfs/usr/local/bin/nexo"; chmod +x "$U
 # PATH aislado (solo el «Termux» de prueba y enlaces a las herramientas): update toca TODAS las copias de nexo que ve en el PATH,
 # y las pruebas no deben llegar jamás a un nexo de verdad que tengas instalado.
 UT=$U/tbin; mkdir -p "$UT"
+# (se buscan primero en los directorios del sistema: si quien lanza las pruebas puso delante en el PATH un «envoltorio» —un rm que
+# pregunta, un script de seguimiento—, el enlace apuntaría a ese envoltorio, que sin su entorno no funciona, y no al programa de verdad)
 for c in bash sh sed grep tail head cmp readlink mktemp dirname basename cat cp mv rm mkdir rmdir chmod stat id tr cut env python3 unzip ls sleep timeout date uname wc sort touch ln awk jq tee; do
-    p=$(type -P "$c" 2>/dev/null) && [ -n "$p" ] && ln -sf "$p" "$UT/$c"
+    p=$(PATH="/usr/local/bin:/usr/bin:/bin:$PATH" type -P "$c" 2>/dev/null) && [ -n "$p" ] && ln -sf "$p" "$UT/$c"
 done
 uenv() { env -i PATH="$UP/bin:$UT" HOME="$U/home" PREFIX="$UP" TMPDIR="$U/tmp" NEXO_GUESTS_BASE="$UG" "$@"; }
 rm -f "$FP/bin/proot-distro"
@@ -952,6 +958,39 @@ mkdir -p "$T/ri2/src/bin"
 cp "$ROOT/termux/install.sh" "$T/ri2/src/install.sh"; cp "$ROOT/termux/bin/nexo" "$T/ri2/src/bin/nexo"
 run env -i PATH="$PATH" HOME="$T/ri/home" NEXO_BIN_DIR="$T/ri2/bin" NEXO_NO_DEPS=1 bash "$T/ri2/src/install.sh"
 [ -x "$T/ri2/bin/nexo" ] && [ ! -e "$T/ri2/bin/nexo-dbus" ] && [ ! -e "$T/ri2/bin/nexo-tools" ] && [ ! -e "$T/ri2/bin/nexo-usb" ] && ok "sin nexo-dbus, nexo-tools ni nexo-usb en el origen, instala solo el cliente (y no se queja)" || bad "instalación sin nexo-dbus"
+
+echo "== tests/ci_annotate.sh (las anotaciones de GitHub Actions con la causa de cada fallo)"
+CA=$ROOT/tests/ci_annotate.sh
+# (sin GITHUB_STEP_SUMMARY, para no escribir falsos fallos en el resumen del trabajo cuando estas pruebas corren en GitHub)
+ca() { env GITHUB_STEP_SUMMARY= bash "$CA" "$@"; }
+run ca "t" -- bash -c 'echo hola'
+rc_is "una orden que sale bien: código 0" 0
+has "…y se ve su salida" "hola"
+hasnt "…sin anotar nada" "::"
+run ca "t" -- bash -c 'echo "  ok    algo"; echo "  FALLA cosa 100% mala"; echo "        se esperaba [a] y salió [b]"; echo "  FALLA otra sin detalle"; exit 1'
+rc_is "una orden que falla: sale con SU código" 1
+has "…anota cada FALLA con su detalle (con % y saltos de línea codificados)" "::error title=t::Terminó con código 1. • cosa 100%25 mala%0A    se esperaba [a] y salió [b]%0A• otra sin detalle%0A"
+has "…y la salida normal sigue ahí" "  FALLA cosa 100% mala"
+run ca "t" -- bash -c 'echo l1; echo "Traceback boom"; exit 3'
+rc_is "sin líneas FALLA: sale con el código de la orden (3)" 3
+has "…y anota las últimas líneas" "::error title=t::Terminó con código 3. l1%0ATraceback boom"
+run ca "Título, con: cosas" -- bash -c 'exit 1'
+has "el título codifica la coma y los dos puntos" "title=Título%2C con%3A cosas::"
+run ca "t" -- bash -c 'for i in $(seq 15); do echo "  FALLA número $i"; done; exit 1'
+has "con más de 12 fallos anota 12…" "• número 12%0A"
+hasnt "…sin el 13" "número 13%0A"
+has "…y dice cuántos faltan" "(y 3 fallos más: mira el registro)"
+run ca "ui" -- bash -c 'echo "falta Playwright"; exit 77'
+rc_is "el código 77 («no se pudo correr») no es un fallo por omisión (0)" 0
+has "…pero avisa" "::warning title=ui::No se pudo correr (código 77). falta Playwright"
+run ca --77-falla "ui" -- bash -c 'echo "falta Playwright"; exit 77'
+rc_is "con --77-falla, el 77 sí falla (1)" 1
+has "…y lo anota como error" "::error title=ui::No se pudo correr (código 77), y en CI debería poder. falta Playwright"
+rm -f "$T/ann.md"
+run env GITHUB_STEP_SUMMARY="$T/ann.md" bash "$CA" "t" -- bash -c 'echo "  FALLA cosa"; exit 1'
+grep -q '^### ✗ t (código 1)$' "$T/ann.md" 2>/dev/null && grep -q '^• cosa$' "$T/ann.md" && ok "con GITHUB_STEP_SUMMARY, también lo deja en el resumen del trabajo" || bad "resumen del trabajo" "$(cat "$T/ann.md" 2>/dev/null)"
+run ca "solo el título"
+rc_is "sin «--» ni orden: uso (2)" 2
 
 # nexo-dbus (necesita dbus-daemon, busctl y gdbus; si faltan, esas pruebas se omiten con un aviso)
 . "$ROOT/tests/dbus_tests.sh"

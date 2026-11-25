@@ -1,4 +1,4 @@
-# Protocolo Nexo (versión 1, revisión 4)
+# Protocolo Nexo (versión 1, revisión 5)
 
 Lo que hablan la app Android y los clientes (`nexo`, `nexo-dbus`, o el tuyo). Es deliberadamente simple para que se
 pueda usar desde bash, Python, Node, QML o lo que tengas dentro de una distro.
@@ -12,7 +12,7 @@ conozca, y una app nueva sigue atendiendo a los clientes viejos. La *revisión* 
 | 2 | 0.2.x | audio, media, `wifi.saved/forget/reconnect`, `bt.forget/rename/info`, `logs`, `commands` en `hello`, `gateway/prefix/dns` en `wifi.status` |
 | 3 | 0.4.1 | USB serie (Arduino, ESP32, adaptadores USB↔serie): `usb.status`, `usb.permission`, `usb.open`, `usb.setup`, `usb.control`, `usb.close`, `usb.attach`, el tema de eventos `usb` y el campo `usb` en `hello`. Una conexión puede pasar a ser de **bytes** (`usb.attach`) |
 | 4 | 0.4.2 | Discos USB (pendrives, discos duros y SSD externos): `storage.status`, `storage.access`, `storage.revoke`, `storage.list`, `storage.stat`, `storage.open`, `storage.read`, `storage.write`, `storage.sync`, `storage.close`, `storage.mkdir`, `storage.delete`, `storage.rename`, `storage.eject`, el tema de eventos `storage` y el campo `storage` en `hello`. Los archivos viajan en trozos de base64 por la misma conexión JSON (no hay conexiones de bytes nuevas) |
-| 5 | 0.4.3 (previsto) | `net.status` (qué red usa el móvil) y el tema de eventos `net`; notificaciones: `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` |
+| 5 | 0.4.3 | La red del móvil y sus notificaciones: `net.status` (por dónde sale a internet y si hay internet de verdad) y el tema de eventos `net`; `notif.status`, `notif.list`, `notif.dismiss` y el tema `notif` (privado: la app no reenvía nada hasta que el usuario lo activa, y el tema hay que pedirlo a propósito). Valor nuevo de `opens`: `nexo_app` |
 
 ## Transporte
 
@@ -30,7 +30,7 @@ Si el token es incorrecto, la app espera ~0,8 s, responde `unauthorized` y cierr
 {"id":"1","cmd":"hello","token":"<48 caracteres hex>","client":"mi-cliente/1.0"}
 ```
 ```json
-{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.2","proto":1,"minor":4,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"usb":true,"storage":true,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
+{"id":"1","ok":true,"data":{"app":"nexo","version":"0.4.3","proto":1,"minor":5,"android_sdk":36,"target_sdk":28,"device":"Xiaomi 25078RA3EL","wifi":true,"bluetooth":true,"listener":false,"usb":true,"storage":true,"uptime_s":3120,"commands":["wifi.status","wifi.enable","…"]}}
 ```
 
 - `wifi` y `bluetooth` dicen si el móvil tiene esa radio.
@@ -59,13 +59,13 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 | `bad_request` | JSON inválido o faltan/sobran parámetros |
 | `unknown_command` | Ese `cmd` no existe (una app antigua responde esto a los comandos nuevos) |
 | `permission_denied` | Falta un permiso de Android; `permission` dice cuál cuando se sabe (`ACCESS_FINE_LOCATION`, `BLUETOOTH_CONNECT`) |
-| `needs_user_action` | Android no deja hacerlo solo. La app dejó una **notificación** que abre el panel adecuado: la respuesta trae `"action":"notification"` y `"opens"` = `wifi_panel`, `bluetooth_enable`, `bluetooth_settings`, `volume_panel` o `notification_listener_settings` |
+| `needs_user_action` | Android no deja hacerlo solo. La app dejó una **notificación** que abre el panel adecuado: la respuesta trae `"action":"notification"` y `"opens"` = `wifi_panel`, `bluetooth_enable`, `bluetooth_settings`, `volume_panel`, `notification_listener_settings` o `nexo_app` (la propia app Nexo, donde está el interruptor «Reenviar notificaciones a Linux»; revisión 5) |
 | `wifi_disabled` / `bluetooth_disabled` | El comando necesita la radio encendida |
 | `not_paired` | El dispositivo Bluetooth no está emparejado en Android |
-| `not_found` | Lo que pides no existe: red guardada, salida de audio, sesión de medios, carátula, dispositivo o sesión USB; en discos, un disco, un archivo o carpeta, o un archivo abierto (`handle`) que ya no está abierto |
+| `not_found` | Lo que pides no existe: red guardada, salida de audio, sesión de medios, carátula, notificación (`key`), dispositivo o sesión USB; en discos, un disco, un archivo o carpeta, o un archivo abierto (`handle`) que ya no está abierto |
 | `busy` | USB: el dispositivo ya está abierto (por otra sesión, por otra app, o Android no deja reclamar su interfaz) o la sesión ya tiene un flujo de datos conectado |
 | `unsupported` | Este móvil o esta versión de Android no tiene eso |
-| `failed` | Android rechazó la operación |
+| `failed` | Android rechazó la operación (por ejemplo, quitar una notificación fija o de un servicio en marcha) |
 | `timeout` | El comando tardó más de lo razonable (la app no se quedó colgada: contesta y sigue) |
 | `rate_limited` | Solo para `bootstrap` (el instalador): se pidió demasiado seguido (máx. 1 cada 2 s y 10 por minuto en total). Se cierra la conexión; reintenta en unos segundos |
 | `no_access` | Discos USB: Nexo todavía no tiene acceso a ese disco. Se pide con `storage.access` (el usuario lo concede en el selector de carpetas de Android). La respuesta lleva `volume` |
@@ -89,7 +89,7 @@ La respuesta repite el `id`. Se pueden mandar varias peticiones seguidas por la 
 |---|---|---|
 | `hello` | `token`, `client?` | información de la app (arriba) |
 | `ping` | — | `{"pong":true,"t":<ms>}` |
-| `subscribe` | `topics?` = `["wifi","bt","audio","media","usb","storage"]` | `{"topics":[…]}`, y después un evento inicial por tema |
+| `subscribe` | `topics?` = `["wifi","bt","audio","media","usb","storage"]`; además se pueden pedir `"net"` y `"notif"` (revisión 5), que no van por omisión | `{"topics":[…]}` (solo los que la app conoce), y después un evento inicial por tema (el tema `notif` no tiene: solo cuenta lo que pasa) |
 | `unsubscribe` | — | — |
 | `logs` | `n?` (50; máx. 200) | `{"lines":[…],"count":N,"uptime_s":S}`: lo último que anotó la app. Nunca lleva el token ni claves |
 | `bootstrap` | — | **No es JSON**: ver más abajo. No necesita token |
@@ -289,6 +289,35 @@ Necesita que el usuario conceda a Nexo el **acceso a notificaciones** (Ajustes �
 - `media.art` devuelve la carátula reducida (JPEG, hasta 320 px y ~40 KB para caber en una línea); `not_found` si la app no la ofrece.
 - Los comandos de control responden `not_found` si no hay ninguna sesión de medios.
 
+### Red del móvil
+Solo lectura y sin permisos nuevos. Dice por dónde sale el móvil a internet y si de verdad hay internet; no cuenta nombres de redes, direcciones ni nada que identifique la red (el nombre del WiFi está en `wifi.status`).
+
+| Comando | Parámetros | `data` |
+|---|---|---|
+| `net.status` | — | `available, type, internet, validated, metered, vpn, captive` |
+
+- `available` es `false` solo si Android no ofrece información de red (no es un error).
+- `type` es la red **física** por la que sale el móvil: `wifi`, `ethernet`, `cellular`, `bluetooth` (anclaje), `other` (una VPN sin red física conocida, u otra cosa) o `none` (sin red). Con una VPN encima de una red, `type` es la red de debajo y `vpn` es `true`. Un cliente debe tratar un valor que no conozca como `other`.
+- `internet` es lo que **declara** la red (`NET_CAPABILITY_INTERNET`); `validated` es que Android **comprobó** que de verdad sale a internet (`NET_CAPABILITY_VALIDATED`). Un WiFi con router pero sin salida tiene `internet:true` y `validated:false`: para decir «hay internet», usa `validated`.
+- `captive` es `true` si la red tiene un portal cautivo (hay que iniciar sesión en una web); entonces `validated` suele ser `false`.
+- `metered` es `true` si es una red «de pago» (datos móviles, o un WiFi que el usuario marcó así): conviene no bajar cosas grandes. Sin red es `false`.
+
+### Notificaciones (reenvío a Linux)
+**Privado y opcional.** El contenido de las notificaciones es de lo más sensible del móvil, así que no sale de Android a menos que se cumplan tres cosas: el usuario le dio a Nexo el *acceso a notificaciones* de Android, activó **«Reenviar notificaciones a Linux»** en la app (viene apagado) y un cliente con el token lo pide (`notif.list`, o suscribiéndose al tema `notif`). Viajan solo por `127.0.0.1`, la app **no las guarda** y no las pone en `logs`.
+Si falta el acceso, `notif.list` y `notif.dismiss` responden `needs_user_action` con `opens:"notification_listener_settings"`; si falta el interruptor, con `opens:"nexo_app"`. En los dos casos la app deja una notificación que lleva al ajuste, y el tema `notif` no emite nada.
+
+| Comando | Parámetros | `data` |
+|---|---|---|
+| `notif.status` | — | `{"access":bool,"forwarding":bool,"active":N}`: si Android le dio el acceso, si el usuario activó el reenvío y cuántas notificaciones hay ahora (las que se reenviarían). Nunca es un error y nunca lleva su contenido |
+| `notif.list` | — | `{"notifications":[…]}`: las activas, las **más nuevas primero**, hasta 40 (y 48 KiB como mucho) |
+| `notif.dismiss` | `key` | `{"dismissed":true}`: la quita del móvil, como si la arrastraras |
+
+Cada notificación (en `notif.list` y en el evento `posted`) lleva: `key` (el identificador de Android: es lo que se pasa a `notif.dismiss`; si la app la vuelve a publicar puede ser otro), `package`, `app` (el nombre que ve el usuario), `title` (hasta 160 caracteres) y `text` (hasta 500: si es más largo se corta con «…»), `time` (milisegundos desde 1970 en que se publicó), `category` (la de Android: `msg`, `email`, `call`, `alarm`, `progress`… o `null`), `importance` (de 0 a 5, como en Android: 3 normal, 4 alta, 5 urgente), `ongoing` (de un servicio en marcha, o fija: un reproductor, una descarga…) y `clearable` (si el usuario puede quitarla).
+
+- `notif.dismiss` responde `bad_request` si falta `key`, `not_found` si esa notificación ya no existe y `failed` si Android no la deja quitar (las `ongoing` y las que no son `clearable`, casi siempre).
+- No se reenvían las de la propia Nexo, los resúmenes de grupo (repiten lo que dicen las notificaciones del grupo) ni los controles de música (categoría `transport`: de eso se ocupa `media.*`, y MPRIS en Linux).
+- Android 13 o más: si el interruptor del acceso sale en gris, hay que ir a Ajustes › Aplicaciones › Nexo › ⋮ › «Permitir ajustes restringidos» (el mensaje de `needs_user_action` lo recuerda).
+
 ## Eventos
 
 Tras `subscribe`, la app envía líneas **sin `id`**:
@@ -300,13 +329,19 @@ Tras `subscribe`, la app envía líneas **sin `id`**:
 {"event":"media","data":{ …igual que media.status… }}
 {"event":"usb","data":{ …igual que usb.status… }}
 {"event":"storage","data":{ …igual que storage.status… }}
+{"event":"net","data":{ …igual que net.status… }}
+{"event":"notif","data":{"op":"posted", …los campos de una notificación… }}
+{"event":"notif","data":{"op":"removed","key":"…","reason":"clicked"}}
 ```
 
 Se juntan las ráfagas (300 ms) y no se emiten cambios de intensidad de señal ni de posición de la canción
 (quien la necesite la extrapola con `position_ms` y `speed`, o la pide con `media.status`). El tema `usb` avisa cuando se enchufa o desenchufa un dispositivo, cambia un permiso o
 se abre o se cierra una sesión (no por cada byte: los contadores `rx` y `tx` de un evento son los del momento del aviso).
 El tema `storage` avisa cuando se monta, se expulsa o se quita un disco, cambia su estado o Nexo gana o pierde el acceso a él (no por cada archivo).
-Sin `topics`, se suscribe a `wifi`, `bt`, `audio`, `media`, `usb` y `storage`. El cliente `nexo watch` envía un `ping` cada 30 s sin actividad
+El tema `net` avisa cuando cambia la red por la que sale el móvil (otra red, una VPN, un portal cautivo, internet que se va o vuelve); las ráfagas se juntan y no se repite un estado idéntico.
+El tema `notif` (revisión 5) no es un estado sino **lo que pasa**, y no tiene evento inicial (para las que hay ahora está `notif.list`): `op:"posted"` cuando llega o cambia una notificación (con sus campos) y `op:"removed"` cuando desaparece (con `key` y `reason`: `clicked` si el usuario la tocó, `dismissed` si la descartó, en el móvil o con `notif.dismiss`, `cancelled` si la retiró la propia app, `timeout` si caducó, y `other` en cualquier otro caso).
+La app no avisa de que se quitó una notificación que no avisó de que llegó, no repite una idéntica en menos de 10 s (ni una de un servicio en marcha mientras no cambie) y, si el móvil publica muchas de golpe, reenvía como mucho 40 cada 10 s (`notif.list` siempre tiene la verdad). Un cliente debe ignorar un `reason` que no conozca.
+Sin `topics`, se suscribe a `wifi`, `bt`, `audio`, `media`, `usb` y `storage`: `net` y `notif` hay que pedirlos a propósito. El cliente `nexo watch` envía un `ping` cada 30 s sin actividad
 y reconecta solo (con espera creciente) si se corta.
 
 ## `bootstrap`: instalar el cliente sin internet
@@ -331,7 +366,7 @@ exec 3>&-
 ## Un cliente que se queda conectado: `nexo-dbus`
 
 `nexo-dbus` es un buen ejemplo de cliente persistente (el `nexo watch` del cliente de bash hace algo parecido): abre **una** conexión, envía `hello` con `"client":"nexo-dbus/0.4.0-beta2"`,
-y se suscribe con `{"cmd":"subscribe","topics":["media","audio"]}`. Al suscribirse, la app manda el estado inicial de cada tema como eventos, y desde entonces `nexo-dbus` se mueve con ellos; `media.status` solo lo pide para recalibrar la posición (cada 10 s mientras suena).
+y se suscribe con `{"cmd":"subscribe","topics":["media","audio"]}` (más `bt`, `wifi` y `net` si hacen de BlueZ y NetworkManager, y `notif` si entrega las notificaciones del móvil a tu escritorio). Al suscribirse, la app manda el estado inicial de cada tema como eventos, y desde entonces `nexo-dbus` se mueve con ellos; `media.status` solo lo pide para recalibrar la posición (cada 10 s mientras suena).
 Para el resto usa `media.play|pause|playpause|stop|next|prev`, `media.seek` (`delta_ms` o `position_ms`), `media.art` (por `art_hash`) y `audio.volume` (`percent`).
 Manda un `ping` tras 20 s sin actividad (y da la conexión por muerta si no hay respuesta en 8 s: es lo que pasa cuando Android congela la app), reconecta con espera creciente (1 s hasta 15 s),
 y si recibe `unauthorized` espera 30 s **releyendo el archivo de enlace** por si el token cambió (`nexo rekey`). Ignora los campos y eventos que no conoce. Detecta una app anterior a la 0.2 porque `minor` es menor que 2 o `media.status` no está en `commands`.

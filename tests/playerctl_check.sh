@@ -40,7 +40,8 @@ poll '[ -s "$T/port" ]' 5 || { echo "No arrancó la app falsa"; exit 1; }
 PORT=$(cat "$T/port")
 
 mkdir -p "$T/home" "$T/run" "$T/cache"
-env HOME="$T/home" XDG_RUNTIME_DIR="$T/run" XDG_CACHE_HOME="$T/cache" NEXO_PORT="$PORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_GRACE=1 \
+# (NEXO_DBUS_SYSTEM_BUS=none: aquí solo importa MPRIS en el bus de sesión; si la máquina tiene un bus del sistema, no se toca)
+env HOME="$T/home" XDG_RUNTIME_DIR="$T/run" XDG_CACHE_HOME="$T/cache" NEXO_PORT="$PORT" NEXO_TOKEN="$TOKEN" NEXO_DBUS_GRACE=1 NEXO_DBUS_SYSTEM_BUS=none \
     python3 "$ROOT/termux/bin/nexo-dbus" run -v >"$T/dd.log" 2>&1 &
 DD=$!
 

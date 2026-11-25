@@ -19,6 +19,8 @@ Leyenda: ✅ funciona · 🟡 funciona con un toque tuyo o con condiciones · �
 | Volumen y silencio de la música | ✅ | `audio volume` | [Audio](#audio) |
 | Cambiar la salida de audio del sistema | 🟡 | Notificación que abre el panel de volumen | [Audio](#audio) |
 | Controlar la música (play, pausa, siguiente, saltar) y ver qué suena | 🟡 | `media …`; necesita el «acceso a notificaciones» | [Música](#música-media) |
+| Saber por dónde sale el móvil a internet (datos móviles, VPN, internet de verdad, de pago) | ✅ | `nexo net`: la red **predeterminada**, sin IP ni operador | [Red del móvil](#red-del-móvil-nexo-net) |
+| Las notificaciones del móvil en Linux | 🟡 | `nexo notif` y, con `nexo-dbus`, en el escritorio; **opcional y apagado de fábrica**; no puede quitar las fijas | [Notificaciones](#notificaciones-nexo-notif) |
 | Que Linux vea un adaptador WiFi/Bluetooth «de verdad» | ❌ | Lo emula por D‑Bus: la música (MPRIS) desde la v0.3; BlueZ y NetworkManager después (ver [ROADMAP](ROADMAP.md)) | [Emulación](#emulación-no-hardware) |
 | Mantener la app viva siempre | 🟡 | Servicio en primer plano + ajustes de batería + auto-recuperación | [La app se congela](#la-app-se-congela-código-12) |
 
@@ -76,11 +78,32 @@ El hotspot de siempre (compartir internet) pertenece al sistema. Nexo **no** lo 
 
 ## Música (media)
 
-- Ver qué suena y controlarlo exige el **acceso a notificaciones**. Nexo lo usa **solo** para las sesiones de medios; no lee ni guarda notificaciones (el reenvío de notificaciones al escritorio llegará en la 0.4.3, opcional y aparte).
+- Ver qué suena y controlarlo exige el **acceso a notificaciones**. Nexo lo usa **solo** para las sesiones de medios; no lee ni guarda notificaciones (el reenvío de notificaciones a Linux es, desde la 0.4.3, opcional y aparte: ver [Notificaciones](#notificaciones-nexo-notif)).
 - En **Android 13 o más**, si instalaste el APK a mano, el interruptor del acceso a notificaciones sale en gris hasta que pulsas Ajustes › Aplicaciones › Nexo › ⋮ › **Permitir ajustes restringidos**.
 - Solo aparece la música de apps que publican una *sesión de medios* (casi todas las de música y vídeo; algunas la crean al darle a play). Los controles dependen de lo que la app permita: `can_next`, `can_seek`… lo dicen.
 - La **posición** no se transmite en los eventos (cambiaría cada segundo): se calcula al preguntar. `media seek` funciona si la app lo admite.
 - La **carátula** (`media art`) se reduce a ≤ 320 px y ~40 KB. Si la app solo da una dirección de internet, no se descarga (Nexo no usa la red): solo imágenes incluidas en la sesión o en un `content://` de la propia app.
+
+## Red del móvil (`nexo net`)
+
+- Cuenta la red **predeterminada** de Android (la que usa para salir a internet), no todas las que estén conectadas a la vez: con el WiFi y los datos móviles encendidos dice la que Android esté usando en ese momento (normalmente el WiFi).
+- Es un **resumen**: tipo (WiFi, datos móviles, cable, Bluetooth u otra), si hay VPN, si Android validó que hay internet, si la red es de pago y si hay portal cautivo. **No** da la IP de los datos móviles, el operador, la intensidad ni la velocidad (para el WiFi, `nexo wifi status` sigue dando los detalles).
+- «Internet de verdad» lo decide **Android** con su propia comprobación (Nexo no hace ninguna petición a internet): una red que bloquea esa comprobación puede salir como «sin internet de verdad» aunque con ella se pueda navegar. `nexo net` solo cuenta lo que Android dice.
+- No cambia nada: solo mira. Con una app anterior a la 0.4.3 no existe (`nexo net` pide el APK nuevo).
+- **Sin probar en un móvil** (solo con la app simulada y con pruebas de las reglas en una JVM): cómo cuenta cada transporte tu Android (HyperOS, datos duales, WiFi + datos a la vez, VPN que se enciende y apaga).
+
+## Notificaciones (`nexo notif`)
+
+- Es **opcional y viene apagado**: hace falta el «acceso a notificaciones» de Android (el mismo de la música; en Android 13 o más, quizá antes **Permitir ajustes restringidos**, ver [Música](#música-media)) **y** el interruptor **«Reenviar notificaciones a Linux»** de la app. Sin cualquiera de los dos no sale nada de Android.
+- **Quien tenga tu token puede leerlas.** Activado el reenvío, cualquier programa de Termux o de una distro que lea la configuración de Nexo puede suscribirse y ver tus notificaciones (y quitarlas): lo que decía arriba para WiFi y Bluetooth, pero con datos más privados. Por eso viene apagado y solo viaja por `127.0.0.1`.
+- **Nexo no las guarda** (ni la app ni la caché del cliente). Lo que ya llegó a tu escritorio queda en manos de tu demonio de avisos (dunst, mako, GNOME, KDE…), que puede tener su propio historial.
+- **No se pueden quitar las fijas** ni las de servicios en marcha (reproductores, VPN, una llamada en curso, «Nexo activo»): Android no deja que una app de terceros las cierre. Se ven en `nexo notif list`, pero `nexo notif dismiss` dice que no se pudo; en el escritorio no se enseñan (salvo `NEXO_DBUS_NOTIFY_ALL=1`).
+- **Solo texto**: llegan el nombre de la app, el título, el texto (recortes de 160 y 500 caracteres), la hora, la categoría y la importancia. **No** pasan los iconos, las imágenes, los botones de acción ni las respuestas rápidas: no se puede responder un mensaje ni abrir la app del móvil desde Linux.
+- **Solo en vivo y solo lo de ahora.** Los avisos nuevos llegan mientras haya alguien suscrito (`nexo notif watch`, `nexo-dbus`): lo que llegó antes no se recupera. `nexo notif list` enseña las que Android tiene **ahora** (las 40 más nuevas como mucho); no hay historial.
+- Se **omiten** las de la propia Nexo, los resúmenes de grupo y los controles de reproductor; no se repite un aviso idéntico en menos de 10 s y no salen más de 40 eventos cada 10 s (una app que repite avisos no satura tu terminal ni tu escritorio).
+- Cerrar un aviso en el escritorio con la ✕ lo quita del móvil; si **caduca solo** o lo cierra el propio programa, el móvil no se entera.
+- Si el sistema o el fabricante **suelta** el servicio de notificaciones (pasa en algunos con el ahorro de batería), Nexo le pide a Android que lo enlace otra vez; si no vuelve, apaga y enciende el acceso en los ajustes. `nexo notif status` y `nexo doctor` dicen si está activo.
+- **Sin probar en un móvil ni con un demonio de avisos de verdad** (solo con la app simulada, un demonio simulado y pruebas de las reglas en una JVM): qué entrega Android exactamente en HyperOS 3 / Android 16, qué hace cada demonio (iconos, acciones, urgencia, historial, notificaciones que se reemplazan) y cuáles de las fijas se resisten.
 
 ## Emulación, no hardware
 
@@ -104,7 +127,8 @@ Esa emulación es **fiel solo en lo que Android permite**: estado, listas, event
   La dirección del adaptador es inventada (Android no da la del móvil) y `Discoverable`, `Blocked` y el nombre del adaptador no se pueden cambiar desde aquí.
 - **WiFi.** `nmcli` ve **un** dispositivo (`wlan0`) y las redes que ve el móvil. Conectar, desconectar, escanear y olvidar redes funcionan; **las claves guardadas no se pueden leer** (`GetSecrets` va vacío),
   no se pueden crear ni editar perfiles (`nmcli connection add/modify` → «no soportado») y no hay VPN, Ethernet, hotspot ni IP estática. La MAC de `wlan0` es inventada. Encender o apagar el WiFi y algunas conexiones piden a veces un toque en el móvil.
-  Hasta la 0.4.3, el estado global de la conexión (`State`, `Connectivity`) mira solo el WiFi: con datos móviles puede decir «desconectado» (`NEXO_DBUS_NM_ASSUME_ONLINE=1` lo evita).
+  El estado global (`State`, `Connectivity`, `Metered`) sale, con la app 0.4.3, de la red por la que sale el móvil (datos móviles, VPN, WiFi sin salida o portal cautivo incluidos), pero **la red de datos móviles o la VPN no aparecen como dispositivos ni conexiones** en `nmcli`: solo cambian el estado global.
+  Con una app anterior mira solo el WiFi y con datos móviles puede decir «desconectado» (`NEXO_DBUS_NM_ASSUME_ONLINE=1` lo evita).
 - Un bus del sistema de verdad **exige una política** para que un usuario normal ocupe `org.bluez` o `org.freedesktop.NetworkManager` (`nexo setup-dbus --system-policy`, con root); en proot no hay bus del sistema y se crea uno propio con `--own-bus`.
 - Si ya hay un BlueZ o un NetworkManager de verdad (o systemd los gestiona), `nexo-dbus` **no los pisa** (modo pasivo).
 - Los programas basados en `libnm` (`nmcli`, `nm-applet`, los paneles de GNOME y KDE) comprueban muchas propiedades: la emulación puede resultarles incompleta. **Está probada con `busctl` y `gdbus`, no con ellos.**
@@ -163,7 +187,7 @@ Ver [FAQ](FAQ.md#qué-es-el-código-12) y la sección «Que Android no cierre la
 
 ## Seguridad: lo que no protege
 
-- El token protege frente a **otras apps** del móvil. Quien lo tenga controla WiFi, Bluetooth, audio y música: no lo compartas ni lo pegues en chats.
+- El token protege frente a **otras apps** del móvil. Quien lo tenga controla WiFi, Bluetooth, audio y música (y, si activas el reenvío, **lee y quita tus notificaciones**): no lo compartas ni lo pegues en chats.
 - `proot` comparte la red con Android: el `127.0.0.1` de la distro **es** el de la app. Cualquier proceso dentro de la distro que lea `/etc/nexo/config` puede hablar con la app (con `setup-guests --private`, solo root).
 - `nexo raw` es un freno a los errores, no una barrera: quien tiene el token puede escribir peticiones a mano.
 

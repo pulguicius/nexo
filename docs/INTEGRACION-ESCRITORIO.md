@@ -8,14 +8,14 @@ se queda conectado a la app Nexo y publica en D‑Bus lo que Android sabe, con l
 | 0.3 | `org.mpris.MediaPlayer2.nexo`: la música del móvil como un reproductor más | sesión | `playerctl`, el módulo `mpris` de Waybar, Quickshell, GNOME, KDE, Plasma, los atajos multimedia… |
 | **0.4.0** (beta 1 y 2) | `org.bluez`: el Bluetooth del móvil como un adaptador `hci0` con sus dispositivos emparejados | sistema | `bluetoothctl`, Blueman, applets de Bluetooth |
 | **0.4.0** (beta 1 y 2) | `org.freedesktop.NetworkManager`: el WiFi del móvil como un dispositivo `wlan0` (redes a la vista, redes guardadas, conexión actual) | sistema | `nmcli`, `nm-applet`, applets de red |
-| 0.4.3 (más adelante) | Las notificaciones del móvil en tu escritorio (`org.freedesktop.Notifications`) y la red móvil en el estado de NetworkManager | sesión | dunst, mako, swaync, GNOME, KDE |
+| **0.4.3** | Las notificaciones del móvil en tu escritorio (`org.freedesktop.Notifications`: `nexo-dbus` es cliente del demonio que ya tengas) y, en NetworkManager, la red por la que sale el móvil (datos móviles incluidos) | sesión (y sistema para la red) | dunst, mako, swaync, GNOME, KDE · `nmcli`, applets de red |
 
-Esta guía describe la **0.4.0** (la beta 2 no cambia nada de `nexo-dbus`: trae `nexo tools`, `nexo update` y el arreglo de `setup-guests`). Qué se ha probado y qué no, al final: **BlueZ y NetworkManager están comprobados con `busctl` y `gdbus`, no con `bluetoothctl` ni `nmcli` reales.**
+Esta guía describe la **0.4.3** (la 0.4.1 y la 0.4.2 no cambian nada de `nexo-dbus`: traen USB). Qué se ha probado y qué no, al final: **BlueZ y NetworkManager están comprobados con `busctl` y `gdbus`, no con `bluetoothctl` ni `nmcli` reales, y las notificaciones con un demonio de avisos simulado y `busctl`, no con dunst, mako, GNOME ni KDE.**
 
 ```
  App Nexo (Android) ──TCP 127.0.0.1:8765──▶ nexo-dbus ──D‑Bus, bus de SESIÓN───▶ playerctl · Waybar · Quickshell · GNOME · KDE      (MPRIS)
-   música · WiFi · Bluetooth                (un proceso por distro,
-                                             una conexión por bus)  ──D‑Bus, bus del SISTEMA──▶ nmcli · bluetoothctl · Blueman · nm-applet (NetworkManager, BlueZ)
+   música · WiFi · Bluetooth                (un proceso por distro,                                  ──▶ dunst · mako · swaync · GNOME · KDE   (notificaciones)
+   red · notificaciones                      una conexión por bus)  ──D‑Bus, bus del SISTEMA──▶ nmcli · bluetoothctl · Blueman · nm-applet (NetworkManager, BlueZ)
 ```
 
 - **Un solo archivo de Python 3**, sin librerías (ni `pydbus` ni GObject): lleva su propia implementación del protocolo de D‑Bus.
@@ -23,6 +23,7 @@ Esta guía describe la **0.4.0** (la beta 2 no cambia nada de `nexo-dbus`: trae 
 - El reproductor MPRIS **solo aparece mientras haya música en Android** (una sesión de medios activa). Si no hay nada que controlar, no hay reproductor:
   así `playerctl` y los widgets no se llenan de un «Nexo» muerto. (`NEXO_DBUS_ALWAYS=1` lo deja siempre.)
 - **BlueZ** y **NetworkManager** aparecen cuando el móvil tiene esa radio y la app responde, y se retiran si la app deja de responder (30 s de margen).
+- Las **notificaciones del móvil** son opcionales y vienen apagadas: no sale nada de Android hasta que activas «Reenviar notificaciones a Linux» en la app (ver «Notificaciones del móvil»).
 - **Nunca pisa un BlueZ o un NetworkManager de verdad**: si ya hay uno en el bus (o systemd lo gestiona), se queda pasivo y lo dice (ver «Modo pasivo»).
 - Todo es local: `nexo-dbus` solo habla con `127.0.0.1` y con los sockets de tus buses de D‑Bus.
 
@@ -81,7 +82,7 @@ D‑Bus tiene dos buses. El de **sesión** es uno por usuario y escritorio (ahí
 ### Bus de sesión (MPRIS)
 
 `nexo-dbus` tiene que conectarse al **mismo bus de sesión** que tu barra o tu escritorio; si no, ellos no ven el reproductor. Lo busca, en este orden, en
-`--bus DIRECCIÓN` / `NEXO_DBUS_BUS`, `DBUS_SESSION_BUS_ADDRESS`, `$XDG_RUNTIME_DIR/bus`, `/run/user/UID/bus`, y el bus propio que él mismo creó (ver abajo).
+`--bus DIRECCIÓN` / `NEXO_DBUS_BUS`, `DBUS_SESSION_BUS_ADDRESS`, `$XDG_RUNTIME_DIR/bus`, `/run/user/UID/bus` (con `NEXO_DBUS_SESSION_SOCKET=RUTA` se usa solo esa), y el bus propio que él mismo creó (ver abajo).
 
 | Tu caso | Qué hacer |
 |---|---|
@@ -192,9 +193,45 @@ nmcli radio wifi off               # apaga el WiFi del móvil (o «on»)
 | `Settings.Connection.GetSettings` | ✅ SSID, tipo de seguridad, `autoconnect`, UUID estable derivado del nombre |
 | `GetSecrets` y las claves guardadas | ❌ Android **no deja leer** las claves guardadas: siempre vacío |
 | `AddConnection`, `Update`, `Save`, editar una conexión, `WwanEnabled = true`, `Sleep`, VPN, Ethernet, hotspot, IP estática | ❌ «no soportado» con la explicación (`Settings.Error.ReadOnlyConnection` o `…NotSupported`) |
-| `Metered`, `PrimaryConnection`, `State` / `Connectivity` globales | ⚠️ En la beta 1 se deducen **solo del WiFi** (conectado → `connected`/internet; si no → `disconnected`): la app 0.4.0 aún no cuenta si el móvil sale por datos móviles. Con **`NEXO_DBUS_NM_ASSUME_ONLINE=1`** NetworkManager dice siempre «conectado» mientras la app no cuente la red (así Firefox y otras apps no creen que no hay internet si usas datos móviles). La 0.4.3 traerá `net.status` y dejará de hacer falta |
+| `State`, `Connectivity` y `Metered` globales | ✅ **con la app 0.4.3** salen de `net.status`, o sea, de la red por la que **sale de verdad** el móvil (también datos móviles o un cable): `connected` + `full` cuando Android comprobó que hay internet; `connected (site only)` + `limited` si hay red pero Android no logra comprobar internet (también un portal cautivo); `connected (local only)` + `none` si la red ni declara salida a internet; `disconnected` sin red. `Metered` = `yes` si es de pago (datos móviles). Con una **app anterior a la 0.4.3** se deducen solo del WiFi como antes (conectado → `connected`; si no, `disconnected`), y con **`NEXO_DBUS_NM_ASSUME_ONLINE=1`** NetworkManager dice «conectado» aunque el WiFi no lo esté (así Firefox no cree que no hay internet si usas datos móviles): con la 0.4.3 ya no hace falta |
+| `PrimaryConnection` | ⚠️ Es la conexión WiFi actual; si el móvil sale por datos móviles o por un cable no hay una conexión de ese tipo que enseñar (Nexo solo publica `wlan0`) |
 
 La MAC de `wlan0` es **inventada y estable** (`02:…`): Android no da la del WiFi. La lista de redes se refresca cada 120 s (`NEXO_DBUS_NM_SCAN`), el estado cada 20 s (`NEXO_DBUS_NM_REFRESH`), y al instante cuando Android avisa de un cambio.
+
+## Notificaciones del móvil (`org.freedesktop.Notifications`)
+
+Las notificaciones de Android salen en tu escritorio, en el demonio de avisos que ya uses (dunst, mako, swaync, el de GNOME o el de KDE), y si las cierras allí se quitan también del móvil.
+
+**Es opcional y viene apagado**: lo que dicen tus notificaciones es lo más privado del móvil. No sale de Android hasta que, en la app Nexo, (1) das el **acceso a notificaciones** (el mismo que usa la música) y (2) activas **«Reenviar notificaciones a Linux»**.
+Solo viajan por `127.0.0.1`, hacia un cliente con tu token (`nexo-dbus`, o `nexo notif` si lo pides tú); ni la app ni `nexo-dbus` guardan ninguna, y no pasan por la caché de las barras. `nexo dbus status` dice si falta algo:
+
+```
+  Notificaciones  reenviando a dunst 1.11.0 (org.freedesktop.Notifications)
+  Notificaciones  el reenvío está apagado: actívalo en la app Nexo («Reenviar notificaciones a Linux»)
+  Notificaciones  falta el acceso a notificaciones de Android (app Nexo → Permisos → Acceso a notificaciones)
+  Notificaciones  no hay un demonio de notificaciones en el bus de sesión (instala dunst, mako o swaync; GNOME y KDE ya traen uno)
+```
+
+`nexo-dbus` es aquí un **cliente** del demonio, no un servidor: **no ocupa** el nombre `org.freedesktop.Notifications`, así que no choca con el tuyo ni lo desplaza (por eso no hay «modo pasivo» ni `NEXO_DBUS_FORCE` para esto).
+Si no hay demonio en el bus de sesión no se muestra nada (y se anota una sola vez); en cuanto aparece uno, los avisos siguientes salen en él sin reiniciar nada. Si el demonio se reinicia o lo cambias por otro, `nexo-dbus` se da cuenta.
+
+| Qué pasa en Android | Qué pasa en Linux |
+|---|---|
+| Llega una notificación | Sale en tu escritorio con el nombre de la app, el título y el texto (icono genérico `phone`) |
+| La app la actualiza (otro mensaje en la conversación, una barra de progreso) | Se **reemplaza** la misma (`replaces_id`): no salen dos |
+| La tocas, la descartas o la retira la app, en el móvil | Desaparece también del escritorio |
+| La cierras **aquí** con el ratón (la ✕) | Se quita también **del móvil** (`notif.dismiss`). Si caduca sola, o la cierra el propio programa, el móvil no se entera. `NEXO_DBUS_NOTIFY_DISMISS=0` lo apaga |
+| Es una alarma o una llamada (`alarm`, `call`) | Urgencia **crítica** (2) |
+| Es poco importante (importancia baja) | Urgencia **baja** (0); el resto, normal (1) |
+| Es un mensaje, un correo o una descarga (`msg`, `email`, `progress`) | Lleva la categoría estándar de escritorio (`im.received`, `email.arrived`, `transfer`) |
+| Es una **fija** (reproductor, VPN, servicios en marcha) o de importancia mínima | **No se enseña** (te llenarían la pantalla). `NEXO_DBUS_NOTIFY_ALL=1` las enseña (las fijas, sin caducidad: se quedan hasta que se quiten) |
+
+No se reenvían las notificaciones de la propia Nexo, los resúmenes de grupo ni los controles de música (de eso se ocupa MPRIS).
+
+**El texto del móvil llega como texto, no como código.** Se le quitan los caracteres de control, el título se corta en 200 letras y el cuerpo en 1000 (con «…»), y si tu demonio interpreta marcado (`body-markup`) se **escapa**:
+una notificación no puede meter negritas, enlaces ni imágenes en tu escritorio, y un `<b>` en un mensaje se ve como `<b>`. (Los `<` y `>` del título y del nombre de la app se cambian por `‹` y `›`, porque algunos demonios interpretan también esos.)
+
+Para probarlo sin esperar a que te escriban: `notify-send "prueba"` (de `libnotify`) confirma que tu demonio funciona; `nexo notif status` dice si el móvil reenvía; y publica una notificación en el móvil.
 
 ## Modo pasivo (no pisar lo de verdad)
 
@@ -283,9 +320,13 @@ La carátula se guarda en `~/.cache/nexo/art/` (se conservan las 30 últimas; la
 | Variable | Para qué |
 |---|---|
 | `NEXO_DBUS_BUS` | Dirección del bus de sesión (si no es la normal): `unix:path=/ruta/bus` (también `--bus`) |
+| `NEXO_DBUS_SESSION_SOCKET` | Ruta del socket del bus de sesión; **sustituye** a `$XDG_RUNTIME_DIR/bus` y `/run/user/UID/bus` (sirve en distros raras y para probar «sin bus» en una máquina que tiene uno) |
 | `NEXO_DBUS_SYSTEM_BUS` | Dirección del bus del sistema (también `--system-bus`); `none` = no usar el bus del sistema (sin BlueZ ni NetworkManager) |
 | `NEXO_DBUS_SYSTEM_SOCKET` | Ruta del socket del bus del sistema; **sustituye** a las rutas habituales (`/run/dbus/system_bus_socket`…) |
 | `NEXO_DBUS_MPRIS`, `NEXO_DBUS_BLUEZ`, `NEXO_DBUS_NM` | `0` apaga ese servicio; `1` lo activa aunque haya otro o lo gestione systemd; vacío o `auto` = automático (también `--no-mpris`, `--no-bluez`, `--no-nm`) |
+| `NEXO_DBUS_NOTIFY` | `0` apaga las notificaciones del móvil (también `--no-notify`): `nexo-dbus` ni siquiera las pide a la app |
+| `NEXO_DBUS_NOTIFY_ALL=1` | Enseña también las notificaciones fijas (reproductor, VPN, servicios en marcha) y las de importancia mínima |
+| `NEXO_DBUS_NOTIFY_DISMISS=0` | Cerrar una notificación en el escritorio ya no la quita del móvil |
 | `NEXO_DBUS_FORCE=1` | Reclama los nombres aunque ya los tenga otro programa (o los gestione systemd) |
 | `NEXO_DBUS_ALWAYS=1` | El reproductor MPRIS se ve aunque no haya música (`Stopped`, sin controles) |
 | `NEXO_DBUS_GRACE` | Segundos que espera antes de retirar el reproductor cuando para la música (3) |
@@ -294,7 +335,7 @@ La carátula se guarda en `~/.cache/nexo/art/` (se conservan las 30 últimas; la
 | `NEXO_DBUS_DISCOVERY_SECS` | Cuánto dura «Discovering = true» tras `StartDiscovery` (120) |
 | `NEXO_DBUS_REFRESH` | Cada cuántos segundos relee los dispositivos Bluetooth aunque no pase nada (60) |
 | `NEXO_DBUS_NM_SCAN`, `NEXO_DBUS_NM_REFRESH` | Cada cuántos segundos escanea redes (120, mínimo 10) y relee el estado del WiFi (20, mínimo 2) |
-| `NEXO_DBUS_NM_ASSUME_ONLINE=1` | NetworkManager dice «conectado» aunque el WiFi del móvil no lo esté, mientras la app no cuente qué red usa el móvil (útil con datos móviles) |
+| `NEXO_DBUS_NM_ASSUME_ONLINE=1` | NetworkManager dice «conectado» aunque el WiFi del móvil no lo esté, **solo con una app anterior a la 0.4.3** (que no cuenta qué red usa el móvil; útil con datos móviles) |
 | `NEXO_DBUS_DENIED_RETRY` | Cada cuántos segundos reintenta ocupar un nombre que el bus le negó por política (30) |
 | `NEXO_DBUS_SYSTEMD_DIR` | Dónde mira si systemd gestiona BlueZ/NetworkManager (`/run/systemd/system`) |
 | `NEXO_PORT`, `NEXO_TOKEN`, `NEXO_CONFIG` | Los mismos que el cliente `nexo`: el enlace se lee igual (y se vuelve a leer solo si cambia, p. ej. tras `nexo rekey`) |
@@ -314,7 +355,9 @@ Empieza por `nexo dbus status` (o `nexo doctor`): dice, servicio por servicio, q
 | `status` dice «pasivo: ya hay un BlueZ/NetworkManager de verdad» | En ese equipo ya hay uno funcionando | Es lo esperado. Usa el de verdad o páralo y `NEXO_DBUS_FORCE=1` |
 | `bluetoothctl connect …` falla con `NeedsUserAction` | Android no deja a una app conectar dispositivos Bluetooth | Pulsa la notificación de Nexo: abre los ajustes de Bluetooth del móvil |
 | `nmcli device wifi connect` tarda y falla | Android no confirmó la conexión en 15 s (clave mala, red fuera de alcance, ajustes restringidos) | Mira el mensaje del error; `nexo wifi status` |
-| Firefox y otras apps creen que no hay internet (usas datos móviles) | La app 0.4.0 aún no cuenta la red móvil y NetworkManager mira solo el WiFi | `NEXO_DBUS_NM_ASSUME_ONLINE=1` (la 0.4.3 lo hará sola) |
+| Firefox y otras apps creen que no hay internet (usas datos móviles) | La app es anterior a la 0.4.3: no cuenta la red móvil y NetworkManager mira solo el WiFi | Instala el APK de la 0.4.3 (o `NEXO_DBUS_NM_ASSUME_ONLINE=1` mientras tanto) |
+| No sale ninguna notificación del móvil en el escritorio | Falta el reenvío, el acceso a notificaciones o el demonio de avisos | `nexo dbus status` dice cuál (ver «Notificaciones del móvil»); `nexo notif status` mira el lado del móvil |
+| Salen, pero no las fijas del reproductor o de la VPN | Es a propósito: las fijas y las de importancia mínima no se enseñan | `NEXO_DBUS_NOTIFY_ALL=1` |
 | Se ve en `busctl` pero no en tu barra | La barra usa **otro** bus | Arranca `nexo-dbus` desde la sesión de la barra (`--launcher`, `exec-once`) |
 | «la app Nexo rechazó el enlace» | Cambiaste el token | `nexo rekey` (o `nexo pair`): `nexo-dbus` recoge el nuevo en unos segundos |
 | «esta versión de la app Nexo no sabe de música» | APK anterior a la 0.2 | Instala el APK nuevo |
@@ -329,12 +372,13 @@ Empieza por `nexo dbus status` (o `nexo doctor`): dice, servicio por servicio, q
 - el reproductor MPRIS completo visto con esos dos clientes: propiedades, metadatos, carátula, controles, `Seek`, `Volume`, cambios hechos desde Android, 30 clientes a la vez;
 - **BlueZ** (`org.bluez`) en un bus del sistema de pruebas: el árbol de objetos (`GetManagedObjects`), todas las propiedades con sus tipos, escrituras y errores, las señales (`InterfacesAdded/Removed`, `PropertiesChanged`), encender y apagar, `StartDiscovery`/`StopDiscovery`, `RemoveDevice`;
 - **NetworkManager** en el mismo bus: objetos, redes a la vista con intensidad y seguridad, conexión y desconexión (también las que fallan o piden un toque), WiFi apagado y encendido, olvidar una red, estado global con y sin `net.status`;
+- las **notificaciones** contra un demonio de avisos **de pruebas** (`tests/fake_notifd.py`: `Notify`, `CloseNotification`, `GetCapabilities`, `GetServerInformation` y las señales) y mirando el bus con `busctl monitor` (otro cliente de D‑Bus: lo que `nexo-dbus` manda lo entiende alguien que no es él): llegar, reemplazar, quitar, cerrar en el escritorio y que se quite del móvil (y que no haya bucle), urgencias y categorías, textos con etiquetas, caracteres de control y textos enormes, demonio que se cae, se reinicia o rechaza un aviso, sin demonio, reenvío apagado, sin acceso, app antigua y `NEXO_DBUS_NOTIFY*`;
 - aparecer y desaparecer según haya música, app caída y vuelta, bus reiniciado, token cambiado, modo pasivo cuando otro ya tiene el nombre, systemd, bus que niega el nombre y bus que no existe (cada servicio con su conexión: un fallo no arrastra al otro);
 - la **política del bus** contra un `dbus-daemon` que lo niega todo por omisión: sin política, `nexo-dbus` no ocupa el nombre; con `nexo setup-dbus --system-policy`, lo ocupa solo (sin reiniciar) y se puede hablar con él; `--uninstall` la quita (y no toca un `nexo.conf` ajeno);
 - el bus propio (`--own-bus`); `nexo setup-dbus` (systemd simulado, autostart, script propio, desinstalar, sin python3), `setup-guests --with-dbus` y el instalador;
 - todo lo anterior **dos veces**: como `root` y como un usuario sin privilegios (`nobody`, sin `sudo`), que es lo más parecido a Termux.
 
-**No probado:** `bluetoothctl`, `nmcli`, Blueman, `nm-applet`, `libnm`, `playerctl`, Waybar, Polybar, Quickshell, GNOME, KDE (ningún programa real de escritorio; `busctl` y `gdbus` son los clientes que sí se han usado).
+**No probado:** `bluetoothctl`, `nmcli`, Blueman, `nm-applet`, `libnm`, `playerctl`, Waybar, Polybar, Quickshell, GNOME, KDE (ningún programa real de escritorio; `busctl` y `gdbus` son los clientes que sí se han usado) y, para las notificaciones, **dunst, mako, swaync, GNOME Shell y KDE Plasma de verdad**: cada uno interpreta a su manera el marcado, los iconos, el reemplazo (`replaces_id`) y la urgencia.
 **`nmcli`, `nm-applet` y los paneles de GNOME/KDE usan `libnm`, que comprueba muchas propiedades; si falta alguna pueden mostrar menos de lo esperado o quejarse.** Es lo que más espero que haya que afinar con tu retroalimentación.
 Tampoco se ha probado: el comportamiento dentro de proot en un móvil real (permisos del socket del bus, identidad de usuario dentro de proot), instalar la política en el `/etc/dbus-1/system.d` de un sistema de verdad
 (con `sudo`: las pruebas usan un bus de pruebas y una carpeta propia, así que ahí no hace falta), Python anteriores a 3.13 en ejecución (solo se comprueba que el código usa sintaxis de 3.7), y todo lo que depende del código de Android (que tampoco se ha ejecutado en un móvil desde la 0.2).

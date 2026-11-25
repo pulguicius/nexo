@@ -13,8 +13,8 @@ class CmdException(
 object Protocol {
     const val VERSION = 1
 
-    /** Revisión dentro de la versión 1 (ver docs/PROTOCOLO.md): la 2 añade audio, media y comandos de WiFi/Bluetooth; la 3, el USB serie; la 4, el almacenamiento USB. */
-    const val MINOR = 4
+    /** Revisión dentro de la versión 1 (ver docs/PROTOCOLO.md): la 2 añade audio, media y comandos de WiFi/Bluetooth; la 3, el USB serie; la 4, el almacenamiento USB; la 5, la red del móvil y las notificaciones. */
+    const val MINOR = 5
     const val MAX_LINE_BYTES = 64 * 1024
 
     fun ok(id: Any?, data: JSONObject? = null): JSONObject {

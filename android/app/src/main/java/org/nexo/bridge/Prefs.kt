@@ -3,7 +3,7 @@ package org.nexo.bridge
 import android.content.Context
 import java.security.SecureRandom
 
-/** Ajustes que se guardan en el móvil: token, puerto y arranque automático. */
+/** Ajustes que se guardan en el móvil: token, puerto, arranque automático y reenvío de notificaciones. */
 object Prefs {
     const val DEFAULT_PORT = 8765
 
@@ -12,6 +12,7 @@ object Prefs {
     private const val K_PORT = "port"
     private const val K_BOOT = "start_on_boot"
     private const val K_WANTED = "service_wanted"
+    private const val K_FWD = "forward_notifications"
 
     private fun sp(c: Context) =
         c.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -41,6 +42,10 @@ object Prefs {
 
     fun startOnBoot(c: Context): Boolean = sp(c).getBoolean(K_BOOT, false)
     fun setStartOnBoot(c: Context, v: Boolean) = sp(c).edit().putBoolean(K_BOOT, v).apply()
+
+    /** «Reenviar notificaciones a Linux»: apagado por defecto (el contenido de tus notificaciones es privado). */
+    fun forwardNotifications(c: Context): Boolean = sp(c).getBoolean(K_FWD, false)
+    fun setForwardNotifications(c: Context, v: Boolean) = sp(c).edit().putBoolean(K_FWD, v).apply()
 
     /** Si el usuario dejó el puente encendido (para la pantalla). */
     fun serviceWanted(c: Context): Boolean = sp(c).getBoolean(K_WANTED, false)

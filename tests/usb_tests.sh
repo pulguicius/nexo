@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Pruebas de la parte SERIE de nexo-usb (la 0.4.1): monitor serie, puente con PTY / RFC 2217 / TCP crudo, permisos, desenchufar y volver a enchufar.
 # (Los discos USB de la 0.4.2 están en tests/usb_storage_tests.sh.)
 # No se ejecuta solo: lo carga tests/run_tests.sh (usa sus ok/bad/run/has/…). Necesita: bash, python3, jq.
@@ -228,6 +229,7 @@ run nu monitor keyboard --seconds 1 --no-input;     rc_is "un teclado no es un p
 has "…y explica lo del teclado y /dev/input" "/dev/input"
 run nu monitor disk --seconds 1 --no-input;         rc_is "un disco no es un puerto serie → 4" 4
 has "…y manda a nexo usb mounts (0.4.2)" "nexo usb mounts"
+hasnt "…sin decir que eso llegará «en la 0.4.2» (ya llegó)" "en la 0.4.2"
 run nu monitor --seconds 1 --no-input;              rc_is "dos adaptadores serie y ninguno elegido → 2" 2
 has "…y los enseña" "Hay 2 dispositivos posibles"
 run nu monitor 0403 --seconds 1 --no-input;         rc_is "un VID suelto no es un dispositivo → 4" 4

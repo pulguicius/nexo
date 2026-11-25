@@ -36,7 +36,8 @@ Sin el permiso, el WiFi aparece como «red oculta» y `wifi scan` sale vacío.
 ## ¿Por qué pide «acceso a notificaciones»? ¿Lee mis notificaciones?
 
 Para poder ver y controlar **la música** (qué suena, pausa, siguiente, carátula): Android solo enseña las sesiones de medios de otras apps a quien tiene ese acceso.
-En esta versión Nexo **no lee ni guarda ninguna notificación**. Puedes quitar el acceso cuando quieras (Ajustes › Notificaciones › Acceso a notificaciones); lo demás sigue funcionando.
+Para la música Nexo **no lee ninguna notificación**. Desde la 0.4.3 hay una función **aparte y opcional** que sí las usa: **«Reenviar notificaciones a Linux»** (un interruptor de la app, **apagado de fábrica**) trae tus notificaciones a la distro (`nexo notif`) y a tu escritorio (dunst, mako, GNOME, KDE…) con `nexo-dbus`;
+mientras no lo actives, no sale ninguna de Android, y activada tampoco se guarda ninguna. Puedes quitar el acceso cuando quieras (Ajustes › Notificaciones › Acceso a notificaciones); lo demás sigue funcionando. Detalles y límites: [LIMITACIONES](LIMITACIONES.md#notificaciones-nexo-notif).
 
 **El interruptor sale en gris (Android 13 o más):** al instalar el APK a mano, Android lo bloquea. Ajustes › Aplicaciones › Nexo › ⋮ (arriba a la derecha) › **Permitir ajustes restringidos**, y vuelve a intentarlo.
 
@@ -98,6 +99,8 @@ Con `nexo usb` (desde la 0.4.2): cable OTG (o un hub), `nexo usb mounts` (Androi
 - **`bluetoothctl` (BlueZ) y `nmcli` (NetworkManager): desde la 0.4.0‑beta1, en beta.** `nexo-dbus` finge ser `org.bluez` (con los dispositivos emparejados en Android) y `org.freedesktop.NetworkManager` (con el WiFi del móvil como `wlan0`),
   en el bus del sistema; en proot, `nexo setup-dbus --own-bus`. Comprobado con `busctl` y `gdbus`, **todavía no con `bluetoothctl` ni `nmcli` reales**; y Android limita lo que se puede hacer
   (no se pueden conectar dispositivos Bluetooth ni leer las claves WiFi). Guía y límites: [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md).
+- **Notificaciones del móvil en tu escritorio (dunst, mako, swaync, GNOME, KDE): desde la 0.4.3, opcional.** `nexo-dbus` las enseña como avisos normales (y cerrar uno lo quita del móvil) si activas **«Reenviar notificaciones a Linux»** en la app. Probado con un demonio simulado; **todavía no con uno de verdad**. Guía: [INTEGRACION-ESCRITORIO](INTEGRACION-ESCRITORIO.md#notificaciones-del-móvil-orgfreedesktopnotifications).
+- **`nmcli` con datos móviles:** desde la 0.4.3 el estado global (conectado, de pago, sin internet de verdad) sale de la red por la que sale el móvil, no solo del WiFi. `nexo net` lo dice por la línea de comandos.
 - Mientras tanto, Nexo también se integra por línea de comandos (formatos para Waybar, Polybar, i3bar, Quickshell, tmux, starship…).
 
 ## `bluetoothctl` o `nmcli` no ven nada
